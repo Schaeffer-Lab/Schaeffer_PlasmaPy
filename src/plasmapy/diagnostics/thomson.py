@@ -16,7 +16,7 @@ from typing import Any
 import astropy.constants as const
 import astropy.units as u
 import numpy as np
-from lmfit import Model
+from lmfit import Model  
 
 from plasmapy.formulary import (
     permittivity_1D_Maxwellian_lite,
