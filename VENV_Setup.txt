@@ -1,0 +1,34 @@
+This document records the steps used to create and use a local Python 3.12.4 venv in VS code on macOS.
+
+(i) Install Python 3.12.4 (macOS)
+    Download from:
+
+    https://www.python.org/downloads/macos/
+
+    Run .pkg installer
+
+    Run python3.12 --version in VSCode terminal to confirm installation (should return 3.12.4)
+
+(ii) Create local project folder -- enter sequentially in VSCode terminal
+
+    cd ~/Desktop
+    mkdir Thomson
+    cd Thomsonpwd
+    ~Desktop/Thomson
+    pwd
+    python 3.12 -m venv .venv
+    .venv/bin/activate
+    python --version
+
+    On VSCode, cmd+shift+p to select intepreter -- select Python 3.12.4 .VENV.
+    Return to terminal and enter the following commands sequentially.
+
+    pip --version (should return Thomson/.venv)
+    conda config --set auto_activate_base false
+
+    Now, should have local folder on desktop to store all relevant Thomson notebooks
+
+(iii) Restart VSCode and select Thomson folder. Once again, cmd + shift + p to select interpreter.
+      Run SuperGaussianFit.ipynb as test.
+
+
