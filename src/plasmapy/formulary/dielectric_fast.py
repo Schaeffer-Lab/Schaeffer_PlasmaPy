@@ -10,7 +10,7 @@ import numpy as np
 from astropy import units as u
 from collections import namedtuple
 
-from plasmapy.dispersion.dispersionfunction import plasma_dispersion_func_deriv
+from plasmapy.dispersion.dispersion_functions import plasma_dispersion_func_deriv
 from plasmapy.formulary import parameters
 from plasmapy.utils.decorators import validate_quantities
 
