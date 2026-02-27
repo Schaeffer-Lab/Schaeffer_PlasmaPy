@@ -1,28 +1,16 @@
 """
-Unified Thomson scattering diagnostics module.
+Unified Thomson scattering module.
 
-This file merges two existing implementations into a single module:
+This file merges all thomson funcitonality into a single module. In order, you will see four distinct approaches:
 
-1) Arbitrary-VDF (NumPy/Astropy-units) implementation originally from thomsonVDF.py
-2) Autodiff (PyTorch) implementation originally from cpu_autodiff_thomson.py
+1) Arbitrary-VDF (NumPy/Astropy-units) implementation originally from thomsonVDF.py -- typically used to generate synthetic examples/used for DE (extension fo PlasmaPy model, takes in any defined VDF)
+2) Autodiff (PyTorch) implementation originally from cpu_autodiff_thomson.py -- typically used to fit experimental/synthetic spectra using AD (PyTORCH compatibility allows for gradient tracking, also takes in any defined VDF)
+3) Standard PlasmaPy Thomson formalism
+4) Modifed Thomson formulation used for experimental data processing 
 
-Design goals
-------------
-- Preserve the original public API from thomsonVDF.py as the default, so existing
-  code that used `spectral_density_arbdist`, `spectral_density_maxwellian`,
-  and `scattered_power_model_*` continues to work.
-- Expose the autodiff forward model side-by-side with minimal disruption.
-- Provide two clear entry points:
-    * `arbitrary_forwardmodel`  -> arbitrary-VDF scattered power / spectral density
-    * `autodiff_forwardmodel`   -> torch/autodiff scattered power / spectral density
+Note: Formalisms (1) and (2) are the most relevant for our applications. All helper functions for (1) will have "arbitrary" in the naming scheme, all functions for (2) will have "autodiff" attached and all functions for (4) will have "experimental" attached. The functions of most importance
+      will be the "arbitrary/autodiff"_spectral_density_arbdist, which is what is being used to calculate the spectral density function S(k,w). Call in notebook using thomson.autodiff/arbtirary_forwardmodel.
 
-Notes
------
-- Internals from each source file are namespaced with prefixes:
-    arbitrary_*  and  autodiff_*
-  to avoid name collisions while keeping the original logic intact.
-
-Generated on 2026-02-26T21:21:08.
 """
 
 from __future__ import annotations
@@ -51,7 +39,7 @@ __all__ = [
 
 
 # ----------------------------------------------------------------------------
-# Arbitrary-VDF implementation (from thomsonVDF.py)
+# Arbitrary-VDF implementation (from thomsonVDF.py) -- (1) noted above
 # ----------------------------------------------------------------------------
 import astropy.constants as const
 import astropy.units as u
@@ -1580,7 +1568,7 @@ def arbitrary_scattered_power_model_maxwellian(wavelengths, settings, params):
     return model
 
 # ----------------------------------------------------------------------------
-# Autodiff implementation (from cpu_autodiff_thomson.py)
+# Autodiff implementation (from cpu_autodiff_thomson.py) -- (2) as outlined at top of .py file.
 # ----------------------------------------------------------------------------
 # Install torch dependencies
 import torch
@@ -1626,7 +1614,7 @@ def autodiff_derivative(f: torch.Tensor, x: torch.Tensor, derivative_matrices: T
         print("You can only choose an order of 1 or 2...")
 
 @torch.jit.script
-# Original interpolation function from Lars Du (end of thread): https://github.com/pytorch/pytorch/issues/1552
+# Original interpolation function from Lars Du 
 def autodiff_torch_1d_interp(
     x: torch.Tensor,
     xp: torch.Tensor,
@@ -2082,11 +2070,8 @@ def autodiff_spectral_density_arbdist(
         )
 
 
-# =============================================================================
-# Public wrappers / aliases
-# =============================================================================
 
-# --- Recommended names you asked for ---
+
 def arbitrary_forwardmodel(*args, **kwargs):
     """
     Forward model for arbitrary VDFs (NumPy/Astropy-units implementation).
@@ -2105,7 +2090,7 @@ def autodiff_forwardmodel(*args, **kwargs):
     return autodiff_spectral_density_arbdist(*args, **kwargs)
 
 
-# --- Backwards-compatible defaults (keep thomsonVDF behavior) ---
+
 spectral_density_arbdist = arbitrary_spectral_density_arbdist
 fast_spectral_density_arbdist = arbitrary_fast_spectral_density_arbdist
 spectral_density_maxwellian = arbitrary_spectral_density_maxwellian
@@ -2114,11 +2099,11 @@ fast_spectral_density_maxwellian = arbitrary_fast_spectral_density_maxwellian
 scattered_power_model_arbdist = arbitrary_scattered_power_model_arbdist
 scattered_power_model_maxwellian = arbitrary_scattered_power_model_maxwellian
 
-# --- Explicit autodiff aliases (opt-in) ---
+
 spectral_density_arbdist_autodiff = autodiff_spectral_density_arbdist
 fast_spectral_density_arbdist_autodiff = autodiff_fast_spectral_density_arbdist
 
-# --- Helper aliases in the naming convention you suggested ---
+
 chi_arbitrary_forwardmodel = arbitrary_chi
 chi_autodiff_forwardmodel = autodiff_chi
 
