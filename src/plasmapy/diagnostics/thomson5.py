@@ -9,7 +9,7 @@ This file merges all thomson funcitonality into a single module. In order, you w
 4) Modifed Thomson formulation used for experimental data processing 
 
 Note: Formalisms (1) and (2) are the most relevant for our applications. All helper functions for (1) will have "arbitrary" in the naming scheme, all functions for (2) will have "autodiff" attached and all functions for (4) will have "experimental" attached. The functions of most importance
-      will be the "arbitrary/autodiff"_spectral_density_arbdist, which is what is being used to calculate the spectral density function S(k,w). Call in notebook using thomson.autodiff/arbtirary_forwardmodel.
+      will be the "arbitrary/autodiff"_spectral_density_arbdist, which is what is being used to calculate the spectral density function S(k,w). Call in notebook using thomson.autodiff/arbtirary_forwardmodel. Note thomson.plasmapy/experimental_forwardmodel for (3)/(4).
 
 """
 
@@ -2109,18 +2109,9 @@ chi_autodiff_forwardmodel = autodiff_chi
 
 
 # ----------------------------------------------------------------------------
-# Experimental PlasmaPy-style API (from thomson_plasmampy.py)
+# Standard PlasmaPy formalism -- as outlined in (3)
 # ----------------------------------------------------------------------------
-# Everything in this section is suffixed with `_experimental` to make it clear
-# that these are alternative entry points / API surfaces.
 
-
-# ============================================================================
-# PlasmaPy Thomson formalism (from thomson-6.py)
-# - Integrated into this unified module.
-# - All public and helper functions are suffixed with `_plasmapy`.
-# - Primary forward-model entrypoint: `plasmapy_forwardmodel` (alias of `spectral_density_plasmapy`).
-# ============================================================================
 
 import warnings
 from collections.abc import Callable
@@ -3125,10 +3116,7 @@ def spectral_density_model_plasmapy(  # noqa: C901, PLR0912, PLR0915
 plasmapy_forwardmodel = spectral_density_plasmapy
 
 # ============================================================================
-# Experimental Thomson formalism (from thomson2.py)
-# - Integrated into this unified module.
-# - All public and helper functions are suffixed with `_experimental`.
-# - Primary forward-model entrypoint: `experimental_forwardmodel` (alias of `spectral_density_experimental`).
+# Formalism for experimental processing -- as outlined in (4) at top of file.
 # ============================================================================
 
 import astropy.constants as const
