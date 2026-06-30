@@ -106,6 +106,12 @@ class _TorchPlaceholder:
         return None
 
     def __getattr__(self, name):
+        # Let introspection tools (pytest's ``--doctest-modules`` collector,
+        # ``inspect``, ``copy``, ...) probe dunder attributes without tripping
+        # the optional-dependency guard; only genuine ``torch.<api>`` access
+        # raises the informative error.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         raise ModuleNotFoundError(self._MSG)
 
 
