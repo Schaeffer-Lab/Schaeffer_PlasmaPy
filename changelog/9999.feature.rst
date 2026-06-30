@@ -1,0 +1,6 @@
+Added :func:`~plasmapy.diagnostics.thomson.spectral_density_arbitrary`
+(and its :term:`lite-function`
+:func:`~plasmapy.diagnostics.thomson.spectral_density_arbitrary_lite`) to
+`plasmapy.diagnostics.thomson`, which calculates the Thomson scattering
+spectral density for plasmas with arbitrary (non-Maxwellian) one-dimensional
+electron and ion velocity distribution functions.

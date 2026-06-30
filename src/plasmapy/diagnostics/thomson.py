@@ -5,9 +5,10 @@ Defines the Thomson scattering analysis module as part of
 
 __all__ = [
     "spectral_density",
+    "spectral_density_arbitrary",
     "spectral_density_model",
 ]
-__lite_funcs__ = ["spectral_density_lite"]
+__lite_funcs__ = ["spectral_density_lite", "spectral_density_arbitrary_lite"]
 
 import warnings
 from collections.abc import Callable
@@ -615,6 +616,585 @@ def spectral_density(  # noqa: C901, PLR0912, PLR0915
     )
 
     return alpha, Skw * u.s / u.rad
+
+
+def _finite_difference_derivative(
+    f: np.ndarray, x: np.ndarray, order: int
+) -> np.ndarray:
+    r"""
+    Fourth-order finite-difference derivative of ``f`` sampled on the
+    uniformly spaced grid ``x``.
+
+    Parameters
+    ----------
+    f : `~numpy.ndarray`
+        Function values sampled at the points in ``x``.
+
+    x : `~numpy.ndarray`
+        Uniformly spaced sample points.
+
+    order : `int`
+        The order of the derivative to compute; either ``1`` or ``2``.
+
+    Returns
+    -------
+    `~numpy.ndarray`
+        The ``order``\ -th derivative of ``f`` with respect to ``x``,
+        evaluated at the points in ``x``.
+    """
+    dx = x[1] - x[0]
+    f_prime = np.empty(len(f))
+
+    if order == 1:
+        # 4th-order one-sided differences for the two points at each end
+        f_prime[0] = (
+            -25 / 12 * f[0] + 4 * f[1] - 3 * f[2] + 4 / 3 * f[3] - f[4] / 4
+        ) / dx
+        f_prime[1] = (
+            -25 / 12 * f[1] + 4 * f[2] - 3 * f[3] + 4 / 3 * f[4] - f[5] / 4
+        ) / dx
+        f_prime[-1] = (
+            f[-5] / 4 - 4 / 3 * f[-4] + 3 * f[-3] - 4 * f[-2] + 25 / 12 * f[-1]
+        ) / dx
+        f_prime[-2] = (
+            f[-6] / 4 - 4 / 3 * f[-5] + 3 * f[-4] - 4 * f[-3] + 25 / 12 * f[-2]
+        ) / dx
+        # 4th-order centered difference for the interior
+        f_prime[2:-2] = (-f[4:] + 8 * f[3:-1] - 8 * f[1:-3] + f[:-4]) / (12 * dx)
+    elif order == 2:
+        f_prime[0] = (
+            15 / 4 * f[0]
+            - 77 / 6 * f[1]
+            + 107 / 6 * f[2]
+            - 13 * f[3]
+            + 61 / 12 * f[4]
+            - 5 / 6 * f[5]
+        ) / dx**2
+        f_prime[1] = (
+            15 / 4 * f[1]
+            - 77 / 6 * f[2]
+            + 107 / 6 * f[3]
+            - 13 * f[4]
+            + 61 / 12 * f[5]
+            - 5 / 6 * f[6]
+        ) / dx**2
+        f_prime[-1] = (
+            15 / 4 * f[-1]
+            - 77 / 6 * f[-2]
+            + 107 / 6 * f[-3]
+            - 13 * f[-4]
+            + 61 / 12 * f[-5]
+            - 5 / 6 * f[-6]
+        ) / dx**2
+        f_prime[-2] = (
+            15 / 4 * f[-2]
+            - 77 / 6 * f[-3]
+            + 107 / 6 * f[-4]
+            - 13 * f[-5]
+            + 61 / 12 * f[-6]
+            - 5 / 6 * f[-7]
+        ) / dx**2
+        f_prime[2:-2] = (
+            -f[:-4] / 12
+            + 4 / 3 * f[1:-3]
+            - 5 / 2 * f[2:-2]
+            + 4 / 3 * f[3:-1]
+            - f[4:] / 12
+        ) / dx**2
+    else:
+        raise ValueError("``order`` must be either 1 or 2.")
+
+    return f_prime
+
+
+def _chi_arbitrary(
+    f: np.ndarray,
+    u_axis: np.ndarray,
+    k: np.ndarray,
+    xi: np.ndarray,
+    v_th: float,
+    n: float,
+    mass: float,
+    Z: float,
+    phi: float = 1e-5,
+    n_points: int = 1000,
+    inner_range: float = 0.1,
+    inner_frac: float = 0.8,
+) -> np.ndarray:
+    r"""
+    Longitudinal susceptibility :math:`χ(k, ω)` of a single species with an
+    arbitrary one-dimensional velocity distribution function.
+
+    This evaluates the susceptibility integral (Sheffield Eq. 3.3.9) by
+    numerically computing the principal value of
+
+    .. math::
+        χ = -\frac{ω_p^2}{2 k^2 v_{th}^2}
+            \int \frac{∂f/∂u}{u - ξ}\, du
+
+    using a quadrature that is refined near the :math:`u = ξ` pole, plus the
+    Landau residue contribution :math:`i π\, f'(ξ)`.
+
+    Parameters
+    ----------
+    f : `~numpy.ndarray`
+        The (normalized) velocity distribution function sampled on
+        ``u_axis``.
+
+    u_axis : `~numpy.ndarray`
+        Velocity axis normalized by :math:`\sqrt{2}\, v_{th}` and centered
+        on the distribution's bulk velocity.
+
+    k : `~numpy.ndarray`
+        Scattering wavenumbers in radians per meter.
+
+    xi : `~numpy.ndarray`
+        Normalized phase velocities :math:`ω / (\sqrt{2}\, k\, v_{th})`.
+
+    v_th : `float`
+        Thermal speed of the distribution (its standard deviation in m/s).
+
+    n : `float`
+        Number density of the species in m\ :sup:`-3`.
+
+    mass : `float`
+        Mass of the species in kg.
+
+    Z : `float`
+        Charge number of the species.
+
+    phi : `float`, optional
+        Small standoff offset used to avoid the integrand singularity.
+
+    n_points : `int`, optional
+        Number of sample points used for the principal-value integral.
+
+    inner_range, inner_frac : `float`, optional
+        Fraction of the integration range and of the sample points,
+        respectively, devoted to the finely sampled region near the pole.
+
+    Returns
+    -------
+    `~numpy.ndarray`
+        The complex susceptibility evaluated at each value in ``xi``.
+    """
+    f_prime = _finite_difference_derivative(f, u_axis, 1)
+    f_double_prime = _finite_difference_derivative(f, u_axis, 2)
+
+    # f' and f'' interpolated onto the phase velocities
+    g = np.interp(xi, u_axis, f_prime)
+    g_prime = np.interp(xi, u_axis, f_double_prime)
+
+    # Set up integration sample points, finely spaced near the pole
+    outer_frac = 1 - inner_frac
+    m_inner = np.linspace(0, inner_range, int(np.floor(n_points / 2 * inner_frac)))
+    p_inner = np.linspace(0, inner_range, int(np.ceil(n_points / 2 * inner_frac)))
+    m_outer = np.linspace(inner_range, 1, int(np.floor(n_points / 2 * outer_frac)))
+    p_outer = np.linspace(inner_range, 1, int(np.ceil(n_points / 2 * outer_frac)))
+    m = np.concatenate((m_inner, m_outer))
+    p = np.concatenate((p_inner, p_outer))
+
+    delta_u_max = np.max(u_axis) - np.min(u_axis)
+    m_points = phi + m * delta_u_max
+    p_points = phi + p * delta_u_max
+    m_deltas = np.append(m_points[1:] - m_points[:-1], 0)
+    p_deltas = np.append(p_points[1:] - p_points[:-1], 0)
+
+    # Offsets above (zm) and below (zp) each phase velocity
+    zm = xi[:, np.newaxis] + m_points[np.newaxis, :]
+    zp = xi[:, np.newaxis] - p_points[np.newaxis, :]
+    gm = np.interp(zm, u_axis, f_prime)
+    gp = np.interp(zp, u_axis, f_prime)
+
+    integral = (
+        np.sum(m_deltas * gm / m_points, axis=1)
+        - np.sum(p_deltas * gp / p_points, axis=1)
+        + 1j * np.pi * g
+        + 2 * phi * g_prime
+    )
+
+    wpl_sq = plasma_frequency_lite(n, mass, Z) ** 2
+    coefficient = -wpl_sq / k**2 / (np.sqrt(2) * v_th)
+    return coefficient * integral
+
+
+@preserve_signature
+def spectral_density_arbitrary_lite(  # noqa: C901, PLR0915
+    wavelengths,
+    probe_wavelength: float,
+    n: float,
+    e_velocity_axes: np.ndarray,
+    i_velocity_axes: np.ndarray,
+    efn: np.ndarray,
+    ifn: np.ndarray,
+    efract: np.ndarray,
+    ifract: np.ndarray,
+    ion_z: np.ndarray,
+    ion_mass: np.ndarray,
+    probe_vec: np.ndarray,
+    scatter_vec: np.ndarray,
+    notch: np.ndarray | None = None,
+    inner_range: float = 0.1,
+    inner_frac: float = 0.8,
+) -> tuple[np.floating, np.ndarray]:
+    r"""
+    The :term:`lite-function` version of
+    `~plasmapy.diagnostics.thomson.spectral_density_arbitrary`.  Performs the
+    same calculation but is intended for computational use and thus has data
+    conditioning safeguards removed.
+
+    Unlike
+    `~plasmapy.diagnostics.thomson.spectral_density_lite`, which assumes
+    Maxwellian populations, this function accepts arbitrary one-dimensional
+    velocity distribution functions for each electron and ion population.
+    The bulk velocity and thermal speed of each population are computed as
+    moments of the supplied distributions.
+
+    Parameters
+    ----------
+    wavelengths : (Nλ,) `~numpy.ndarray`
+        The wavelengths in meters over which the spectral density function
+        is calculated.
+
+    probe_wavelength : real number
+        Wavelength of the probe laser in meters.
+
+    n : real number
+        Total combined number density of all electron populations in
+        m\ :sup:`-3`.
+
+    e_velocity_axes : (Ne, Nv) `~numpy.ndarray`
+        The velocity axis in m/s for each electron population's
+        distribution function.
+
+    i_velocity_axes : (Ni, Nv) `~numpy.ndarray`
+        The velocity axis in m/s for each ion population's distribution
+        function.
+
+    efn : (Ne, Nv) `~numpy.ndarray`
+        The distribution function of each electron population, sampled on
+        the corresponding row of ``e_velocity_axes`` and normalized so that
+        its integral over velocity is unity (units of s/m).
+
+    ifn : (Ni, Nv) `~numpy.ndarray`
+        As ``efn``, but for each ion population.
+
+    efract : (Ne,) `~numpy.ndarray`
+        Fraction of the total electron number density in each electron
+        population; must sum to 1.
+
+    ifract : (Ni,) `~numpy.ndarray`
+        Fraction of the total ion number density in each ion population;
+        must sum to 1.
+
+    ion_z : (Ni,) `~numpy.ndarray`
+        Charge number :math:`Z` of each ion species.
+
+    ion_mass : (Ni,) `~numpy.ndarray`
+        Mass of each ion species in kg.
+
+    probe_vec : (3,) `~numpy.ndarray`
+        Unit vector in the direction of the probe laser.
+
+    scatter_vec : (3,) `~numpy.ndarray`
+        Unit vector pointing from the scattering volume to the detector.
+
+    notch : (2,) or (N, 2) `~numpy.ndarray`, optional
+        Pairs of wavelengths in meters between which the output is set to
+        zero. Defaults to no notch.
+
+    inner_range, inner_frac : `float`, optional
+        Quadrature-refinement controls passed to the susceptibility
+        integral; see
+        `~plasmapy.diagnostics.thomson.spectral_density_arbitrary`.
+
+    Returns
+    -------
+    alpha : `float`
+        Mean scattering parameter over the input wavelengths.
+
+    Skw : `~numpy.ndarray`
+        The spectral density function, normalized so that its integral over
+        ``wavelengths`` is unity.
+    """
+    probe_vec = probe_vec / np.linalg.norm(probe_vec)
+    scatter_vec = scatter_vec / np.linalg.norm(scatter_vec)
+
+    # Normal vector along k; all velocities are assumed to lie along it
+    k_vec = scatter_vec - probe_vec
+    k_vec = k_vec / np.linalg.norm(k_vec)
+
+    # Bulk velocity and thermal speed (standard deviation) of each population
+    # are obtained as moments of the supplied distribution functions.
+    def _moments(velocity_axes, fns):
+        drift_1d = np.empty(len(fns))
+        v_th = np.empty(len(fns))
+        for i, fn in enumerate(fns):
+            v_axis = velocity_axes[i]
+            bulk = np.trapezoid(fn * v_axis, v_axis)
+            drift_1d[i] = bulk
+            v_th[i] = np.sqrt(np.trapezoid(fn * (v_axis - bulk) ** 2, v_axis))
+        drift = np.outer(drift_1d, k_vec)
+        return drift, drift_1d, v_th
+
+    electron_vel, electron_vel_1d, vTe = _moments(e_velocity_axes, efn)
+    ion_vel, ion_vel_1d, vTi = _moments(i_velocity_axes, ifn)
+
+    # Plasma parameters
+    zbar = np.sum(ifract * ion_z)
+    ne = efract * n
+    ni = ifract * n / zbar  # ne / zbar = sum(ni)
+    wpe = plasma_frequency_lite(n, m_e_si_unitless, 1)
+
+    # Convert wavelengths to angular frequencies (phase speed c)
+    ws = 2 * np.pi * c_si_unitless / wavelengths
+    wl = 2 * np.pi * c_si_unitless / probe_wavelength
+    w = ws - wl  # frequency shift (energy conservation)
+
+    # Wavenumbers in the plasma (Sheffield Sec. 1.8.1, Eqs. 5.4.1-5.4.2)
+    ks = np.sqrt(ws**2 - wpe**2) / c_si_unitless
+    kl = np.sqrt(wl**2 - wpe**2) / c_si_unitless
+    scattering_angle = np.arccos(np.dot(probe_vec, scatter_vec))
+    k = np.sqrt(ks**2 + kl**2 - 2 * ks * kl * np.cos(scattering_angle))
+
+    # Doppler-shifted frequencies for each population
+    w_e = w - np.matmul(electron_vel, np.outer(k, k_vec).T)
+    w_i = w - np.matmul(ion_vel, np.outer(k, k_vec).T)
+
+    # Scattering parameter alpha = 1 / (k * lambda_De), where the Debye
+    # length lambda_De = sigma / wpe and ``vTe`` is the distribution's
+    # standard deviation sigma.
+    alpha = wpe / np.outer(k, vTe)
+
+    # Normalized phase velocities, xi = w / (sqrt(2) k v_th)
+    xie = (np.outer(1 / vTe, 1 / k) * w_e) / np.sqrt(2)
+    xii = (np.outer(1 / vTi, 1 / k) * w_i) / np.sqrt(2)
+
+    # Susceptibilities from the arbitrary-distribution integral
+    chiE = np.zeros([efract.size, w.size], dtype=np.complex128)
+    for i in range(efract.size):
+        u_axis = (e_velocity_axes[i] - electron_vel_1d[i]) / (np.sqrt(2) * vTe[i])
+        chiE[i, :] = _chi_arbitrary(
+            efn[i],
+            u_axis,
+            k,
+            xie[i],
+            vTe[i],
+            ne[i],
+            m_e_si_unitless,
+            1,
+            inner_range=inner_range,
+            inner_frac=inner_frac,
+        )
+
+    chiI = np.zeros([ifract.size, w.size], dtype=np.complex128)
+    for i in range(ifract.size):
+        u_axis = (i_velocity_axes[i] - ion_vel_1d[i]) / (np.sqrt(2) * vTi[i])
+        chiI[i, :] = _chi_arbitrary(
+            ifn[i],
+            u_axis,
+            k,
+            xii[i],
+            vTi[i],
+            ni[i],
+            ion_mass[i],
+            ion_z[i],
+            inner_range=inner_range,
+            inner_frac=inner_frac,
+        )
+
+    epsilon = 1 + np.sum(chiE, axis=0) + np.sum(chiI, axis=0)
+
+    # Electron and ion contributions to S(k, w) (Sheffield Sec. 5.1), with
+    # the distribution function evaluated at the phase velocity.
+    econtr = np.zeros([efract.size, w.size], dtype=np.complex128)
+    for j in range(efract.size):
+        u_axis = (e_velocity_axes[j] - electron_vel_1d[j]) / (np.sqrt(2) * vTe[j])
+        econtr[j] = efract[j] * (
+            2
+            * np.pi
+            / k
+            * np.power(np.abs(1 - np.sum(chiE, axis=0) / epsilon), 2)
+            * np.interp(xie[j], u_axis, efn[j])
+        )
+
+    icontr = np.zeros([ifract.size, w.size], dtype=np.complex128)
+    for j in range(ifract.size):
+        u_axis = (i_velocity_axes[j] - ion_vel_1d[j]) / (np.sqrt(2) * vTi[j])
+        icontr[j] = ifract[j] * (
+            2
+            * np.pi
+            * ion_z[j]
+            / k
+            * np.power(np.abs(np.sum(chiE, axis=0) / epsilon), 2)
+            * np.interp(xii[j], u_axis, ifn[j])
+        )
+
+    Skw = np.real(np.sum(econtr, axis=0) + np.sum(icontr, axis=0))
+
+    # Notches
+    if notch is not None:
+        if np.ndim(notch) == 1:
+            notch = np.array([notch])
+        for notch_i in notch:
+            if len(notch_i) != 2:
+                raise ValueError("Notches must be pairs of wavelengths.")
+            x0 = np.argmin(np.abs(wavelengths - notch_i[0]))
+            x1 = np.argmin(np.abs(wavelengths - notch_i[1]))
+            Skw[x0:x1] = 0
+
+    # Normalize so the spectrum integrates to unity over wavelength
+    Skw = Skw / np.trapezoid(Skw, wavelengths)
+
+    return np.mean(alpha), Skw
+
+
+@bind_lite_func(spectral_density_arbitrary_lite)
+def spectral_density_arbitrary(
+    wavelengths: u.Quantity[u.nm],
+    probe_wavelength: u.Quantity[u.nm],
+    n: u.Quantity[u.m**-3],
+    e_velocity_axes: u.Quantity[u.m / u.s],
+    i_velocity_axes: u.Quantity[u.m / u.s],
+    efn: u.Quantity[u.s / u.m],
+    ifn: u.Quantity[u.s / u.m],
+    *,
+    efract: np.ndarray | None = None,
+    ifract: np.ndarray | None = None,
+    ions: ParticleLike | list[ParticleLike] = "p+",
+    probe_vec=None,
+    scatter_vec=None,
+    notch: u.Quantity[u.nm] | None = None,
+    inner_range: float = 0.1,
+    inner_frac: float = 0.8,
+) -> tuple[np.floating, u.Quantity]:
+    r"""
+    Calculate the Thomson scattering spectral density for plasmas with
+    arbitrary velocity distribution functions.
+
+    **Lite Version:**
+    `~plasmapy.diagnostics.thomson.spectral_density_arbitrary_lite`
+
+    This is a generalization of
+    `~plasmapy.diagnostics.thomson.spectral_density` that accepts an
+    arbitrary (not necessarily Maxwellian) one-dimensional velocity
+    distribution function for each electron and ion population.  The bulk
+    velocity and thermal speed of each population are computed as moments of
+    the supplied distributions, and the longitudinal susceptibilities are
+    obtained by direct numerical integration rather than from the analytic
+    Maxwellian form.
+
+    Parameters
+    ----------
+    wavelengths : (Nλ,) `~astropy.units.Quantity`
+        The wavelengths over which the spectral density function is
+        calculated, convertible to nanometers.
+
+    probe_wavelength : `~astropy.units.Quantity`
+        Wavelength of the probe laser, convertible to nanometers.
+
+    n : `~astropy.units.Quantity`
+        Total combined number density of all electron populations,
+        convertible to m\ :sup:`-3`.
+
+    e_velocity_axes : (Ne, Nv) `~astropy.units.Quantity`
+        Velocity axis (in m/s) for each electron population's distribution
+        function.
+
+    i_velocity_axes : (Ni, Nv) `~astropy.units.Quantity`
+        Velocity axis (in m/s) for each ion population's distribution
+        function.
+
+    efn : (Ne, Nv) `~astropy.units.Quantity`
+        Distribution function of each electron population, sampled on the
+        corresponding row of ``e_velocity_axes`` and normalized so that its
+        integral over velocity is unity (units of s/m).
+
+    ifn : (Ni, Nv) `~astropy.units.Quantity`
+        As ``efn``, but for each ion population.
+
+    efract : (Ne,) array_like, optional
+        Fraction of the total electron number density in each population;
+        must sum to 1. Defaults to a single population.
+
+    ifract : (Ni,) array_like, optional
+        Fraction of the total ion number density in each population; must
+        sum to 1. Defaults to a single population.
+
+    ions : |particle-list-like|, optional
+        Ion species. Defaults to a single proton population (``"p+"``).
+
+    probe_vec : (3,) `~numpy.ndarray`, optional
+        Unit vector in the direction of the probe laser. Defaults to
+        ``[1, 0, 0]``.
+
+    scatter_vec : (3,) `~numpy.ndarray`, optional
+        Unit vector pointing from the scattering volume to the detector.
+        Defaults to ``[0, 1, 0]``.
+
+    notch : (2,) or (N, 2) `~astropy.units.Quantity`, optional
+        Pairs of wavelengths between which the output is set to zero.
+
+    inner_range, inner_frac : `float`, optional
+        Controls for the susceptibility quadrature: the fraction of the
+        integration range and of the sample points, respectively, devoted
+        to the finely sampled region near the :math:`u = ξ` pole.
+
+    Returns
+    -------
+    alpha : `float`
+        Mean scattering parameter, where ``alpha`` > 1 corresponds to
+        collective scattering.
+
+    Skw : `~astropy.units.Quantity`
+        The spectral density function, normalized so that its integral over
+        ``wavelengths`` is unity (units of 1/m).
+
+    See Also
+    --------
+    spectral_density
+    """
+    efract = np.ones(1) if efract is None else np.asarray(efract, dtype=np.float64)
+    ifract = np.ones(1) if ifract is None else np.asarray(ifract, dtype=np.float64)
+
+    if probe_vec is None:
+        probe_vec = np.array([1, 0, 0])
+    if scatter_vec is None:
+        scatter_vec = np.array([0, 1, 0])
+
+    if isinstance(ions, str | Particle):
+        ions = [ions]
+    ions = ParticleList(
+        [Particle(ion) if not isinstance(ion, Particle) else ion for ion in ions]
+    )
+    if len(ions) == 0:
+        raise ValueError("At least one ion species must be provided.")
+
+    ion_z = np.array([ion.charge_number for ion in ions])
+    ion_mass = np.array([ion.mass.to(u.kg).value for ion in ions])
+
+    notch_si = None if notch is None else notch.to(u.m).value
+
+    alpha, Skw = spectral_density_arbitrary_lite(
+        wavelengths=wavelengths.to(u.m).value,
+        probe_wavelength=probe_wavelength.to(u.m).value,
+        n=n.to(u.m**-3).value,
+        e_velocity_axes=np.atleast_2d(e_velocity_axes.to(u.m / u.s).value),
+        i_velocity_axes=np.atleast_2d(i_velocity_axes.to(u.m / u.s).value),
+        efn=np.atleast_2d(efn.to(u.s / u.m).value),
+        ifn=np.atleast_2d(ifn.to(u.s / u.m).value),
+        efract=efract,
+        ifract=ifract,
+        ion_z=ion_z,
+        ion_mass=ion_mass,
+        probe_vec=probe_vec,
+        scatter_vec=scatter_vec,
+        notch=notch_si,
+        inner_range=inner_range,
+        inner_frac=inner_frac,
+    )
+
+    return alpha, Skw / u.m
 
 
 # ***************************************************************************

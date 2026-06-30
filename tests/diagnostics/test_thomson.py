@@ -1415,3 +1415,96 @@ def test_model_input_validation(
             if msg is not None:
                 print(excinfo.value)  # noqa: T201
                 assert msg in str(excinfo.value)
+
+
+# ***************************************************************************
+# Tests for spectral_density_arbitrary (arbitrary velocity distributions)
+# ***************************************************************************
+
+
+def _maxwellian_axis_and_fn(T, mass, npts=2001, span=8):
+    """Return a (velocity axis, distribution) pair for a 1D Maxwellian."""
+    sigma = np.sqrt(const.k_B * T / mass).to(u.m / u.s).value
+    v = np.linspace(-span * sigma, span * sigma, npts)
+    fn = np.exp(-(v**2) / (2 * sigma**2)) / (np.sqrt(2 * np.pi) * sigma)
+    return v * u.m / u.s, fn * u.s / u.m
+
+
+def test_spectral_density_arbitrary_lite_binding():
+    """The lite-function is bound to the public function."""
+    assert hasattr(thomson.spectral_density_arbitrary, "lite")
+    assert (
+        thomson.spectral_density_arbitrary.lite
+        is thomson.spectral_density_arbitrary_lite
+    )
+
+
+def test_spectral_density_arbitrary_reduces_to_maxwellian():
+    """
+    Feeding Maxwellian distributions to ``spectral_density_arbitrary`` should
+    reproduce the analytic ``spectral_density`` result (matching scattering
+    parameter and spectral shape).
+    """
+    probe = 532 * u.nm
+    wavelengths = np.linspace(520, 545, 600) * u.nm
+    n = 2e17 * u.cm**-3
+    T_e = 50 * u.eV
+    T_i = 20 * u.eV
+    ions = ["H+"]
+
+    alpha_ref, Skw_ref = thomson.spectral_density(
+        wavelengths, probe, n, T_e=T_e, T_i=T_i, ions=ions
+    )
+
+    Te_K = T_e.to(u.K, equivalencies=u.temperature_energy())
+    Ti_K = T_i.to(u.K, equivalencies=u.temperature_energy())
+    ve, fe = _maxwellian_axis_and_fn(Te_K, const.m_e)
+    vi, fi = _maxwellian_axis_and_fn(Ti_K, const.m_p)
+
+    alpha_arb, Skw_arb = thomson.spectral_density_arbitrary(
+        wavelengths,
+        probe,
+        n,
+        e_velocity_axes=ve[None, :],
+        i_velocity_axes=vi[None, :],
+        efn=fe[None, :],
+        ifn=fi[None, :],
+        ions=ions,
+    )
+
+    # Scattering parameter should match the Maxwellian result closely.
+    assert np.isclose(float(alpha_arb), float(alpha_ref), rtol=1e-3)
+
+    # Compare normalized spectral shapes.
+    lam_m = wavelengths.to(u.m).value
+    ref_n = Skw_ref.value / np.trapezoid(Skw_ref.value, lam_m)
+    arb_n = Skw_arb.value / np.trapezoid(Skw_arb.value, lam_m)
+    assert np.max(np.abs(arb_n - ref_n)) / np.max(ref_n) < 0.05
+
+
+def test_spectral_density_arbitrary_normalization():
+    """The returned spectrum integrates to unity over wavelength."""
+    probe = 532 * u.nm
+    wavelengths = np.linspace(520, 545, 400) * u.nm
+    n = 1e17 * u.cm**-3
+
+    ve, fe = _maxwellian_axis_and_fn(
+        (30 * u.eV).to(u.K, equivalencies=u.temperature_energy()), const.m_e
+    )
+    vi, fi = _maxwellian_axis_and_fn(
+        (10 * u.eV).to(u.K, equivalencies=u.temperature_energy()), const.m_p
+    )
+
+    _alpha, Skw = thomson.spectral_density_arbitrary(
+        wavelengths,
+        probe,
+        n,
+        e_velocity_axes=ve[None, :],
+        i_velocity_axes=vi[None, :],
+        efn=fe[None, :],
+        ifn=fi[None, :],
+        ions=["H+"],
+    )
+
+    integral = np.trapezoid(Skw.to(u.m**-1).value, wavelengths.to(u.m).value)
+    assert np.isclose(integral, 1.0, rtol=1e-6)
