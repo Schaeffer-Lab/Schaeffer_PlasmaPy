@@ -78,6 +78,16 @@ urls.website = "https://www.plasmapy.org"
 # Remove references to plasma calculator after mid-2026
 scripts.plasma-calculator = "plasmapy.utils.calculator:main"
 
+[project.optional-dependencies]
+# Heavy, optional runtime dependencies for the JIT (numba) and autodiff
+# (torch) Thomson scattering forward models in
+# ``plasmapy.diagnostics.thomson``. The rest of PlasmaPy imports and runs
+# without these installed.
+thomson = [
+  "numba>=0.59",
+  "torch>=2.2",
+]
+
 [dependency-groups]
 # Define development dependencies using dependency groups (see PEP 735).
 # Because dependency groups are excluded from built distributions of

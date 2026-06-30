@@ -23,17 +23,23 @@ __all__ = [
     # Primary forward-model entry points
     "arbitrary_forwardmodel",
     "autodiff_forwardmodel",
+    "plasmapy_forwardmodel",
     "experimental_forwardmodel",
-    "thomson_forwardmodel",
-
-    # Helper aliases (optional convenience)
+    # Convenience aliases for the susceptibility (chi) helpers
     "chi_arbitrary_forwardmodel",
     "chi_autodiff_forwardmodel",
-
-    # Experimental (PlasmaPy-style) API (suffixed)
+    # Standard PlasmaPy-formalism API
+    "spectral_density_plasmapy",
+    "spectral_density_lite_plasmapy",
+    "spectral_density_model_plasmapy",
+    # Experimental-data-processing API
     "spectral_density_experimental",
     "spectral_density_lite_experimental",
     "spectral_density_model_experimental",
+    "spectral_power_experimental",
+    "spectral_power_lite_experimental",
+    "spectral_power_lite2_experimental",
+    "spectral_power_model_experimental",
 ]
 
 
@@ -49,19 +55,81 @@ import re
 import warnings
 
 from lmfit import Model
-from numba import jit
 from typing import List, Tuple, Union
-import torch
+
+# ``numba`` and ``torch`` are optional dependencies, required only by the
+# arbitrary-VDF (numba) and autodiff (torch) forward models defined below.
+# They are imported defensively so that ``import plasmapy.diagnostics`` keeps
+# working when they are not installed; the functions that actually need them
+# raise an informative error when called.  Install them together with
+# ``pip install plasmapy[thomson]``.
+try:
+    from numba import jit
+
+    _HAS_NUMBA = True
+except ModuleNotFoundError:
+    _HAS_NUMBA = False
+
+    def jit(*jit_args, **jit_kwargs):
+        """No-op stand-in for :func:`numba.jit` when numba is unavailable."""
+        # Support both bare ``@jit`` and parametrized ``@jit(nopython=True)``.
+        if len(jit_args) == 1 and callable(jit_args[0]) and not jit_kwargs:
+            return jit_args[0]
+
+        def _decorator(func):
+            return func
+
+        return _decorator
+
+
+class _TorchPlaceholder:
+    """Stand-in for :mod:`torch` so the module imports without PyTorch.
+
+    The module-level ``set_default_dtype(torch.float64)`` call must not fail at
+    import time, but any genuine tensor operation reached at runtime raises an
+    informative error.
+    """
+
+    _MSG = (
+        "PyTorch is required for the autodiff Thomson scattering forward "
+        "model. Install it with `pip install plasmapy[thomson]` or "
+        "`pip install torch`."
+    )
+
+    float64 = None
+
+    @staticmethod
+    def set_default_dtype(*args, **kwargs):
+        return None
+
+    def __getattr__(self, name):
+        raise ModuleNotFoundError(self._MSG)
+
+
+try:
+    import torch
+
+    _HAS_TORCH = True
+except ModuleNotFoundError:
+    _HAS_TORCH = False
+
+    torch = _TorchPlaceholder()
 
 
 from plasmapy.formulary.dielectric import fast_permittivity_1D_Maxwellian
-from plasmapy.formulary.parameters import fast_plasma_frequency, fast_thermal_speed
+from plasmapy.formulary.frequencies import plasma_frequency_lite
+from plasmapy.formulary.speeds import thermal_speed_coefficients, thermal_speed_lite
 from plasmapy.particles import Particle, particle_mass
 from plasmapy.utils.decorators import validate_quantities
 
 _c = const.c.si.value  # Make sure C is in SI units
 _e = const.e.si.value
 _m_p = const.m_p.si.value
+
+# Most-probable, 3D thermal-speed coefficient, used with thermal_speed_lite to
+# reproduce the unit-stripped thermal speed previously provided by the
+# (now-removed) formulary.parameters.fast_thermal_speed helper.
+_vth_coeff_mp_3d = thermal_speed_coefficients(method="most_probable", ndim=3)
 _m_e = const.m_e.si.value
 
 
@@ -313,11 +381,11 @@ def arbitrary_fast_spectral_density_arbdist(
     for i, fn in enumerate(efn):
         v_axis = e_velocity_axes[i]
         moment1_integrand = np.multiply(fn, v_axis)
-        bulk_velocity = np.trapz(moment1_integrand, v_axis)
+        bulk_velocity = np.trapezoid(moment1_integrand, v_axis)
         moment2_integrand = np.multiply(fn, (v_axis - bulk_velocity) ** 2)
         electron_vel.append(bulk_velocity * k_vec / np.linalg.norm(k_vec))
         electron_vel_1d.append(bulk_velocity)
-        vTe.append(np.sqrt(np.trapz(moment2_integrand, v_axis)))
+        vTe.append(np.sqrt(np.trapezoid(moment2_integrand, v_axis)))
 
     electron_vel = np.array(electron_vel)
     electron_vel_1d = np.array(electron_vel_1d)
@@ -333,11 +401,11 @@ def arbitrary_fast_spectral_density_arbdist(
     for i, fn in enumerate(ifn):
         v_axis = i_velocity_axes[i]
         moment1_integrand = np.multiply(fn, v_axis)
-        bulk_velocity = np.trapz(moment1_integrand, v_axis)
+        bulk_velocity = np.trapezoid(moment1_integrand, v_axis)
         moment2_integrand = np.multiply(fn, (v_axis - bulk_velocity) ** 2)
         ion_vel.append(bulk_velocity * k_vec / np.linalg.norm(k_vec))
         ion_vel_1d.append(bulk_velocity)
-        vTi.append(np.sqrt(np.trapz(moment2_integrand, v_axis)))
+        vTi.append(np.sqrt(np.trapezoid(moment2_integrand, v_axis)))
 
     ion_vel = np.array(ion_vel)
     ion_vel_1d = np.array(ion_vel_1d)
@@ -503,7 +571,7 @@ def arbitrary_fast_spectral_density_arbdist(
     # print("S(k,w) before normaliation:", Skw)
 
     # Normalize result to have integral 1
-    Skw = Skw / np.trapz(Skw, wavelengths)
+    Skw = Skw / np.trapezoid(Skw, wavelengths)
 
     if not torch.is_tensor(alpha):
         alpha = torch.tensor(alpha, dtype=torch.float64)
@@ -581,7 +649,7 @@ def arbitrary_spectral_density_arbdist(
     ion_m = np.zeros(len(ion_species))
     for i, particle in enumerate(ion_species):
         ion_z[i] = particle.charge_number
-        ion_m[i] = ion_species[i].mass_number
+        ion_m[i] = ion_species[i].mass.to(u.kg).value / _m_p
         
     
     probe_vec = probe_vec / np.linalg.norm(probe_vec)
@@ -654,8 +722,8 @@ def arbitrary_fast_spectral_density_maxwellian(
 
     # Calculate plasma parameters
     # Temperatures here in K!
-    vTe = fast_thermal_speed(Te, _m_e)
-    vTi = fast_thermal_speed(Ti, ion_m * _m_p)
+    vTe = thermal_speed_lite(Te, _m_e, _vth_coeff_mp_3d)
+    vTi = thermal_speed_lite(Ti, ion_m * _m_p, _vth_coeff_mp_3d)
     zbar = np.sum(ifract * ion_z)
 
     # Compute electron and ion densities
@@ -663,7 +731,7 @@ def arbitrary_fast_spectral_density_maxwellian(
     ni = ifract * n / zbar  # ne/zbar = sum(ni)
 
     # wpe is calculated for the entire plasma (all electron populations combined)
-    wpe = fast_plasma_frequency(n, 1, _m_e)
+    wpe = plasma_frequency_lite(n, _m_e, 1)
 
     # Convert wavelengths to angular frequencies (electromagnetic waves, so
     # phase speed is c)
@@ -702,14 +770,14 @@ def arbitrary_fast_spectral_density_maxwellian(
     # Calculate the susceptibilities
     chiE = np.zeros([efract.size, w.size], dtype=np.complex128)
     for i, fract in enumerate(efract):
-        wpe = fast_plasma_frequency(ne[i], 1, _m_e)
+        wpe = plasma_frequency_lite(ne[i], _m_e, 1)
         chiE[i, :] = fast_permittivity_1D_Maxwellian(w_e[i, :], k, vTe[i], wpe)
 
     # Treatment of multiple species is an extension of the discussion in
     # Sheffield Sec. 5.1
     chiI = np.zeros([ifract.size, w.size], dtype=np.complex128)
     for i, fract in enumerate(ifract):
-        wpi = fast_plasma_frequency(ni[i], ion_z[i], ion_m[i] * _m_p)
+        wpi = plasma_frequency_lite(ni[i], ion_m[i] * _m_p, ion_z[i])
         chiI[i, :] = fast_permittivity_1D_Maxwellian(w_i[i, :], k, vTi[i], wpi)
 
     # Calculate the longitudinal dielectric function
@@ -757,7 +825,7 @@ def arbitrary_fast_spectral_density_maxwellian(
         x1 = np.argmin(np.abs(wavelengths - myNotch[1]))
         Skw[x0:x1] = 0
         
-    Skw = Skw / np.trapz(Skw, wavelengths)
+    Skw = Skw / np.trapezoid(Skw, wavelengths)
 
     return np.mean(alpha), Skw
 
@@ -977,7 +1045,7 @@ def arbitrary_spectral_density_maxwellian(
     ion_m = np.zeros(len(ion_species))
     for i, particle in enumerate(ion_species):
         ion_z[i] = particle.charge_number
-        ion_m[i] = particle.mass_number
+        ion_m[i] = particle.mass.to(u.kg).value / _m_p
 
     probe_vec = probe_vec / np.linalg.norm(probe_vec)
     scatter_vec = scatter_vec / np.linalg.norm(scatter_vec)
@@ -1342,7 +1410,7 @@ def arbitrary_scattered_power_model_arbdist(wavelengths, settings, params):
     for i, species in enumerate(ion_species):
         particle = Particle(species)
         ion_z[i] = particle.charge_number
-        ion_m[i] = particle.mass_number
+        ion_m[i] = particle.mass.to(u.kg).value / _m_p
     settings["ion_z"] = ion_z
     settings["ion_m"] = ion_m
     
@@ -1468,7 +1536,7 @@ def arbitrary_scattered_power_model_maxwellian(wavelengths, settings, params):
     for i, species in enumerate(settings["ion_species"]):
         particle = Particle(species)
         ion_z[i] = particle.charge_number
-        ion_m[i] = particle.mass_number
+        ion_m[i] = particle.mass.to(u.kg).value / _m_p
     settings["ion_z"] = ion_z
     settings["ion_m"] = ion_m
     
@@ -1570,10 +1638,8 @@ def arbitrary_scattered_power_model_maxwellian(wavelengths, settings, params):
 # ----------------------------------------------------------------------------
 # Autodiff implementation (from cpu_autodiff_thomson.py) -- (2) as outlined at top of .py file.
 # ----------------------------------------------------------------------------
-# Install torch dependencies
-import torch
-import torch.nn.functional as F
-
+# ``torch`` (real or placeholder) is already imported at the top of the
+# module; it is not re-imported here so the optional-dependency guard applies.
 import astropy.constants as const
 import astropy.units as u
 import inspect
@@ -1585,7 +1651,6 @@ from lmfit import Model
 from typing import List, Tuple, Union, Optional    # Imported Optional
 
 from plasmapy.formulary.dielectric import fast_permittivity_1D_Maxwellian
-from plasmapy.formulary.parameters import fast_plasma_frequency, fast_thermal_speed
 from plasmapy.particles import Particle, particle_mass
 from plasmapy.utils.decorators import validate_quantities
 
@@ -1597,7 +1662,6 @@ _e = const.e.si.value
 _m_p = const.m_p.si.value
 _m_e = const.m_e.si.value
 
-@torch.jit.script
 def autodiff_derivative(f: torch.Tensor, x: torch.Tensor, derivative_matrices: Tuple[torch.Tensor, torch.Tensor], order: int):
     dx = x[1]-x[0]
 
@@ -1613,7 +1677,6 @@ def autodiff_derivative(f: torch.Tensor, x: torch.Tensor, derivative_matrices: T
     else:
         print("You can only choose an order of 1 or 2...")
 
-@torch.jit.script
 # Original interpolation function from Lars Du 
 def autodiff_torch_1d_interp(
     x: torch.Tensor,
@@ -1769,17 +1832,31 @@ def autodiff_fast_spectral_density_arbdist(
     derivative_matrices,
     n,
     notches = None,
-    efract = torch.tensor([1.0], dtype=torch.float64),
-    ifract = torch.tensor([1.0], dtype=torch.float64),
-    ion_z=torch.tensor([1], dtype=torch.float64),
-    ion_m=torch.tensor([1], dtype=torch.float64),
-    probe_vec=torch.tensor([1, 0, 0]),
-    scatter_vec=torch.tensor([0, 1, 0]),
+    efract = None,
+    ifract = None,
+    ion_z=None,
+    ion_m=None,
+    probe_vec=None,
+    scatter_vec=None,
     scattered_power=True,
     inner_range=0.1,
     inner_frac=0.8,
     return_chi = False
 ):
+    # Tensor defaults are constructed here (not in the signature) so the
+    # module imports without PyTorch installed.
+    if efract is None:
+        efract = torch.tensor([1.0], dtype=torch.float64)
+    if ifract is None:
+        ifract = torch.tensor([1.0], dtype=torch.float64)
+    if ion_z is None:
+        ion_z = torch.tensor([1], dtype=torch.float64)
+    if ion_m is None:
+        ion_m = torch.tensor([1], dtype=torch.float64)
+    if probe_vec is None:
+        probe_vec = torch.tensor([1, 0, 0])
+    if scatter_vec is None:
+        scatter_vec = torch.tensor([0, 1, 0])
 
     # Ensure unit vectors are normalized
     probe_vec = probe_vec / torch.linalg.norm(probe_vec)
@@ -1798,12 +1875,12 @@ def autodiff_fast_spectral_density_arbdist(
     for i, fn in enumerate(efn):
         v_axis = e_velocity_axes[i]
         moment1_integrand = torch.multiply(fn, v_axis)
-        bulk_velocity = torch.trapz(moment1_integrand, v_axis)
+        bulk_velocity = torch.trapezoid(moment1_integrand, v_axis)
         moment2_integrand = torch.multiply(fn, torch.square(v_axis - bulk_velocity))
 
         electron_vel = torch.cat((electron_vel, bulk_velocity * k_vec / torch.linalg.norm(k_vec)))
         electron_vel_1d = torch.cat((electron_vel_1d, torch.tensor([bulk_velocity])))
-        vTe = torch.cat((vTe, torch.tensor([torch.sqrt(torch.trapz(moment2_integrand, v_axis))])))
+        vTe = torch.cat((vTe, torch.tensor([torch.sqrt(torch.trapezoid(moment2_integrand, v_axis))])))
 
     electron_vel = torch.reshape(electron_vel, (len(efn), 3))
 
@@ -1814,12 +1891,12 @@ def autodiff_fast_spectral_density_arbdist(
     for i, fn in enumerate(ifn):
         v_axis = i_velocity_axes[i]
         moment1_integrand = torch.multiply(fn, v_axis)
-        bulk_velocity = torch.trapz(moment1_integrand, v_axis)
+        bulk_velocity = torch.trapezoid(moment1_integrand, v_axis)
         moment2_integrand = torch.multiply(fn, torch.square(v_axis - bulk_velocity))
 
         ion_vel = torch.cat((ion_vel, bulk_velocity * k_vec / torch.linalg.norm(k_vec)))
         ion_vel_1d = torch.cat((ion_vel_1d, torch.tensor([bulk_velocity])))
-        vTi = torch.cat((vTi, torch.tensor([torch.sqrt(torch.trapz(moment2_integrand, v_axis))])))
+        vTi = torch.cat((vTi, torch.tensor([torch.sqrt(torch.trapezoid(moment2_integrand, v_axis))])))
 
     ion_vel = torch.reshape(ion_vel, (len(ifn), 3))
 
@@ -1972,7 +2049,7 @@ def autodiff_fast_spectral_density_arbdist(
         Skw = torch.mul(Skw, bools)
 
     # Normalize result to have integral 1
-    Skw = Skw / torch.trapz(Skw, wavelengths)
+    Skw = Skw / torch.trapezoid(Skw, wavelengths)
 
     if return_chi:
         return torch.mean(alpha), Skw, chiE, chiI
@@ -1991,8 +2068,8 @@ def autodiff_spectral_density_arbdist(
     efract = None,
     ifract = None,
     ion_species: Union[str, List[str], Particle, List[Particle]] = "p",
-    probe_vec=torch.tensor([1, 0, 0]),
-    scatter_vec=torch.tensor([0, 1, 0]),
+    probe_vec=None,
+    scatter_vec=None,
     scattered_power=False,
     inner_range=0.1,
     inner_frac=0.8,
@@ -2001,6 +2078,13 @@ def autodiff_spectral_density_arbdist(
 
     from plasmapy.particles import Particle
     from typing import List, Union
+
+    # Tensor defaults are constructed here (not in the signature) so the
+    # module imports without PyTorch installed.
+    if probe_vec is None:
+        probe_vec = torch.tensor([1, 0, 0])
+    if scatter_vec is None:
+        scatter_vec = torch.tensor([0, 1, 0])
 
     # --- Condition ion_species ---
     if isinstance(ion_species, (str, Particle)):
@@ -2042,7 +2126,7 @@ def autodiff_spectral_density_arbdist(
     ion_m = torch.zeros(len(ion_species))
     for i, particle in enumerate(ion_species):
         ion_z[i] = particle.charge_number
-        ion_m[i] = ion_species[i].mass_number
+        ion_m[i] = ion_species[i].mass.to(u.kg).value / _m_p
         
     probe_vec = probe_vec / torch.linalg.norm(probe_vec)
     scatter_vec = scatter_vec / torch.linalg.norm(scatter_vec)
@@ -2137,10 +2221,6 @@ from plasmapy.utils.decorators import (
     validate_quantities,
 )
 
-
-# List of lite-function names populated by @bind_lite_func
-__lite_funcs__ = []
-__all__ += __lite_funcs__
 
 c_si_unitless = const.c.si.value
 e_si_unitless = const.e.si.value
@@ -3145,8 +3225,6 @@ from plasmapy.utils.decorators import (
     preserve_signature,
     validate_quantities,
 )
-
-__all__ += __lite_funcs__
 
 c_si_unitless = const.c.si.value
 e_si_unitless = const.e.si.value
@@ -5343,23 +5421,3 @@ def spectral_power_model_experimental(  # noqa: C901, PLR0912, PLR0915
     )
 
 experimental_forwardmodel = spectral_density_experimental
-
-try:
-    __all__.extend([
-        "spectral_density_plasmapy",
-        "spectral_density_lite_plasmapy",
-        "spectral_density_model_plasmapy",
-        "plasmapy_forwardmodel",
-        "spectral_density_experimental",
-        "spectral_density_lite_experimental",
-        "spectral_density_model_experimental",
-        "spectral_power_experimental",
-        "spectral_power_lite_experimental",
-        "spectral_power_lite2_experimental",
-        "spectral_density_model2_experimental",
-        "spectral_power_model_experimental",
-        "spectral_power_model2_experimental",
-        "experimental_forwardmodel",
-    ])
-except Exception:
-    pass

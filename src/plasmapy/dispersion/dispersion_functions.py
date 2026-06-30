@@ -4,18 +4,75 @@ derivative :math:`Z′(ζ)`.
 """
 
 __all__ = ["plasma_dispersion_func", "plasma_dispersion_func_deriv"]
-
+__lite_funcs__ = ["plasma_dispersion_func_lite", "plasma_dispersion_func_deriv_lite"]
 
 import astropy.units as u
 import numpy as np
+
 from scipy.special import wofz as faddeeva_function
 
+from plasmapy.utils.decorators import bind_lite_func, preserve_signature
 
+__all__ += __lite_funcs__
+
+
+@preserve_signature
+def plasma_dispersion_func_lite(zeta):
+    r"""
+    The :term:`lite-function` for
+    `~plasmapy.dispersion.dispersion_functions.plasma_dispersion_func`.
+    Performs the same plasma dispersion function calculation as
+    `~plasmapy.dispersion.dispersion_functions.plasma_dispersion_func`,
+    but is intended for computational use and, thus, has all data
+    conditioning safeguards removed.
+
+    Parameters
+    ----------
+    zeta : complex, float, or `~numpy.ndarray`
+        The real or complex value (assumed dimensionless) to be provided
+        as an argument to the plasma dispersion function.
+
+    Returns
+    -------
+    complex, float, or `~numpy.ndarray`
+        The real or complex value of plasma dispersion function
+        evaluated at ``zeta``.
+
+    Notes
+    -----
+    The plasma dispersion function is defined as:
+
+    .. math::
+        Z(ζ) = π^{-0.5} \int_{-∞}^{+∞}
+        \frac{e^{-x^2}}{x-ζ} dx
+
+    where the argument is a complex number :cite:p:`fried:1961`.
+
+    In plasma wave theory, the plasma dispersion function appears
+    frequently when the background medium has a Maxwellian
+    distribution function.  The argument of this function then refers
+    to the ratio of a wave's phase velocity to a thermal velocity.
+
+    Examples
+    --------
+    >>> plasma_dispersion_func_lite(0)
+    np.complex128(1.77245385...j)
+    >>> plasma_dispersion_func_lite(1 + 1j)
+    np.complex128(-0.36905845...+0.54014504...j)
+    >>> plasma_dispersion_func_lite([0.3, 0.7 + 2.3j])
+    array([-0.56526333+1.61990085j, -0.09995023+0.37685142j])
+    """
+    return 1j * np.sqrt(np.pi) * faddeeva_function(zeta)
+
+
+@bind_lite_func(plasma_dispersion_func_lite)
 def plasma_dispersion_func(
     zeta: complex | np.ndarray | u.Quantity[u.dimensionless_unscaled],
 ) -> complex | np.ndarray | u.Quantity[u.dimensionless_unscaled]:
     r"""
     Calculate the plasma dispersion function.
+
+    **Lite Version:** `~plasmapy.dispersion.dispersion_functions.plasma_dispersion_func_lite`
 
     The plasma dispersion function is defined as:
 
@@ -64,7 +121,7 @@ def plasma_dispersion_func(
     array([-0.56526333+1.61990085j, -0.09995023+0.37685142j])
     """
     try:
-        return 1j * np.sqrt(np.pi) * faddeeva_function(zeta)
+        return plasma_dispersion_func_lite(zeta)
     except u.UnitTypeError as wrong_units:
         raise u.UnitsError(
             "The argument to plasma_dispersion_func "
@@ -77,11 +134,58 @@ def plasma_dispersion_func(
         ) from wrong_type
 
 
+@preserve_signature
+def plasma_dispersion_func_deriv_lite(zeta):
+    r"""
+    The :term:`lite-function` for
+    `~plasmapy.dispersion.dispersion_functions.plasma_dispersion_func_deriv`.
+    Performs the same plasma dispersion function derivative calculation
+    as
+    `~plasmapy.dispersion.dispersion_functions.plasma_dispersion_func_deriv`,
+    but is intended for computational use and, thus, has all data
+    conditioning safeguards removed.
+
+    Parameters
+    ----------
+    zeta : complex, float, or `~numpy.ndarray`
+        Argument (assumed dimensionless) of the plasma dispersion
+        function.
+
+    Returns
+    -------
+    complex, float, or `~numpy.ndarray`
+        First derivative of the plasma dispersion function.
+
+    Notes
+    -----
+    The derivative of the plasma dispersion function is:
+
+    .. math::
+        Z'(ζ) = π^{-1/2} \int_{-∞}^{+∞} \frac{e^{-x^2}}{(x-ζ)^2} dx
+
+    where the argument :math:`ζ` is a complex number
+    :cite:p:`fried:1961`.
+
+    Examples
+    --------
+    >>> plasma_dispersion_func_deriv_lite(0)
+    np.complex128(-2+0j)
+    >>> plasma_dispersion_func_deriv_lite(1j)
+    np.complex128(-0.48425568771737604+0j)
+    >>> plasma_dispersion_func_deriv_lite(-1.52 + 0.47j)
+    np.complex128(0.165871331...+0.4458797880...j)
+    """
+    return -2 * (1 + zeta * plasma_dispersion_func_lite(zeta))
+
+
+@bind_lite_func(plasma_dispersion_func_deriv_lite)
 def plasma_dispersion_func_deriv(
     zeta: complex | np.ndarray | u.Quantity[u.dimensionless_unscaled],
 ) -> complex | np.ndarray | u.Quantity[u.dimensionless_unscaled]:
     r"""
     Calculate the derivative of the plasma dispersion function.
+
+    **Lite Version:** `~plasmapy.dispersion.dispersion_functions.plasma_dispersion_func_deriv_lite`
 
     The derivative of the plasma dispersion function is:
 
@@ -133,86 +237,3 @@ def plasma_dispersion_func_deriv(
             "must be one of the following types: complex, float, "
             "int, ndarray, or a dimensionless Quantity."
         ) from wrong_type
-
-
-# -------------------------------------------------------------------
-# Backwards-compatibility / deprecated "dispersionfunction" API
-# -------------------------------------------------------------------
-import warnings
-
-# PlasmaPy historically used PlasmaPyFutureWarning. If unavailable in a
-# trimmed-down repo, fall back to FutureWarning.
-try:
-    from plasmapy.utils.exceptions import PlasmaPyFutureWarning  # type: ignore
-except Exception:  # pragma: no cover
-    class PlasmaPyFutureWarning(FutureWarning):
-        """Fallback warning used when PlasmaPyFutureWarning is unavailable."""
-        pass
-
-
-def plasma_dispersion_func_lite(zeta):
-    r"""
-    Deprecated lite-wrapper for the plasma dispersion function.
-
-    This function exists for backwards compatibility with the former
-    ``plasmapy.dispersion.dispersionfunction`` module.
-
-    Use ``plasma_dispersion_func`` (or ``plasma_dispersion_func.lite``)
-    instead.
-    """
-    warnings.warn(
-        (
-            "plasma_dispersion_func_lite is deprecated. Use "
-            "plasmapy.dispersion.dispersion_functions.plasma_dispersion_func.lite "
-            "or plasma_dispersion_func instead."
-        ),
-        PlasmaPyFutureWarning,
-        stacklevel=2,
-    )
-    return plasma_dispersion_func(zeta)
-
-
-def plasma_dispersion_func_deriv_lite(zeta):
-    r"""
-    Deprecated lite-wrapper for the derivative of the plasma dispersion function.
-
-    This function exists for backwards compatibility with the former
-    ``plasmapy.dispersion.dispersionfunction`` module.
-
-    Use ``plasma_dispersion_func_deriv`` (or ``plasma_dispersion_func_deriv.lite``)
-    instead.
-    """
-    warnings.warn(
-        (
-            "plasma_dispersion_func_deriv_lite is deprecated. Use "
-            "plasmapy.dispersion.dispersion_functions.plasma_dispersion_func_deriv.lite "
-            "or plasma_dispersion_func_deriv instead."
-        ),
-        PlasmaPyFutureWarning,
-        stacklevel=2,
-    )
-    return plasma_dispersion_func_deriv(zeta)
-
-
-# Attach .lite attributes in the same spirit as PlasmaPy's bind_lite_func.
-# These are *attributes* (not separate public functions) used by some code.
-try:
-    plasma_dispersion_func.lite = plasma_dispersion_func_lite  # type: ignore[attr-defined]
-    plasma_dispersion_func_deriv.lite = plasma_dispersion_func_deriv_lite  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    pass
-
-
-# Expand public exports to include the deprecated lite wrappers.
-try:
-    __all__ = list(__all__) + [
-        "plasma_dispersion_func_lite",
-        "plasma_dispersion_func_deriv_lite",
-    ]
-except Exception:  # pragma: no cover
-    __all__ = [
-        "plasma_dispersion_func",
-        "plasma_dispersion_func_deriv",
-        "plasma_dispersion_func_lite",
-        "plasma_dispersion_func_deriv_lite",
-    ]

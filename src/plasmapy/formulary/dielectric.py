@@ -419,7 +419,8 @@ from astropy import units as u
 from collections import namedtuple
 
 from plasmapy.dispersion.dispersion_functions import plasma_dispersion_func_deriv
-from plasmapy.formulary import parameters
+from plasmapy.formulary.frequencies import gyrofrequency, plasma_frequency
+from plasmapy.formulary.speeds import thermal_speed
 from plasmapy.utils.decorators import validate_quantities
 
 r"""
@@ -520,8 +521,8 @@ def cold_plasma_permittivity_SDP_fast(B: u.T, species, n, omega: u.rad / u.s):
     S, D, P = 1, 0, 1
 
     for s, n_s in zip(species, n):
-        omega_c = parameters.gyrofrequency(B=B, particle=s, signed=True)
-        omega_p = parameters.plasma_frequency(n=n_s, particle=s)
+        omega_c = gyrofrequency(B=B, particle=s, signed=True)
+        omega_p = plasma_frequency(n=n_s, particle=s)
 
         S += -(omega_p ** 2) / (omega ** 2 - omega_c ** 2)
         D += omega_c / omega * omega_p ** 2 / (omega ** 2 - omega_c ** 2)
@@ -612,8 +613,8 @@ def cold_plasma_permittivity_LRP_fast(B: u.T, species, n, omega: u.rad / u.s):
     L, R, P = 1, 1, 1
 
     for s, n_s in zip(species, n):
-        omega_c = parameters.gyrofrequency(B=B, particle=s, signed=True)
-        omega_p = parameters.plasma_frequency(n=n_s, particle=s)
+        omega_c = gyrofrequency(B=B, particle=s, signed=True)
+        omega_p = plasma_frequency(n=n_s, particle=s)
 
         L += -(omega_p ** 2) / (omega * (omega - omega_c))
         R += -(omega_p ** 2) / (omega * (omega + omega_c))
@@ -717,17 +718,17 @@ def permittivity_1D_Maxwellian_fast(
     >>> T = 30 * 11600 * u.K
     >>> n = 1e18 * u.cm**-3
     >>> particle = 'Ne'
-    >>> z_mean = 8 * u.dimensionless_unscaled
-    >>> vTh = parameters.thermal_speed(T, particle, method="most_probable")
+    >>> z_mean = 8
+    >>> vTh = thermal_speed(T, particle, method="most_probable")
     >>> omega = 5.635e14 * 2 * pi * u.rad / u.s
     >>> kWave = omega / vTh
     >>> permittivity_1D_Maxwellian(omega, kWave, T, n, particle, z_mean)
-    <Quantity -6.72809...e-08+5.76037...e-07j>
+    <Quantity -6.72955...e-08+5.76163...e-07j>
     """
     # thermal velocity
-    vTh = parameters.thermal_speed(T=T, particle=particle, method="most_probable")
+    vTh = thermal_speed(T=T, particle=particle, method="most_probable")
     # plasma frequency
-    wp = parameters.plasma_frequency(n=n, particle=particle, z_mean=z_mean)
+    wp = plasma_frequency(n=n, particle=particle, Z=z_mean)
 
     return fast_permittivity_1D_Maxwellian(omega, kWave, vTh, wp)
 
