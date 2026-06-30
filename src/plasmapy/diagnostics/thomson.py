@@ -2169,7 +2169,7 @@ def arbitrary_forwardmodel(*args, **kwargs):
     """
     Forward model for arbitrary VDFs (NumPy/Astropy-units implementation).
 
-    This is an alias for :func:`arbitrary_spectral_density_arbdist`.
+    This is an alias for ``arbitrary_spectral_density_arbdist``.
     """
     return arbitrary_spectral_density_arbdist(*args, **kwargs)
 
@@ -2178,7 +2178,7 @@ def autodiff_forwardmodel(*args, **kwargs):
     """
     Forward model for arbitrary VDFs with PyTorch autodiff support.
 
-    This is an alias for :func:`autodiff_spectral_density_arbdist`.
+    This is an alias for ``autodiff_spectral_density_arbdist``.
     """
     return autodiff_spectral_density_arbdist(*args, **kwargs)
 
