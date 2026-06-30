@@ -2,6 +2,7 @@ Synchronized the Schaeffer-Lab fork with upstream PlasmaPy ``main`` and
 reconciled the Thomson-scattering forward-model code with the current package
 structure: guarded the optional ``torch``/``numba`` dependencies so
 ``plasmapy.diagnostics`` imports without them, rewired the helpers onto the
-canonical formulary lite-functions, removed the duplicated monolithic
-``formulary/parameters.py``, and raised the minimum ``astropy`` requirement to
-``8.0`` (CODATA 2022).
+canonical formulary lite-functions, and removed the duplicated monolithic
+``formulary/parameters.py``. Dependency pins (including ``astropy``) and the
+constant-dependent test reference values are kept aligned with upstream
+(CODATA 2018).
