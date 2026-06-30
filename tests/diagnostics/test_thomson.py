@@ -9,6 +9,7 @@ import astropy.units as u
 import numpy as np
 import pytest
 from lmfit import Parameter, Parameters
+from scipy.optimize import least_squares
 
 from plasmapy.diagnostics import thomson
 from plasmapy.particles import Particle, particle_mass
@@ -1508,3 +1509,61 @@ def test_spectral_density_arbitrary_normalization():
 
     integral = np.trapezoid(Skw.to(u.m**-1).value, wavelengths.to(u.m).value)
     assert np.isclose(integral, 1.0, rtol=1e-6)
+
+
+def _super_gaussian(v, width, drift, p):
+    """Normalized 1D super-Gaussian distribution ``exp(-|(v-drift)/width|**p)``."""
+    f = np.exp(-(np.abs((v - drift) / width) ** p))
+    return f / np.trapezoid(f, v)
+
+
+def test_spectral_density_arbitrary_supergaussian_fit():
+    """
+    A non-Maxwellian (super-Gaussian) ion distribution can be recovered from
+    a synthetic spectrum by least-squares fitting with ``scipy.optimize`` --
+    i.e. the arbitrary-VDF forward model is differentiable enough for
+    gradient-free / finite-difference fitting without any autodiff backend.
+    """
+    probe = 532 * u.nm
+    wavelengths = np.linspace(531, 533, 250) * u.nm
+    n = 1e18 * u.cm**-3
+    ions = ["H+"]
+
+    Te_K = (200 * u.eV).to(u.K, equivalencies=u.temperature_energy())
+    Ti_K = (50 * u.eV).to(u.K, equivalencies=u.temperature_energy())
+    sig_e = np.sqrt(const.k_B * Te_K / const.m_e).to(u.m / u.s).value
+    sig_i = np.sqrt(const.k_B * Ti_K / const.m_p).to(u.m / u.s).value
+    ve = np.linspace(-8 * sig_e, 8 * sig_e, 1201)
+    vi = np.linspace(-8 * sig_i, 8 * sig_i, 1201)
+
+    # Fixed Maxwellian electrons; the ion distribution is what we fit.
+    efn = _super_gaussian(ve, np.sqrt(2) * sig_e, 0.0, 2.0)
+
+    def model(width_i, drift_i, p_i):
+        ifn = _super_gaussian(vi, width_i, drift_i, p_i)
+        _alpha, Skw = thomson.spectral_density_arbitrary(
+            wavelengths,
+            probe,
+            n,
+            e_velocity_axes=ve[None, :] * u.m / u.s,
+            i_velocity_axes=vi[None, :] * u.m / u.s,
+            efn=efn[None, :] * u.s / u.m,
+            ifn=ifn[None, :] * u.s / u.m,
+            ions=ions,
+        )
+        return Skw.to(u.m**-1).value
+
+    # Synthesize a spectrum from a known non-Maxwellian (p = 3.2) ion VDF.
+    truth = {"width": np.sqrt(2) * sig_i, "drift": 4e4, "p": 3.2}
+    target = model(truth["width"], truth["drift"], truth["p"])
+
+    # Fit starting from a Maxwellian (p = 2), offset width and drift.
+    x0 = [1.3 * np.sqrt(2) * sig_i, 0.0, 2.5]
+    result = least_squares(
+        lambda theta: model(*theta) - target, x0, method="lm", max_nfev=200
+    )
+    width, drift, p = result.x
+
+    assert np.isclose(width, truth["width"], rtol=1e-2)
+    assert np.isclose(p, truth["p"], rtol=1e-2)
+    assert np.isclose(drift, truth["drift"], rtol=1e-2)
