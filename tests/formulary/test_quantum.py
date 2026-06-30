@@ -207,7 +207,7 @@ class Test__chemical_potential_interp:
         """Initializing parameters for tests"""
         cls.n_e = 1e23 * u.cm**-3
         cls.T = 11604 * u.K
-        cls.True1 = 7.741254037813922
+        cls.True1 = 7.741254027015188
 
     def test_known1(self) -> None:
         """

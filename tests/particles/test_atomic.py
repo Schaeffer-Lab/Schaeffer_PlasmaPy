@@ -488,7 +488,7 @@ atomic_numbers = range(1, 119)
 
 isotopic_abundance_isotopes = (common_isotopes(element) for element in atomic_numbers)
 
-isotopic_abundance_sum_table = (
+isotopic_abundance_sum_table = [
     (element, isotopes)
     for element, isotopes in zip(
         atomic_numbers,
@@ -496,7 +496,7 @@ isotopic_abundance_sum_table = (
         strict=False,
     )
     if isotopes
-)
+]
 
 
 @pytest.mark.parametrize(("element", "isotopes"), isotopic_abundance_sum_table)

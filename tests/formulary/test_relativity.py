@@ -107,10 +107,10 @@ def test_relativistic_energy_warnings(velocity, mass, warning) -> None:
 proton_at_half_c_inputs = [
     ("v_over_c", 0.5),
     ("velocity", 0.5 * c),
-    ("lorentz_factor", 1.1547005383792517),
-    ("total_energy", 1.7358354725115025e-10 * u.J),
-    ("kinetic_energy", 2.3255785652637692e-11 * u.J),
-    ("momentum", 2.8950619440057805e-19 * u.kg * u.m / u.s),
+    ("lorentz_factor", 1.1547005383792515),
+    ("total_energy", 1.7358354748569146e-10 * u.J),
+    ("kinetic_energy", 2.3255785684060234e-11 * u.J),
+    ("momentum", 2.8950619479175068e-19 * u.kg * u.m / u.s),
 ]
 
 

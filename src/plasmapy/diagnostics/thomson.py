@@ -28,7 +28,10 @@ __all__ = [
     # Convenience aliases for the susceptibility (chi) helpers
     "chi_arbitrary_forwardmodel",
     "chi_autodiff_forwardmodel",
-    # Standard PlasmaPy-formalism API
+    # Standard PlasmaPy-formalism API (canonical names + suffixed variants)
+    "spectral_density",
+    "spectral_density_lite",
+    "spectral_density_model",
     "spectral_density_plasmapy",
     "spectral_density_lite_plasmapy",
     "spectral_density_model_plasmapy",
@@ -3197,6 +3200,16 @@ def spectral_density_model_plasmapy(  # noqa: C901, PLR0912, PLR0915
     )
 
 plasmapy_forwardmodel = spectral_density_plasmapy
+
+# Canonical PlasmaPy Thomson-scattering API names (formalism 3). These alias
+# the ``*_plasmapy`` implementations -- which are the standard PlasmaPy
+# formalism -- so that code and tests written against the upstream interface
+# continue to work unchanged.
+spectral_density = spectral_density_plasmapy
+spectral_density_lite = spectral_density_lite_plasmapy
+spectral_density_model = spectral_density_model_plasmapy
+_count_populations_in_params = _count_populations_in_params_plasmapy
+_params_to_array = _params_to_array_plasmapy
 
 # ============================================================================
 # Formalism for experimental processing -- as outlined in (4) at top of file.

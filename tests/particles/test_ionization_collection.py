@@ -827,9 +827,11 @@ class TestIonizationStateCollectionDensityEqualities:
 
     @pytest.mark.parametrize(
         ("this", "that"),
-        itertools.product(
-            ["ndens1", "ndens2", "no_ndens3", "no_ndens4", "no_ndens5"],
-            repeat=2,
+        list(
+            itertools.product(
+                ["ndens1", "ndens2", "no_ndens3", "no_ndens4", "no_ndens5"],
+                repeat=2,
+            )
         ),
     )
     def test_equality(self, this, that) -> None:
