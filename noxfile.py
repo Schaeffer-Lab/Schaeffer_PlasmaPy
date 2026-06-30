@@ -37,8 +37,9 @@ import re
 import shutil
 import sys
 
-import nox  # ty:ignore[unresolved-import]
-import nox_uv  # ty:ignore[unresolved-import]
+import nox
+import nox.command
+import nox_uv
 
 # SPEC 0 indicates that scientific Python packages should support
 # versions of Python that have been released in the last 3 years, or
@@ -160,7 +161,7 @@ def lock(session: nox.Session) -> None:
     )
     try:
         # Use session.run() with silent=True to return the command output
-        uv_output: str | bool = session.run(*uv_lock, silent=RUNNING_ON_CI)
+        uv_output: str | bool | None = session.run(*uv_lock, silent=RUNNING_ON_CI)
     except nox.command.CommandFailed:
         session.warn("⚠️ uv.lock is invalid, likely due to a git merge conflict.")
         session.log(
@@ -170,7 +171,7 @@ def lock(session: nox.Session) -> None:
             "🪧 If this next attempt is unsuccessful, delete uv.lock and try again.",
         )
         session.run("git", "checkout", "--theirs", "--", "uv.lock", external=True)
-        uv_output: str | bool = session.run(*uv_lock, silent=RUNNING_ON_CI)
+        uv_output: str | bool | None = session.run(*uv_lock, silent=RUNNING_ON_CI)
 
     if RUNNING_ON_CI:
         session.log(uv_output)

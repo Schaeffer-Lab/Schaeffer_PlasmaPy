@@ -67,7 +67,7 @@ from typing import List, Tuple, Union
 # raise an informative error when called.  Install them together with
 # ``pip install plasmapy[thomson]``.
 try:
-    from numba import jit
+    from numba import jit  # ty:ignore[unresolved-import]
 
     _HAS_NUMBA = True
 except ModuleNotFoundError:
@@ -116,7 +116,7 @@ class _TorchPlaceholder:
 
 
 try:
-    import torch
+    import torch  # ty:ignore[unresolved-import]
 
     _HAS_TORCH = True
 except ModuleNotFoundError:
@@ -604,8 +604,8 @@ def arbitrary_spectral_density_arbdist(
     ifn: u.nm ** -1,
     n: u.m ** -3,
     notches: u.nm = None,
-    efract: np.ndarray = None,
-    ifract: np.ndarray = None,
+    efract: np.ndarray | None = None,
+    ifract: np.ndarray | None = None,
     ion_species: Union[str, List[str], Particle, List[Particle]] = "p",
     probe_vec=np.array([1, 0, 0]),
     scatter_vec=np.array([0, 1, 0]),
@@ -645,20 +645,20 @@ def arbitrary_spectral_density_arbdist(
     
     # Condition ion_species
     if isinstance(ion_species, (str, Particle)):
-        ion_species = [ion_species]
-    if len(ion_species) == 0:
+        ion_species = [ion_species]  # ty:ignore[invalid-assignment]
+    if len(ion_species) == 0:  # ty:ignore[invalid-argument-type]
         raise ValueError("At least one ion species needs to be defined.")
-    for ii, ion in enumerate(ion_species):
+    for ii, ion in enumerate(ion_species):  # ty:ignore[invalid-argument-type]
         if isinstance(ion, Particle):
             continue
-        ion_species[ii] = Particle(ion)
+        ion_species[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
     
     # Create arrays of ion Z and mass from particles given
-    ion_z = np.zeros(len(ion_species))
-    ion_m = np.zeros(len(ion_species))
-    for i, particle in enumerate(ion_species):
+    ion_z = np.zeros(len(ion_species))  # ty:ignore[invalid-argument-type]
+    ion_m = np.zeros(len(ion_species))  # ty:ignore[invalid-argument-type]
+    for i, particle in enumerate(ion_species):  # ty:ignore[invalid-argument-type]
         ion_z[i] = particle.charge_number
-        ion_m[i] = ion_species[i].mass.to(u.kg).value / _m_p
+        ion_m[i] = ion_species[i].mass.to(u.kg).value / _m_p  # ty:ignore[not-subscriptable]
         
     
     probe_vec = probe_vec / np.linalg.norm(probe_vec)
@@ -696,7 +696,7 @@ def arbitrary_fast_spectral_density_maxwellian(
     n,
     Te,
     Ti,
-    notches: np.ndarray = None,
+    notches: np.ndarray | None = None,
     efract: np.ndarray = np.array([1.0]),
     ifract: np.ndarray = np.array([1.0]),
     ion_z=np.array([1]),
@@ -725,7 +725,7 @@ def arbitrary_fast_spectral_density_maxwellian(
         ion_vel = np.zeros([ifract.size, 3])
     
     if notches is None:
-        notches = [(0, 0)]
+        notches = [(0, 0)]  # ty:ignore[invalid-assignment]
 
     scattering_angle = np.arccos(np.dot(probe_vec, scatter_vec))
 
@@ -826,7 +826,7 @@ def arbitrary_fast_spectral_density_maxwellian(
         Skw = Skw * (1 + 2 * w / wl) * 2 / (wavelengths ** 2) 
     
     #Account for notch(es)
-    for myNotch in notches:
+    for myNotch in notches:  # ty:ignore[not-iterable]
         if len(myNotch) != 2:
             raise ValueError("Notches must be pairs of values")
             
@@ -853,8 +853,8 @@ def arbitrary_spectral_density_maxwellian(
     Te: u.K,
     Ti: u.K,
     notches: u.nm = None,
-    efract: np.ndarray = None,
-    ifract: np.ndarray = None,
+    efract: np.ndarray | None = None,
+    ifract: np.ndarray | None = None,
     ion_species: Union[str, List[str], Particle, List[Particle]] = "p",
     electron_vel: u.m / u.s = None,
     ion_vel: u.m / u.s = None,
@@ -1002,33 +1002,33 @@ def arbitrary_spectral_density_maxwellian(
 
     # Condition ion_species
     if isinstance(ion_species, (str, Particle)):
-        ion_species = [ion_species]
-    if len(ion_species) == 0:
+        ion_species = [ion_species]  # ty:ignore[invalid-assignment]
+    if len(ion_species) == 0:  # ty:ignore[invalid-argument-type]
         raise ValueError("At least one ion species needs to be defined.")
-    for ii, ion in enumerate(ion_species):
+    for ii, ion in enumerate(ion_species):  # ty:ignore[invalid-argument-type]
         if isinstance(ion, Particle):
             continue
-        ion_species[ii] = Particle(ion)
+        ion_species[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
 
     # Condition Ti
     if Ti.size == 1:
         # If a single quantity is given, put it in an array so it's iterable
         # If Ti.size != len(ion_species), assume same temp. for all species
-        Ti = [Ti.value] * len(ion_species) * Ti.unit
-    elif Ti.size != len(ion_species):
+        Ti = [Ti.value] * len(ion_species) * Ti.unit  # ty:ignore[invalid-argument-type]
+    elif Ti.size != len(ion_species):  # ty:ignore[invalid-argument-type]
         raise ValueError(
-            f"Got {Ti.size} ion temperatures and expected {len(ion_species)}."
+            f"Got {Ti.size} ion temperatures and expected {len(ion_species)}."  # ty:ignore[invalid-argument-type]
         )
 
     # Make sure the sizes of ion_species, ifract, ion_vel, and Ti all match
     if (
-        (len(ion_species) != ifract.size)
+        (len(ion_species) != ifract.size)  # ty:ignore[invalid-argument-type]
         or (ion_vel.shape[0] != ifract.size)
         or (Ti.size != ifract.size)
     ):
         raise ValueError(
             f"Inconsistent number of species in ifract ({ifract}), "
-            f"ion_species ({len(ion_species)}), Ti ({Ti.size}), "
+            f"ion_species ({len(ion_species)}), Ti ({Ti.size}), "  # ty:ignore[invalid-argument-type]
             f"and/or ion_vel ({ion_vel.shape[0]})."
         )
 
@@ -1050,9 +1050,9 @@ def arbitrary_spectral_density_maxwellian(
         )
 
     # Create arrays of ion Z and mass from particles given
-    ion_z = np.zeros(len(ion_species))
-    ion_m = np.zeros(len(ion_species))
-    for i, particle in enumerate(ion_species):
+    ion_z = np.zeros(len(ion_species))  # ty:ignore[invalid-argument-type]
+    ion_m = np.zeros(len(ion_species))  # ty:ignore[invalid-argument-type]
+    for i, particle in enumerate(ion_species):  # ty:ignore[invalid-argument-type]
         ion_z[i] = particle.charge_number
         ion_m[i] = particle.mass.to(u.kg).value / _m_p
 
@@ -1165,12 +1165,12 @@ def arbitrary__scattered_power_model_arbdist(wavelengths, settings=None, **param
     eparams: parameters to put into emodel to generate a VDF
     iparams: parameters to put into imodel to generate a VDF
     """
-    
+
     
     # check number of ion species
     
-    if "ion_m" in settings:
-        nSpecies = len(settings["ion_m"])
+    if "ion_m" in settings:  # ty:ignore[unsupported-operator]
+        nSpecies = len(settings["ion_m"])  # ty:ignore[not-subscriptable]
     else:
         nSpecies = 1
     
@@ -1183,8 +1183,8 @@ def arbitrary__scattered_power_model_arbdist(wavelengths, settings=None, **param
     iparams = [{} for _ in range(nSpecies)]
 
     # Extract crucial settings of emodel, imodel first
-    emodel = settings["emodel"]
-    imodel = settings["imodel"]
+    emodel = settings["emodel"]  # ty:ignore[not-subscriptable]
+    imodel = settings["imodel"]  # ty:ignore[not-subscriptable]
 
     # print("emodel:", emodel)
     # print("imodel:", imodel)
@@ -1198,7 +1198,7 @@ def arbitrary__scattered_power_model_arbdist(wavelengths, settings=None, **param
         if "q_" + str(i) in params:
             ion_z[i] = params["q_" + str(i)]
         else:
-            ion_z[i] = settings["ion_z"][i]
+            ion_z[i] = settings["ion_z"][i]  # ty:ignore[not-subscriptable]
     
     for myParam in params.keys():
         
@@ -1213,8 +1213,8 @@ def arbitrary__scattered_power_model_arbdist(wavelengths, settings=None, **param
             n = params[myParam]
         
     # Create VDFs from model functions
-    ve = settings["e_velocity_axes"]
-    vi = settings["i_velocity_axes"]
+    ve = settings["e_velocity_axes"]  # ty:ignore[not-subscriptable]
+    vi = settings["i_velocity_axes"]  # ty:ignore[not-subscriptable]
 
     fe = emodel(ve, **eparams)
     fi = [None] * nSpecies
@@ -1227,7 +1227,7 @@ def arbitrary__scattered_power_model_arbdist(wavelengths, settings=None, **param
     settings.pop("ion_z")
 
     # Call scattered power function
-    alpha, model_Pw = arbitrary_fast_spectral_density_arbdist(
+    alpha, model_Pw = arbitrary_fast_spectral_density_arbdist(  # ty:ignore[invalid-assignment]
         wavelengths=wavelengths,
         n=n * 1e6, #this is so it accepts cm^-3 values by default
         efn=fe,
@@ -1235,7 +1235,7 @@ def arbitrary__scattered_power_model_arbdist(wavelengths, settings=None, **param
         scattered_power=True,
         ifract = ifract,
         ion_z = ion_z,
-        **settings,
+        **settings,  # ty:ignore[invalid-argument-type]
     )
 
     # print("alpha:", alpha)
@@ -1243,9 +1243,9 @@ def arbitrary__scattered_power_model_arbdist(wavelengths, settings=None, **param
 
     # Put settings back now
     # this is necessary to avoid changing the settings array globally
-    settings["emodel"] = emodel
-    settings["imodel"] = imodel
-    settings["ion_z"] = ion_z 
+    settings["emodel"] = emodel  # ty:ignore[invalid-assignment]
+    settings["imodel"] = imodel  # ty:ignore[invalid-assignment]
+    settings["ion_z"] = ion_z   # ty:ignore[invalid-assignment]
 
     return model_Pw
 
@@ -1261,15 +1261,15 @@ def arbitrary__scattered_power_model_maxwellian(wavelengths, settings=None, **pa
     wavelengths_unitless = wavelengths.to(u.m).value
 
     # LOAD FROM SETTINGS
-    notches = settings["notches"]
-    ion_z = settings["ion_z"]
-    ion_m = settings["ion_m"]
-    probe_vec = settings["probe_vec"]
-    scatter_vec = settings["scatter_vec"]
-    electron_vdir = settings["electron_vdir"]
-    ion_vdir = settings["ion_vdir"]
-    probe_wavelength = settings["probe_wavelength"]
-    inst_fcn_arr = settings["inst_fcn_arr"]
+    notches = settings["notches"]  # ty:ignore[not-subscriptable]
+    ion_z = settings["ion_z"]  # ty:ignore[not-subscriptable]
+    ion_m = settings["ion_m"]  # ty:ignore[not-subscriptable]
+    probe_vec = settings["probe_vec"]  # ty:ignore[not-subscriptable]
+    scatter_vec = settings["scatter_vec"]  # ty:ignore[not-subscriptable]
+    electron_vdir = settings["electron_vdir"]  # ty:ignore[not-subscriptable]
+    ion_vdir = settings["ion_vdir"]  # ty:ignore[not-subscriptable]
+    probe_wavelength = settings["probe_wavelength"]  # ty:ignore[not-subscriptable]
+    inst_fcn_arr = settings["inst_fcn_arr"]  # ty:ignore[not-subscriptable]
 
     # LOAD FROM PARAMS
     n = params["n"]
@@ -2097,15 +2097,15 @@ def autodiff_spectral_density_arbdist(
 
     # --- Condition ion_species ---
     if isinstance(ion_species, (str, Particle)):
-        ion_species = [ion_species]
+        ion_species = [ion_species]  # ty:ignore[invalid-assignment]
 
-    if len(ion_species) == 0:
+    if len(ion_species) == 0:  # ty:ignore[invalid-argument-type]
         raise ValueError("At least one ion species needs to be defined.")
 
     # Convert all entries to Particle instances
     ion_species = [
         Particle(ion) if isinstance(ion, str) else ion
-        for ion in ion_species
+        for ion in ion_species  # ty:ignore[not-iterable]
     ]
 
     ion_species: List[Particle] 
@@ -2689,15 +2689,15 @@ def spectral_density_plasmapy(  # noqa: C901, PLR0912, PLR0915
     if isinstance(ions, ParticleList):
         pass
     elif isinstance(ions, str):
-        ions = ParticleList([Particle(ions)])
+        ions = ParticleList([Particle(ions)])  # ty:ignore[invalid-assignment]
     # If a list is provided, ensure all values are Particles, then convert
     # to a ParticleList
     elif isinstance(ions, list):
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)
-        ions = ParticleList(ions)
+            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
+        ions = ParticleList(ions)  # ty:ignore[invalid-assignment]
     else:
         raise TypeError(
             "The type of object provided to the ``ions`` keyword "
@@ -2705,11 +2705,11 @@ def spectral_density_plasmapy(  # noqa: C901, PLR0912, PLR0915
         )
 
     # Validate ions
-    if len(ions) == 0:
+    if len(ions) == 0:  # ty:ignore[invalid-argument-type]
         raise ValueError("At least one ion species needs to be defined.")
 
     try:
-        if sum(ion.charge_number <= 0 for ion in ions):
+        if sum(ion.charge_number <= 0 for ion in ions):  # ty:ignore[not-iterable]
             raise ValueError("All ions must be positively charged.")
     # Catch error if charge information is missing
     except ChargeError as ex:
@@ -2723,13 +2723,13 @@ def spectral_density_plasmapy(  # noqa: C901, PLR0912, PLR0915
 
     # Make sure the sizes of ions, ifract, ion_vel, and T_i all match
     if (
-        (len(ions) != ifract.size)
+        (len(ions) != ifract.size)  # ty:ignore[invalid-argument-type]
         or (ion_vel.shape[0] != ifract.size)
         or (T_i.size != ifract.size)
     ):
         raise ValueError(
             f"Inconsistent number of ion species in ifract ({ifract}), "
-            f"ions ({len(ions)}), T_i ({T_i.size}), "
+            f"ions ({len(ions)}), T_i ({T_i.size}), "  # ty:ignore[invalid-argument-type]
             f"and/or ion_vel ({ion_vel.shape[0]})."
         )
 
@@ -2884,13 +2884,13 @@ def _spectral_density_model_plasmapy(wavelengths, settings=None, **params):
     """
 
     # LOAD FROM SETTINGS
-    probe_vec = settings["probe_vec"]
-    scatter_vec = settings["scatter_vec"]
-    electron_vdir = settings["electron_vdir"]
-    ion_vdir = settings["ion_vdir"]
-    probe_wavelength = settings["probe_wavelength"]
-    instr_func_arr = settings["instr_func_arr"]
-    notch = settings["notch"]
+    probe_vec = settings["probe_vec"]  # ty:ignore[not-subscriptable]
+    scatter_vec = settings["scatter_vec"]  # ty:ignore[not-subscriptable]
+    electron_vdir = settings["electron_vdir"]  # ty:ignore[not-subscriptable]
+    ion_vdir = settings["ion_vdir"]  # ty:ignore[not-subscriptable]
+    probe_wavelength = settings["probe_wavelength"]  # ty:ignore[not-subscriptable]
+    instr_func_arr = settings["instr_func_arr"]  # ty:ignore[not-subscriptable]
+    notch = settings["notch"]  # ty:ignore[not-subscriptable]
 
     # LOAD FROM PARAMS
     n = params["n"]
@@ -3685,7 +3685,7 @@ def spectral_power_lite_experimental(
         wpe = plasma_frequency_lite(ne[i], m_e_si_unitless, 1)
         k_i = 2 *np.pi /probe_wavelength
         k_s = 2 *np.pi /wavelengths
-        omega_i = np.sqrt( k_i**2 *c_si_unitless**2 + wpe**2)
+        omega_i = np.sqrt( k_i**2 *c_si_unitless**2 + wpe**2)  # ty:ignore[unsupported-operator]
         omega_s = np.sqrt( k_s**2 *c_si_unitless**2 + wpe**2)
         omega = omega_s - omega_i
         gw = 1 +2*(omega/omega_i)
@@ -3729,7 +3729,7 @@ def spectral_power_lite2_experimental(
     notch_minimum: numbers.Real,
     notch_maximum: numbers.Real,
     instr_func_arr: Optional[np.ndarray] = None,
-) -> tuple[Union[np.floating, np.ndarray], np.ndarray]:
+) -> tuple[Union[np.floating, np.ndarray], np.ndarray]:  # ty:ignore[invalid-return-type]
     r"""
     spectral_power_lite2_experimental calls spectral_power_lite_experimental
     but adds modules to remove notch (useful for epw)
@@ -3871,7 +3871,7 @@ def spectral_power_lite2_experimental(
         # angleStep  := size of angular slices around main scattering
                         # angle
         
-        angles = np.arange(scatteringAngle-deltaAngle,
+        angles = np.arange(scatteringAngle-deltaAngle,  # ty:ignore[no-matching-overload]
                            scatteringAngle+deltaAngle+angleStep,
                            angleStep)
         counter = 0
@@ -3912,7 +3912,7 @@ def spectral_power_lite2_experimental(
     
     if removeNotch == True:
         if removeNotch == True:
-            Pkw = total_Pkw
+            Pkw = total_Pkw  # ty:ignore[unresolved-reference]
         else:
             alpha_aux, Pkw = spectral_power_lite_experimental(
                 wavelengths,
@@ -3944,7 +3944,7 @@ def spectral_power_lite2_experimental(
                    
         # Replace values inside notch with NaN
         Pkw[Min:Max] = np.nan
-        return alpha_aux,Pkw
+        return alpha_aux,Pkw  # ty:ignore[unresolved-reference]
 
 
 @validate_quantities(
@@ -4145,15 +4145,15 @@ def spectral_density_experimental(  # noqa: C901, PLR0912, PLR0915
     if isinstance(ions, ParticleList):
         pass
     elif isinstance(ions, str):
-        ions = ParticleList([Particle(ions)])
+        ions = ParticleList([Particle(ions)])  # ty:ignore[invalid-assignment]
     # If a list is provided, ensure all values are Particles, then convert
     # to a ParticleList
     elif isinstance(ions, list):
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)
-        ions = ParticleList(ions)
+            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
+        ions = ParticleList(ions)  # ty:ignore[invalid-assignment]
     else:
         raise TypeError(
             "The type of object provided to the ``ions`` keyword "
@@ -4161,11 +4161,11 @@ def spectral_density_experimental(  # noqa: C901, PLR0912, PLR0915
         )
 
     # Validate ions
-    if len(ions) == 0:
+    if len(ions) == 0:  # ty:ignore[invalid-argument-type]
         raise ValueError("At least one ion species needs to be defined.")
 
     try:
-        if sum(ion.charge_number <= 0 for ion in ions):
+        if sum(ion.charge_number <= 0 for ion in ions):  # ty:ignore[not-iterable]
             raise ValueError("All ions must be positively charged.")
     # Catch error if charge information is missing
     except ChargeError as ex:
@@ -4179,13 +4179,13 @@ def spectral_density_experimental(  # noqa: C901, PLR0912, PLR0915
 
     # Make sure the sizes of ions, ifract, ion_vel, and T_i all match
     if (
-        (len(ions) != ifract.size)
+        (len(ions) != ifract.size)  # ty:ignore[invalid-argument-type]
         or (ion_vel.shape[0] != ifract.size)
         or (T_i.size != ifract.size)
     ):
         raise ValueError(
             f"Inconsistent number of ion species in ifract ({ifract}), "
-            f"ions ({len(ions)}), T_i ({T_i.size}), "
+            f"ions ({len(ions)}), T_i ({T_i.size}), "  # ty:ignore[invalid-argument-type]
             f"and/or ion_vel ({ion_vel.shape[0]})."
         )
 
@@ -4464,15 +4464,15 @@ def spectral_power_experimental(  # noqa: C901, PLR0912, PLR0915
     if isinstance(ions, ParticleList):
         pass
     elif isinstance(ions, str):
-        ions = ParticleList([Particle(ions)])
+        ions = ParticleList([Particle(ions)])  # ty:ignore[invalid-assignment]
     # If a list is provided, ensure all values are Particles, then convert
     # to a ParticleList
     elif isinstance(ions, list):
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)
-        ions = ParticleList(ions)
+            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
+        ions = ParticleList(ions)  # ty:ignore[invalid-assignment]
     else:
         raise TypeError(
             "The type of object provided to the ``ions`` keyword "
@@ -4480,11 +4480,11 @@ def spectral_power_experimental(  # noqa: C901, PLR0912, PLR0915
         )
 
     # Validate ions
-    if len(ions) == 0:
+    if len(ions) == 0:  # ty:ignore[invalid-argument-type]
         raise ValueError("At least one ion species needs to be defined.")
 
     try:
-        if sum(ion.charge_number <= 0 for ion in ions):
+        if sum(ion.charge_number <= 0 for ion in ions):  # ty:ignore[not-iterable]
             raise ValueError("All ions must be positively charged.")
     # Catch error if charge information is missing
     except ChargeError as ex:
@@ -4498,13 +4498,13 @@ def spectral_power_experimental(  # noqa: C901, PLR0912, PLR0915
 
     # Make sure the sizes of ions, ifract, ion_vel, and T_i all match
     if (
-        (len(ions) != ifract.size)
+        (len(ions) != ifract.size)  # ty:ignore[invalid-argument-type]
         or (ion_vel.shape[0] != ifract.size)
         or (T_i.size != ifract.size)
     ):
         raise ValueError(
             f"Inconsistent number of ion species in ifract ({ifract}), "
-            f"ions ({len(ions)}), T_i ({T_i.size}), "
+            f"ions ({len(ions)}), T_i ({T_i.size}), "  # ty:ignore[invalid-argument-type]
             f"and/or ion_vel ({ion_vel.shape[0]})."
         )
 
@@ -4563,7 +4563,7 @@ def spectral_power_experimental(  # noqa: C901, PLR0912, PLR0915
         T_i.to(u.K).value,
         efract=efract,
         ifract=ifract,
-        ion_z=ion_z,
+        ion_z=ion_z,  # ty:ignore[invalid-argument-type]
         ion_mass=ion_mass.to(u.kg).value,
         electron_vel=electron_vel.to(u.m / u.s).value,
         ion_vel=ion_vel.to(u.m / u.s).value,
@@ -4645,14 +4645,14 @@ def _spectral_density_model_experimental(wavelengths, settings=None, **params):
     """
 
     # LOAD FROM SETTINGS
-    ion_z = settings["ion_z"]
-    ion_mass = settings["ion_mass"]
-    probe_vec = settings["probe_vec"]
-    scatter_vec = settings["scatter_vec"]
-    electron_vdir = settings["electron_vdir"]
-    ion_vdir = settings["ion_vdir"]
-    probe_wavelength = settings["probe_wavelength"]
-    instr_func_arr = settings["instr_func_arr"]
+    ion_z = settings["ion_z"]  # ty:ignore[not-subscriptable]
+    ion_mass = settings["ion_mass"]  # ty:ignore[not-subscriptable]
+    probe_vec = settings["probe_vec"]  # ty:ignore[not-subscriptable]
+    scatter_vec = settings["scatter_vec"]  # ty:ignore[not-subscriptable]
+    electron_vdir = settings["electron_vdir"]  # ty:ignore[not-subscriptable]
+    ion_vdir = settings["ion_vdir"]  # ty:ignore[not-subscriptable]
+    probe_wavelength = settings["probe_wavelength"]  # ty:ignore[not-subscriptable]
+    instr_func_arr = settings["instr_func_arr"]  # ty:ignore[not-subscriptable]
 
     # LOAD FROM PARAMS
     n = params["n"]
@@ -4717,14 +4717,14 @@ def _spectral_power_model_experimental(wavelengths, settings=None, **params):
     """
 
     # LOAD FROM SETTINGS
-    ion_z = settings["ion_z"]
-    ion_mass = settings["ion_mass"]
-    probe_vec = settings["probe_vec"]
-    scatter_vec = settings["scatter_vec"]
-    electron_vdir = settings["electron_vdir"]
-    ion_vdir = settings["ion_vdir"]
-    probe_wavelength = settings["probe_wavelength"]
-    instr_func_arr = settings["instr_func_arr"]
+    ion_z = settings["ion_z"]  # ty:ignore[not-subscriptable]
+    ion_mass = settings["ion_mass"]  # ty:ignore[not-subscriptable]
+    probe_vec = settings["probe_vec"]  # ty:ignore[not-subscriptable]
+    scatter_vec = settings["scatter_vec"]  # ty:ignore[not-subscriptable]
+    electron_vdir = settings["electron_vdir"]  # ty:ignore[not-subscriptable]
+    ion_vdir = settings["ion_vdir"]  # ty:ignore[not-subscriptable]
+    probe_wavelength = settings["probe_wavelength"]  # ty:ignore[not-subscriptable]
+    instr_func_arr = settings["instr_func_arr"]  # ty:ignore[not-subscriptable]
 
     # LOAD FROM PARAMS
     n = params["n"]
@@ -4804,21 +4804,21 @@ def _spectral_power_model2_experimental(wavelengths, settings=None, **params):
     """
 
     # LOAD FROM SETTINGS
-    ion_z = settings["ion_z"]
-    ion_mass = settings["ion_mass"]
-    probe_vec = settings["probe_vec"]
-    scatter_vec = settings["scatter_vec"]
-    electron_vdir = settings["electron_vdir"]
-    ion_vdir = settings["ion_vdir"]
-    probe_wavelength = settings["probe_wavelength"]
-    fNumberCorrection = settings["fNumberCorrection"]
-    scatteringAngle = settings["scatteringAngle"]
-    deltaAngle = settings["deltaAngle"]
-    angleStep = settings["angleStep"]
-    removeNotch = settings["removeNotch"]
-    notch_minimum = settings["notch_minimum"]
-    notch_maximum = settings["notch_maximum"]
-    instr_func_arr = settings["instr_func_arr"]
+    ion_z = settings["ion_z"]  # ty:ignore[not-subscriptable]
+    ion_mass = settings["ion_mass"]  # ty:ignore[not-subscriptable]
+    probe_vec = settings["probe_vec"]  # ty:ignore[not-subscriptable]
+    scatter_vec = settings["scatter_vec"]  # ty:ignore[not-subscriptable]
+    electron_vdir = settings["electron_vdir"]  # ty:ignore[not-subscriptable]
+    ion_vdir = settings["ion_vdir"]  # ty:ignore[not-subscriptable]
+    probe_wavelength = settings["probe_wavelength"]  # ty:ignore[not-subscriptable]
+    fNumberCorrection = settings["fNumberCorrection"]  # ty:ignore[not-subscriptable]
+    scatteringAngle = settings["scatteringAngle"]  # ty:ignore[not-subscriptable]
+    deltaAngle = settings["deltaAngle"]  # ty:ignore[not-subscriptable]
+    angleStep = settings["angleStep"]  # ty:ignore[not-subscriptable]
+    removeNotch = settings["removeNotch"]  # ty:ignore[not-subscriptable]
+    notch_minimum = settings["notch_minimum"]  # ty:ignore[not-subscriptable]
+    notch_maximum = settings["notch_maximum"]  # ty:ignore[not-subscriptable]
+    instr_func_arr = settings["instr_func_arr"]  # ty:ignore[not-subscriptable]
 
     # LOAD FROM PARAMS
     n = params["n"]
@@ -5024,7 +5024,7 @@ def spectral_density_model_experimental(  # noqa: C901, PLR0912, PLR0915
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)
+            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type]
         ions = ParticleList(ions)
     else:
         raise TypeError(
@@ -5303,7 +5303,7 @@ def spectral_power_model_experimental(  # noqa: C901, PLR0912, PLR0915
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)
+            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type]
         ions = ParticleList(ions)
     else:
         raise TypeError(

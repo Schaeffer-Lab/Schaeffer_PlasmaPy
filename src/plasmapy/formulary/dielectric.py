@@ -138,7 +138,7 @@ def cold_plasma_permittivity_SDP(
         S += -(omega_p**2) / (omega**2 - omega_c**2)
         D += omega_c / omega * omega_p**2 / (omega**2 - omega_c**2)
         P += -(omega_p**2) / omega**2
-    return StixTensorElements(S, D, P)
+    return StixTensorElements(S, D, P)  # ty:ignore[invalid-return-type]
 
 
 @validate_quantities(B={"can_be_negative": False}, omega={"can_be_negative": False})
@@ -231,7 +231,7 @@ def cold_plasma_permittivity_LRP(
         L += -(omega_p**2) / (omega * (omega - omega_c))
         R += -(omega_p**2) / (omega * (omega + omega_c))
         P += -(omega_p**2) / omega**2
-    return RotatingTensorElements(L, R, P)
+    return RotatingTensorElements(L, R, P)  # ty:ignore[invalid-return-type]
 
 
 @preserve_signature
