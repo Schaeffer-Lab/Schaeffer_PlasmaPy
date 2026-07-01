@@ -17,10 +17,14 @@ __all__ = [
     "numerical",
     "plasma_dispersion_func",
     "plasma_dispersion_func_deriv",
+    "plasma_dispersion_func_lite",
+    "plasma_dispersion_func_deriv_lite",
 ]
 
 from plasmapy.dispersion import analytical, dispersion_functions, numerical
 from plasmapy.dispersion.dispersion_functions import (
     plasma_dispersion_func,
     plasma_dispersion_func_deriv,
+    plasma_dispersion_func_deriv_lite,
+    plasma_dispersion_func_lite,
 )
