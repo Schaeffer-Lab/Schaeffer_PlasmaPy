@@ -541,8 +541,8 @@ class Tracker(ParticleTracker):
         x = self._coast_to_plane(location, mesh_hdir, mesh_vdir)
 
         # Particle positions in 2D on the mesh plane
-        xloc = np.dot(x - location, mesh_hdir)  # ty:ignore[no-matching-overload]
-        yloc = np.dot(x - location, mesh_vdir)  # ty:ignore[no-matching-overload]
+        xloc = np.dot(x - location, mesh_hdir)  # ty:ignore[invalid-argument-type]
+        yloc = np.dot(x - location, mesh_vdir)  # ty:ignore[invalid-argument-type]
 
         # Create an array in which True indicates that a particle has hit
         # a wire and False indicates that it has not
