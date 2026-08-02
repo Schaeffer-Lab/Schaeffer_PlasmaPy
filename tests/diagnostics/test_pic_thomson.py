@@ -738,3 +738,347 @@ class TestMaxwellianConsistency:
         np.testing.assert_allclose(
             alpha_arbitrary / alpha_maxwellian, np.sqrt(2), rtol=2e-2
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. The forward-model driver
+# ---------------------------------------------------------------------------
+
+REFERENCE_DENSITY = 5e18 * u.cm**-3
+EPW_WINDOW = np.linspace(480, 590, 141) * u.nm
+IAW_WINDOW = np.linspace(529, 535, 61) * u.nm
+DRIVER_CONDITIONING = {"taper_threshold": 1e-4, "max_taper_bins": 50}
+
+
+def species_phase_space(
+    label, T_eV, mass, *, n_time=3, n_x=4, n_v=1024, amplitude=1.0, drift=0.0
+):
+    """
+    A Maxwellian `PICPhaseSpace` whose zeroth moment is *amplitude*, so that
+    `spectra_from_phase_spaces` reads its density as amplitude * reference.
+    """
+    sigma = sigma_of(T_eV, mass)
+    v = np.linspace(drift - 8 * sigma, drift + 8 * sigma, n_v)
+    profile = amplitude * maxwellian(v, sigma, drift)
+    return pic_thomson.from_arrays(
+        f=block(profile, n_time=n_time, n_x=n_x),
+        v=v,
+        x=np.linspace(0.0, 1e-3, n_x),
+        t=np.linspace(0.0, 2e-9, n_time),
+        label=label,
+    )
+
+
+def run_driver(electrons=None, ions=None, **kwargs):
+    """`spectra_from_phase_spaces` with the shared test geometry filled in."""
+    if electrons is None:
+        electrons = species_phase_space("e-", 100, const.m_e)
+    if ions is None:
+        ions = [species_phase_space("p+", 50, const.m_p)]
+    settings = {
+        "position": 0.5e-3,
+        "reference_density": REFERENCE_DENSITY,
+        "probe_wavelength": PROBE_WAVELENGTH,
+        "epw_wavelengths": EPW_WINDOW,
+        "probe_vec": PROBE_VEC,
+        "scatter_vec": SCATTER_VEC,
+        "electron_conditioning": DRIVER_CONDITIONING,
+        "ion_conditioning": DRIVER_CONDITIONING,
+        "progress": False,
+    }
+    settings.update(kwargs)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+        return pic_thomson.spectra_from_phase_spaces(electrons, ions, **settings)
+
+
+@pytest.fixture(scope="module")
+def single_population_spectrogram():
+    pytest.importorskip("numba")
+    return run_driver(iaw_wavelengths=IAW_WINDOW)
+
+
+class TestDriverStructure:
+    def test_shapes_and_labels(self, single_population_spectrogram):
+        spectrogram = single_population_spectrogram
+        assert spectrogram.n_time == 3
+        assert spectrogram.epw.shape == (3, EPW_WINDOW.size)
+        assert spectrogram.iaw.shape == (3, IAW_WINDOW.size)
+        assert spectrogram.electron_labels == ["e-"]
+        assert spectrogram.ion_labels == ["p+"]
+        assert spectrogram.efract.shape == (1, 3)
+        assert spectrogram.ifract.shape == (1, 3)
+
+    def test_wavelength_axes_are_si(self, single_population_spectrogram):
+        np.testing.assert_allclose(
+            single_population_spectrogram.epw_wavelengths,
+            EPW_WINDOW.to_value(u.m),
+        )
+        np.testing.assert_allclose(
+            single_population_spectrogram.iaw_wavelengths,
+            IAW_WINDOW.to_value(u.m),
+        )
+
+    def test_spectra_are_finite_and_positive(self, single_population_spectrogram):
+        spectrogram = single_population_spectrogram
+        assert np.all(np.isfinite(spectrogram.epw))
+        assert np.all(np.isfinite(spectrogram.iaw))
+        assert np.all(np.isfinite(spectrogram.alpha_epw))
+        assert spectrogram.epw.max() > 0
+
+    def test_identical_timesteps_give_identical_spectra(
+        self, single_population_spectrogram
+    ):
+        epw = single_population_spectrogram.epw
+        np.testing.assert_allclose(epw[0], epw[1], rtol=1e-12)
+        np.testing.assert_allclose(epw[0], epw[2], rtol=1e-12)
+
+    def test_density_uses_the_reference_scale(self, single_population_spectrogram):
+        # The test VDFs integrate to 1, so the density is the reference density.
+        np.testing.assert_allclose(
+            single_population_spectrogram.electron_density,
+            REFERENCE_DENSITY.to_value(u.m**-3),
+            rtol=1e-6,
+        )
+
+    def test_skipping_the_iaw_window(self):
+        pytest.importorskip("numba")
+        spectrogram = run_driver()
+        assert spectrogram.iaw is None
+        assert spectrogram.iaw_wavelengths is None
+        assert spectrogram.alpha_iaw is None
+
+    def test_repr_is_informative(self, single_population_spectrogram):
+        text = repr(single_population_spectrogram)
+        assert "e-" in text
+        assert "p+" in text
+        assert "n_time=3" in text
+
+    def test_records_provenance(self, single_population_spectrogram):
+        meta = single_population_spectrogram.meta
+        assert meta["reference_density"] == REFERENCE_DENSITY.to_value(u.m**-3)
+        assert meta["presence_threshold"] == 1e-2
+        assert set(meta["species_meta"]) == {"e-", "p+"}
+
+
+class TestDriverValidation:
+    def test_rejects_empty_ion_list(self):
+        with pytest.raises(ValueError, match="must contain at least one"):
+            run_driver(ions=[])
+
+    def test_rejects_mismatched_time_axis_length(self):
+        with pytest.raises(ValueError, match="timesteps"):
+            run_driver(ions=[species_phase_space("p+", 50, const.m_p, n_time=5)])
+
+    def test_rejects_differing_time_values(self):
+        ion = species_phase_space("p+", 50, const.m_p)
+        shifted = pic_thomson.from_arrays(
+            f=ion.f, v=ion.v, x=ion.x, t=ion.t + 1e-9, label="p+"
+        )
+        with pytest.raises(ValueError, match="different time axes"):
+            run_driver(ions=[shifted])
+
+    def test_rejects_non_phase_space_input(self):
+        with pytest.raises(TypeError, match="PICPhaseSpace objects"):
+            run_driver(ions=[np.zeros((3, 4, 5))])
+
+    def test_rejects_non_positive_reference_density(self):
+        with pytest.raises(ValueError, match="reference_density must be positive"):
+            run_driver(reference_density=0.0)
+
+    def test_rejects_position_outside_the_grid(self):
+        with pytest.raises(ValueError, match="outside the spatial axis"):
+            run_driver(position=1.0 * u.m)
+
+    def test_rejects_velocity_scale_factor_in_conditioning(self):
+        with pytest.raises(ValueError, match="must be the same for every species"):
+            run_driver(
+                electron_conditioning={"velocity_scale_factor": 50},
+            )
+
+    def test_warns_when_an_ion_is_passed_as_an_electron(self):
+        with pytest.warns(RuntimeWarning, match="not flagged as one"):
+            run_driver(electrons=species_phase_space("p+", 100, const.m_p))
+
+    @pytest.mark.parametrize("notches", [np.zeros((2, 3)), np.zeros(3)])
+    def test_rejects_malformed_notches(self, notches):
+        with pytest.raises(ValueError, match="sequence of pairs"):
+            run_driver(epw_notches=notches * u.nm)
+
+    def test_conditioning_can_be_skipped(self):
+        pytest.importorskip("numba")
+        electrons = pic_thomson.condition_phase_space(
+            species_phase_space("e-", 100, const.m_e), **DRIVER_CONDITIONING
+        )
+        ions = [
+            pic_thomson.condition_phase_space(
+                species_phase_space("p+", 50, const.m_p), **DRIVER_CONDITIONING
+            )
+        ]
+        skipped = run_driver(
+            electrons=electrons,
+            ions=ions,
+            electron_conditioning={"skip": True},
+            ion_conditioning={"skip": True},
+        )
+        conditioned = run_driver()
+        np.testing.assert_allclose(skipped.epw, conditioned.epw, rtol=1e-12)
+
+
+class TestDriverPopulations:
+    def test_fractions_reflect_relative_densities(self):
+        pytest.importorskip("numba")
+        spectrogram = run_driver(
+            ions=[
+                species_phase_space("p+", 50, const.m_p, amplitude=0.75),
+                species_phase_space("He-4 2+", 50, 4 * const.m_p, amplitude=0.25),
+            ]
+        )
+        np.testing.assert_allclose(spectrogram.ifract[:, 0], [0.75, 0.25], rtol=1e-6)
+        assert spectrogram.ion_labels == ["p+", "He-4 2+"]
+
+    def test_two_electron_populations_use_efract(self):
+        """
+        The WarpX runs carry a piston and an ambient electron population. Two
+        identical populations at half weight each must give the same spectrum
+        as one population at full weight.
+        """
+        pytest.importorskip("numba")
+        single = run_driver()
+        split = run_driver(
+            electrons=[
+                species_phase_space("e-", 100, const.m_e, amplitude=0.5),
+                species_phase_space("e-", 100, const.m_e, amplitude=0.5),
+            ]
+        )
+        np.testing.assert_allclose(split.efract[:, 0], [0.5, 0.5], rtol=1e-6)
+        np.testing.assert_allclose(
+            split.electron_density, single.electron_density, rtol=1e-6
+        )
+        np.testing.assert_allclose(split.epw, single.epw, rtol=1e-8)
+
+    def test_absent_population_is_excluded_and_fractions_renormalise(self):
+        """
+        A trace species must neither contribute nor leave the remaining
+        fractions summing to less than one -- the forward model uses them to
+        split the density between populations.
+        """
+        pytest.importorskip("numba")
+        trace = species_phase_space("He-4 2+", 50, 4 * const.m_p, amplitude=1e-6)
+        with_trace = run_driver(ions=[species_phase_space("p+", 50, const.m_p), trace])
+        without_trace = run_driver()
+
+        assert not with_trace.ion_present[1].any()
+        assert with_trace.ion_present[0].all()
+        np.testing.assert_allclose(with_trace.epw, without_trace.epw, rtol=1e-8)
+
+    def test_vacuum_timesteps_are_nan(self):
+        pytest.importorskip("numba")
+        electrons = species_phase_space("e-", 100, const.m_e)
+        empty = electrons.f.copy()
+        empty[1] = 0.0  # no plasma at all at the second timestep
+        electrons = pic_thomson.from_arrays(
+            f=empty, v=electrons.v, x=electrons.x, t=electrons.t, label="e-"
+        )
+        spectrogram = run_driver(electrons=electrons)
+
+        assert np.all(np.isnan(spectrogram.epw[1]))
+        assert np.isnan(spectrogram.alpha_epw[1])
+        assert np.all(np.isfinite(spectrogram.epw[0]))
+        assert np.all(np.isfinite(spectrogram.epw[2]))
+        np.testing.assert_array_equal(
+            spectrogram.electron_present[0], [True, False, True]
+        )
+
+    def test_presence_is_judged_before_conditioning(self):
+        """
+        The floor that conditioning applies would make an empty slice look
+        populated, so the presence test must run on the raw phase space.
+        """
+        pytest.importorskip("numba")
+        electrons = species_phase_space("e-", 100, const.m_e)
+        empty = electrons.f.copy()
+        empty[0] = 0.0
+        electrons = pic_thomson.from_arrays(
+            f=empty, v=electrons.v, x=electrons.x, t=electrons.t, label="e-"
+        )
+        spectrogram = run_driver(electrons=electrons)
+        assert np.isnan(spectrogram.alpha_epw[0])
+
+
+class TestDriverPhysics:
+    def test_matches_the_analytic_maxwellian_model(self):
+        """
+        End-to-end: the driver's spectrum for a Maxwellian plasma must agree
+        with `thomson.spectral_density` for the same plasma.
+
+        Compared with ``scattered_power=False``, since `spectral_density`
+        returns S(k, omega) while the driver's default returns power per unit
+        wavelength. The conversion between them is checked separately below.
+        """
+        pytest.importorskip("numba")
+        spectrogram = run_driver(scattered_power=False)
+        _, analytic = thomson.spectral_density(
+            EPW_WINDOW,
+            PROBE_WAVELENGTH,
+            REFERENCE_DENSITY,
+            T_e=100 * u.eV,
+            T_i=50 * u.eV,
+            ions=["p+"],
+            probe_vec=PROBE_VEC,
+            scatter_vec=SCATTER_VEC,
+        )
+        wavelengths = EPW_WINDOW.to_value(u.m)
+        driver = spectrogram.epw[0] / np.trapezoid(spectrogram.epw[0], wavelengths)
+        analytic = as_array(analytic)
+        analytic = analytic / np.trapezoid(analytic, wavelengths)
+
+        l1_error = np.trapezoid(np.abs(driver - analytic), wavelengths)
+        assert l1_error < 0.05, f"normalised L1 difference {l1_error:.3f}"
+
+    def test_scattered_power_applies_the_wavelength_jacobian(self):
+        """
+        ``scattered_power=True`` -- the default -- reports power per unit
+        wavelength rather than S(k, omega). The two differ by the Jacobian of
+        the frequency-to-wavelength change of variables, and each is separately
+        renormalised to unit area.
+        """
+        pytest.importorskip("numba")
+        wavelengths = EPW_WINDOW.to_value(u.m)
+        spectral_density = run_driver(scattered_power=False).epw[0]
+        power = run_driver(scattered_power=True).epw[0]
+
+        speed_of_light = const.c.si.value
+        probe_frequency = 2 * np.pi * speed_of_light / PROBE_WAVELENGTH.to_value(u.m)
+        shift = 2 * np.pi * speed_of_light / wavelengths - probe_frequency
+        jacobian = (1 + 2 * shift / probe_frequency) * 2 / wavelengths**2
+
+        expected = spectral_density * jacobian
+        expected = expected / np.trapezoid(expected, wavelengths)
+        power = power / np.trapezoid(power, wavelengths)
+        np.testing.assert_allclose(expected, power, rtol=1e-10)
+
+    def test_notch_zeroes_the_requested_band(self):
+        pytest.importorskip("numba")
+        spectrogram = run_driver(epw_notches=[520, 545] * u.nm)
+        wavelengths = spectrogram.epw_wavelengths * 1e9
+        notched = (wavelengths > 521) & (wavelengths < 544)
+        np.testing.assert_allclose(spectrogram.epw[0][notched], 0.0, atol=1e-12)
+        assert spectrogram.epw[0][~notched].max() > 0
+
+    def test_velocity_scale_factor_shifts_the_epw_feature(self):
+        """
+        Undoing a reduced mass ratio narrows every velocity distribution, which
+        lowers the electron thermal speed and pulls the EPW satellites in
+        towards the probe wavelength.
+        """
+        pytest.importorskip("numba")
+        wavelengths = EPW_WINDOW.to_value(u.nm)
+        red = wavelengths > 545
+
+        uncorrected = run_driver().epw[0]
+        corrected = run_driver(velocity_scale_factor=9.0).epw[0]
+
+        peak_uncorrected = wavelengths[red][np.argmax(uncorrected[red])]
+        peak_corrected = wavelengths[red][np.argmax(corrected[red])]
+        assert peak_corrected < peak_uncorrected

@@ -38,6 +38,7 @@ normalisation the forward model actually assumes.
 
 __all__ = [
     "PICPhaseSpace",
+    "ThomsonSpectrogram",
     "condition_phase_space",
     "from_arrays",
     "normalize_vdf",
@@ -45,6 +46,7 @@ __all__ = [
     "rescale_velocity_axis",
     "smooth_vdf",
     "species_presence_mask",
+    "spectra_from_phase_spaces",
     "taper_vdf_edges",
 ]
 
@@ -56,7 +58,12 @@ import astropy.units as u
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.ndimage import uniform_filter1d
+from tqdm import tqdm
 
+# Imported from the submodule rather than the package so that this module can be
+# imported from `plasmapy.diagnostics.__init__` without depending on the order in
+# which that file imports its submodules.
+from plasmapy.diagnostics.thomson import arbitrary_forwardmodel
 from plasmapy.particles import Particle
 
 #: Axis of a ``(n_time, n_v, n_x)`` phase-space array that holds velocity.
@@ -710,4 +717,431 @@ def condition_phase_space(
         f=f,
         v=v,
         meta={**phase_space.meta, "conditioning": conditioning},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Forward-model driver
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ThomsonSpectrogram:
+    r"""
+    Synthetic Thomson spectra over time at one point in a PIC simulation.
+
+    Returned by `spectra_from_phase_spaces`. All quantities are SI: wavelengths in
+    m, times in s, densities in m\ :sup:`-3`.
+
+    Parameters
+    ----------
+    epw, iaw : `~numpy.ndarray`
+        Spectra over the electron-plasma-wave and ion-acoustic-wave windows, shape
+        ``(n_time, n_wavelength)``. Timesteps with no plasma present are `~numpy.nan`
+        throughout. ``iaw`` is `None` if no IAW window was requested.
+    epw_wavelengths, iaw_wavelengths : `~numpy.ndarray`
+        The wavelength axes, in m. ``iaw_wavelengths`` is `None` if not requested.
+    t : `~numpy.ndarray`
+        Times, shape ``(n_time,)``, in s.
+    alpha_epw, alpha_iaw : `~numpy.ndarray`
+        Scattering parameter reported by the forward model at each timestep.
+
+        .. note::
+
+           `~plasmapy.diagnostics.thomson.arbitrary_forwardmodel` defines this as
+           :math:`\sqrt{2}\, \omega_{pe} / (k \sigma)`, with :math:`\sigma` the
+           standard deviation of the electron distribution. That is
+           :math:`\sqrt{2}` times the conventional :math:`1 / (k \lambda_{De})`
+           reported by `~plasmapy.diagnostics.thomson.spectral_density`.
+
+    electron_density : `~numpy.ndarray`
+        Total electron density at the sampled point, shape ``(n_time,)``, in
+        m\ :sup:`-3`.
+    efract, ifract : `~numpy.ndarray`
+        Fractional densities of each electron and ion population, shape
+        ``(n_population, n_time)``. These are the raw fractions over *all*
+        populations; the fractions actually handed to the forward model are these
+        restricted to the present populations and renormalised to sum to one.
+    electron_present, ion_present : `~numpy.ndarray`
+        Boolean, shape ``(n_population, n_time)``: whether each population was
+        included at each timestep.
+    position : `float`
+        Requested sampling position, in m.
+    electron_labels, ion_labels : `list` of `str`
+        Species identifiers, ordered as the ``efract`` / ``ifract`` rows.
+    meta : `dict`
+        Provenance: geometry, conditioning settings, and per-species metadata.
+
+    Notes
+    -----
+    The forward model normalises each spectrum to unit area over its own window
+    (``thomson.py``, ``Skw / trapezoid(Skw, wavelengths)``). Each row of ``epw`` and
+    ``iaw`` therefore carries **shape only** -- there is no absolute intensity, no
+    brightness history along the time axis, and no meaningful EPW-to-IAW ratio.
+    """
+
+    epw: np.ndarray
+    epw_wavelengths: np.ndarray
+    t: np.ndarray
+    alpha_epw: np.ndarray
+    electron_density: np.ndarray
+    efract: np.ndarray
+    ifract: np.ndarray
+    electron_present: np.ndarray
+    ion_present: np.ndarray
+    position: float
+    electron_labels: list[str]
+    ion_labels: list[str]
+    iaw: np.ndarray | None = None
+    iaw_wavelengths: np.ndarray | None = None
+    alpha_iaw: np.ndarray | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def n_time(self) -> int:
+        """Number of timesteps."""
+        return self.t.size
+
+    def __repr__(self) -> str:
+        """Summarise the species, sampling point, and spectrogram dimensions."""
+        species = ", ".join([*self.electron_labels, *self.ion_labels])
+        iaw = "none" if self.iaw is None else f"{self.iaw.shape[1]} bins"
+        return (
+            f"ThomsonSpectrogram(species=[{species}], "
+            f"n_time={self.n_time}, epw={self.epw.shape[1]} bins, iaw={iaw})"
+        )
+
+
+def _as_phase_space_list(phase_spaces, name: str) -> list[PICPhaseSpace]:
+    """Normalise a single `PICPhaseSpace` or an iterable of them into a list."""
+    if isinstance(phase_spaces, PICPhaseSpace):
+        return [phase_spaces]
+    phase_spaces = list(phase_spaces)
+    if not phase_spaces:
+        raise ValueError(f"{name} must contain at least one PICPhaseSpace.")
+    for phase_space in phase_spaces:
+        if not isinstance(phase_space, PICPhaseSpace):
+            raise TypeError(
+                f"{name} must contain PICPhaseSpace objects; got "
+                f"{type(phase_space).__name__}."
+            )
+    return phase_spaces
+
+
+def _check_shared_time_axis(phase_spaces: list[PICPhaseSpace]) -> np.ndarray:
+    """Return the common time axis, raising if the species disagree."""
+    reference = phase_spaces[0]
+    for phase_space in phase_spaces[1:]:
+        if phase_space.t.size != reference.t.size:
+            raise ValueError(
+                f"species {phase_space.label!r} has {phase_space.t.size} timesteps "
+                f"but {reference.label!r} has {reference.t.size}; all species must "
+                "be sampled at the same times."
+            )
+        if not np.allclose(phase_space.t, reference.t, rtol=1e-6, atol=0):
+            raise ValueError(
+                f"species {phase_space.label!r} and {reference.label!r} have "
+                "different time axes."
+            )
+    return reference.t
+
+
+def _fractions(densities: np.ndarray) -> np.ndarray:
+    """Row-wise fractions of a ``(n_population, n_time)`` density array."""
+    total = densities.sum(axis=0)
+    return np.divide(densities, total, out=np.zeros_like(densities), where=total > 0)
+
+
+def _notches_to_quantity(notches):
+    """Coerce notch specifications into an ``(n, 2)`` Quantity in nm."""
+    if notches is None:
+        return None
+    notches = u.Quantity(notches, u.nm)
+    if notches.ndim == 1:
+        notches = notches.reshape(1, -1)
+    if notches.ndim != 2 or notches.shape[1] != 2:
+        raise ValueError(
+            "notches must be a pair, or a sequence of pairs, of wavelengths; got "
+            f"shape {tuple(notches.shape)}."
+        )
+    return notches
+
+
+def spectra_from_phase_spaces(  # noqa: C901, PLR0915
+    electrons,
+    ions,
+    *,
+    position,
+    reference_density,
+    probe_wavelength,
+    epw_wavelengths,
+    iaw_wavelengths=None,
+    epw_notches=None,
+    iaw_notches=None,
+    probe_vec=(1.0, 0.0, 0.0),
+    scatter_vec=(0.0, 1.0, 0.0),
+    electron_conditioning: dict[str, Any] | None = None,
+    ion_conditioning: dict[str, Any] | None = None,
+    velocity_scale_factor: float | None = None,
+    presence_threshold: float = 1e-2,
+    scattered_power: bool = True,
+    progress: bool = True,
+) -> ThomsonSpectrogram:
+    r"""
+    Forward-model Thomson spectra from PIC phase space, timestep by timestep.
+
+    This is the code-agnostic core of the pipeline: it takes `PICPhaseSpace` objects
+    from any reader, conditions them, reduces them to a single spatial point, and
+    evaluates `~plasmapy.diagnostics.thomson.arbitrary_forwardmodel` over an EPW and
+    an optional IAW wavelength window at every timestep.
+
+    Parameters
+    ----------
+    electrons : `PICPhaseSpace` or `list` of `PICPhaseSpace`
+        Electron population(s). Multiple populations -- for instance a piston and an
+        ambient plasma -- are combined through the forward model's ``efract``.
+    ions : `PICPhaseSpace` or `list` of `PICPhaseSpace`
+        Ion population(s). Each must carry a `~plasmapy.particles` species label,
+        since the forward model needs the charge and mass.
+    position : `float` or `~astropy.units.Quantity`
+        Where along the spatial axis to sample, in m if given as a bare float. Each
+        species independently uses its own nearest grid point, so the species need
+        not share a spatial grid.
+    reference_density : `float` or `~astropy.units.Quantity`
+        The physical density corresponding to a unit zeroth moment of the supplied
+        phase space, in m\ :sup:`-3` if given as a bare float. For a PIC code that
+        normalises density to a reference :math:`n_0`, this is :math:`n_0`. A reader
+        that already produces ``f`` in SI should pass ``1 * u.m**-3``.
+    probe_wavelength : `~astropy.units.Quantity`
+        Probe laser wavelength.
+    epw_wavelengths : `~astropy.units.Quantity`
+        Wavelengths spanning the electron-plasma-wave feature.
+    iaw_wavelengths : `~astropy.units.Quantity`, optional
+        Wavelengths spanning the ion-acoustic-wave feature. Omit to skip the IAW
+        calculation, which roughly halves the runtime.
+    epw_notches, iaw_notches : `~astropy.units.Quantity`, optional
+        Wavelength ranges to zero out, as a pair or a sequence of pairs -- a
+        stray-light notch filter. Usually only the EPW window needs one, since the
+        IAW window sits inside the notch.
+    probe_vec, scatter_vec : array_like
+        Unit vectors along the probe beam and towards the detector. The defaults
+        give a 90 degree scattering geometry.
+    electron_conditioning, ion_conditioning : `dict`, optional
+        Keyword arguments for `condition_phase_space`, applied to every electron and
+        every ion population respectively. The default, `None`, applies
+        `condition_phase_space` with its own defaults, which do **no smoothing** --
+        real PIC electron distributions usually want a few boxcar passes, and the
+        right number is problem-specific, so set it here explicitly. Pass
+        ``{"skip": True}`` if the phase spaces are already conditioned.
+    velocity_scale_factor : `float`, optional
+        Mass-ratio reduction factor :math:`R`, applied to every species. See
+        `condition_phase_space`.
+    presence_threshold : `float`
+        A population contributes at a given timestep only if its fractional density
+        exceeds this. Timesteps where the total electron density falls below
+        ``presence_threshold * reference_density`` -- vacuum, essentially -- are
+        recorded as `~numpy.nan` rather than given a fabricated spectrum.
+    scattered_power : `bool`
+        Convert :math:`S(k, \omega)` to scattered power per unit wavelength.
+    progress : `bool`
+        Show a progress bar over timesteps.
+
+    Returns
+    -------
+    `ThomsonSpectrogram`
+
+    Notes
+    -----
+    Population fractions are computed from the **raw** phase space, before
+    smoothing, tapering, and flooring, so that conditioning cannot manufacture a
+    population that is not physically there. When some populations are excluded at a
+    timestep, the fractions of those remaining are renormalised to sum to one, as
+    the forward model requires.
+
+    Each returned spectrum is normalised to unit area over its own window; see the
+    notes on `ThomsonSpectrogram`.
+
+    Examples
+    --------
+    .. code-block:: python
+
+       spectra = spectra_from_phase_spaces(
+           electrons=electron_phase_space,
+           ions=[aluminium_phase_space],
+           position=80 * u.mm,
+           reference_density=9e17 * u.cm**-3,
+           probe_wavelength=532 * u.nm,
+           epw_wavelengths=np.linspace(457, 607, 500) * u.nm,
+           iaw_wavelengths=np.linspace(525, 539, 500) * u.nm,
+           epw_notches=[525, 540] * u.nm,
+           electron_conditioning={"smoothing_window": 40, "smoothing_iterations": 3},
+           velocity_scale_factor=50,
+       )
+    """
+    electrons = _as_phase_space_list(electrons, "electrons")
+    ions = _as_phase_space_list(ions, "ions")
+    all_species = [*electrons, *ions]
+    t = _check_shared_time_axis(all_species)
+    n_time = t.size
+
+    for phase_space in electrons:
+        if not phase_space.is_electron:
+            warnings.warn(
+                f"species {phase_space.label!r} was passed as an electron "
+                "population but is not flagged as one.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    position = float(_si_values(position, u.m))
+    reference_density = float(_si_values(reference_density, u.m**-3))
+    if reference_density <= 0:
+        raise ValueError(
+            f"reference_density must be positive; got {reference_density} m^-3."
+        )
+
+    # --- population densities and fractions, from the RAW phase space ---
+    indices = {}
+    densities = {}
+    for phase_space in all_species:
+        index, _ = phase_space.slice_position(position)
+        indices[id(phase_space)] = index
+        densities[id(phase_space)] = (
+            number_density(phase_space.f, phase_space.v)[:, index] * reference_density
+        )
+
+    e_densities = np.stack([densities[id(ps)] for ps in electrons])
+    i_densities = np.stack([densities[id(ps)] for ps in ions])
+    electron_density = e_densities.sum(axis=0)
+    efract = _fractions(e_densities)
+    ifract = _fractions(i_densities)
+
+    plasma_present = electron_density > presence_threshold * reference_density
+    electron_present = (efract > presence_threshold) & plasma_present
+    ion_present = (ifract > presence_threshold) & plasma_present
+
+    # --- conditioning ---
+    def _condition(phase_spaces, settings):
+        settings = dict(settings or {})
+        if settings.pop("skip", False):
+            return list(phase_spaces)
+        if "velocity_scale_factor" in settings:
+            raise ValueError(
+                "pass velocity_scale_factor to spectra_from_phase_spaces, not "
+                "through the per-species conditioning settings; it must be the "
+                "same for every species."
+            )
+        return [
+            condition_phase_space(
+                phase_space,
+                velocity_scale_factor=velocity_scale_factor,
+                **settings,
+            )
+            for phase_space in phase_spaces
+        ]
+
+    electrons_c = _condition(electrons, electron_conditioning)
+    ions_c = _condition(ions, ion_conditioning)
+
+    # --- wavelength windows ---
+    epw_wavelengths = u.Quantity(epw_wavelengths, u.nm)
+    epw_notches = _notches_to_quantity(epw_notches)
+    want_iaw = iaw_wavelengths is not None
+    if want_iaw:
+        iaw_wavelengths = u.Quantity(iaw_wavelengths, u.nm)
+        iaw_notches = _notches_to_quantity(iaw_notches)
+
+    probe_vec = np.asarray(probe_vec, dtype=np.float64)
+    scatter_vec = np.asarray(scatter_vec, dtype=np.float64)
+
+    epw = np.full((n_time, epw_wavelengths.size), np.nan)
+    alpha_epw = np.full(n_time, np.nan)
+    # Always allocated, so the loop below stays simply typed; discarded at the
+    # end when no IAW window was requested.
+    iaw = np.full((n_time, iaw_wavelengths.size if want_iaw else 0), np.nan)
+    alpha_iaw = np.full(n_time, np.nan)
+
+    steps = range(n_time)
+    if progress:
+        steps = tqdm(steps, desc="Forward-modelling Thomson spectra")
+
+    for step in steps:
+        selected_e = np.nonzero(electron_present[:, step])[0]
+        selected_i = np.nonzero(ion_present[:, step])[0]
+        if selected_e.size == 0 or selected_i.size == 0:
+            # Nothing to scatter off. Leave NaN rather than inventing a spectrum.
+            continue
+
+        # The forward model weights populations by these, so they must sum to one
+        # over the populations actually passed.
+        efract_step = efract[selected_e, step]
+        efract_step = efract_step / efract_step.sum()
+        ifract_step = ifract[selected_i, step]
+        ifract_step = ifract_step / ifract_step.sum()
+
+        e_axes = [electrons_c[k].v for k in selected_e] * u.m / u.s
+        i_axes = [ions_c[k].v for k in selected_i] * u.m / u.s
+        efn = (
+            [electrons_c[k].f[step, :, indices[id(electrons[k])]] for k in selected_e]
+            * u.s
+            / u.m
+        )
+        ifn = (
+            [ions_c[k].f[step, :, indices[id(ions[k])]] for k in selected_i] * u.s / u.m
+        )
+        ion_labels_step = [ions[k].label for k in selected_i]
+
+        common = {
+            "probe_wavelength": probe_wavelength,
+            "e_velocity_axes": e_axes,
+            "i_velocity_axes": i_axes,
+            "efn": efn,
+            "ifn": ifn,
+            "efract": efract_step,
+            "ifract": ifract_step,
+            "n": electron_density[step] * u.m**-3,
+            "ion_species": ion_labels_step,
+            "probe_vec": probe_vec,
+            "scatter_vec": scatter_vec,
+            "scattered_power": scattered_power,
+        }
+
+        alpha, spectrum = arbitrary_forwardmodel(
+            wavelengths=epw_wavelengths, notches=epw_notches, **common
+        )
+        epw[step] = np.asarray(spectrum, dtype=np.float64)
+        alpha_epw[step] = float(np.asarray(alpha))
+
+        if want_iaw:
+            alpha, spectrum = arbitrary_forwardmodel(
+                wavelengths=iaw_wavelengths, notches=iaw_notches, **common
+            )
+            iaw[step] = np.asarray(spectrum, dtype=np.float64)
+            alpha_iaw[step] = float(np.asarray(alpha))
+
+    return ThomsonSpectrogram(
+        epw=epw,
+        epw_wavelengths=epw_wavelengths.to_value(u.m),
+        iaw=iaw if want_iaw else None,
+        iaw_wavelengths=iaw_wavelengths.to_value(u.m) if want_iaw else None,
+        t=t,
+        alpha_epw=alpha_epw,
+        alpha_iaw=alpha_iaw if want_iaw else None,
+        electron_density=electron_density,
+        efract=efract,
+        ifract=ifract,
+        electron_present=electron_present,
+        ion_present=ion_present,
+        position=position,
+        electron_labels=[ps.label for ps in electrons],
+        ion_labels=[ps.label for ps in ions],
+        meta={
+            "reference_density": reference_density,
+            "probe_vec": probe_vec.tolist(),
+            "scatter_vec": scatter_vec.tolist(),
+            "presence_threshold": presence_threshold,
+            "velocity_scale_factor": velocity_scale_factor,
+            "scattered_power": scattered_power,
+            "species_meta": {ps.label: ps.meta for ps in [*electrons_c, *ions_c]},
+        },
     )

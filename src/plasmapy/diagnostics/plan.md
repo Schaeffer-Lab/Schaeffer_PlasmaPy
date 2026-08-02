@@ -461,8 +461,39 @@ invariant core and produce physically sane spectra.
      mistaken for a physics bug. `S(k,ω)` itself is unaffected — `arbitrary_chi`
      uses the normalisation consistently.
 
-2. `spectra_from_phase_spaces` driver, `ThomsonSpectrogram`, `efract` support,
-   presence masking.
+2. ✅ **Done.** `spectra_from_phase_spaces` driver, `ThomsonSpectrogram`, `efract`
+   support, presence masking. 98 tests in the file, all passing; `ruff` and `ty`
+   clean; the full `tests/diagnostics/` suite is green (209 passed).
+
+   Design decisions settled while implementing:
+
+   - **`reference_density` semantics.** Defined as "the physical density
+     corresponding to a unit zeroth moment of the supplied phase space". For OSIRIS
+     that is `n0`; a reader that already emits SI passes `1 * u.m**-3`. Only the
+     absolute density and the presence threshold need it — `ifract` and `efract` are
+     ratios and so are normalisation-free.
+   - **Fractions are renormalised over the present populations.** The old pipeline
+     passed the raw fractions of the surviving species, which then summed to less
+     than one; the forward model uses them to split the density
+     (`ne = efract * n`, `ni = ifract * n / zbar`), so that silently lost density.
+   - **Presence is judged on the raw phase space**, before the conditioning floor,
+     which would otherwise make an empty slice look populated. Covered by a test.
+   - **Vacuum timesteps** — total electron density below
+     `presence_threshold * reference_density` — produce `NaN` rows rather than a
+     fabricated spectrum.
+   - **Per-species spatial grids** are handled by each species picking its own
+     nearest grid point, so readers need not agree on spatial resolution.
+   - Conditioning happens inside the driver via `electron_conditioning` /
+     `ion_conditioning` dicts (§5.4's asymmetry is now explicit rather than
+     implied), with `{"skip": True}` to accept pre-conditioned input.
+
+   One more forward-model convention pinned down by a test: the driver's default
+   `scattered_power=True` returns power per unit wavelength, which differs from
+   `spectral_density`'s `S(k, ω)` by the frequency-to-wavelength Jacobian
+   `(1 + 2Δω/ω_probe) · 2/λ²`. Comparing the two directly gives a spurious L1
+   difference of 0.092; with `scattered_power=False` the driver agrees with the
+   analytic model at **L1 = 0.032**, and the Jacobian relation reproduces the
+   `True` output to a relative error of 7e-18.
 3. OSIRIS reader (h5py, no pyVisOS) + unit test 5.
 4. End-to-end OSIRIS run vs. the existing `spectra.hdf5`.
 5. WarpX reader + caching.

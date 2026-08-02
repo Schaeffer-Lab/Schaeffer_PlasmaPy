@@ -8,5 +8,12 @@ distributions that
 `~plasmapy.diagnostics.pic_thomson.smooth_vdf`,
 `~plasmapy.diagnostics.pic_thomson.taper_vdf_edges`,
 `~plasmapy.diagnostics.pic_thomson.normalize_vdf`, and
-`~plasmapy.diagnostics.pic_thomson.rescale_velocity_axis`. OSIRIS and WarpX
-readers and the spectrogram driver follow.
+`~plasmapy.diagnostics.pic_thomson.rescale_velocity_axis`. The driver
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` conditions those
+phase spaces, reduces them to one spatial point, and evaluates the forward model
+over EPW and IAW wavelength windows at every timestep, returning a
+`~plasmapy.diagnostics.pic_thomson.ThomsonSpectrogram`. It supports several
+electron and ion populations through the forward model's ``efract`` and
+``ifract``, and excludes populations that are not physically present at a given
+timestep rather than letting them contribute spurious signal. OSIRIS and WarpX
+readers follow.
