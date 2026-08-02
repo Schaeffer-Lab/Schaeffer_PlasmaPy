@@ -43,6 +43,7 @@ __all__ = [
     "from_arrays",
     "normalize_vdf",
     "number_density",
+    "read_osiris_phase_space",
     "rescale_velocity_axis",
     "smooth_vdf",
     "species_presence_mask",
@@ -52,9 +53,12 @@ __all__ = [
 
 import warnings
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
+import astropy.constants as const
 import astropy.units as u
+import h5py
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.ndimage import uniform_filter1d
@@ -366,7 +370,11 @@ def normalize_vdf(f, v, axis: int = VELOCITY_AXIS) -> np.ndarray:
     """
     f = np.nan_to_num(np.asarray(f, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_negative = int(np.count_nonzero(f < 0))
+    # Boxcar smoothing of a strictly non-negative distribution can leave
+    # negatives of order 1e-20 against a 1e-5 peak, which are round-off, not
+    # shot noise. Warn only about negatives large enough to be physical.
+    scale = float(np.max(np.abs(f))) if f.size else 0.0
+    n_negative = int(np.count_nonzero(f < -1e-12 * scale))
     if n_negative:
         warnings.warn(
             f"normalize_vdf: clipped {n_negative} negative value(s) to zero.",
@@ -426,8 +434,11 @@ def taper_vdf_edges(
         to zero. The default, `None`, stretches the rolloff across the whole
         remaining tail, out to the grid boundary.
     pedestal_warning : `float`, optional
-        Emit a `RuntimeWarning` if the taper widens any slice's second moment by
-        more than this fraction. Set to `None` to silence the check.
+        Emit a `RuntimeWarning` if the taper widens the second moment of any
+        appreciably populated slice by more than this fraction. Slices carrying
+        less than 1% of the peak slice's weight are excluded, since an almost-empty
+        cell has a near-zero width that any taper multiplies enormously. Set to
+        `None` to silence the check.
 
     Returns
     -------
@@ -509,9 +520,15 @@ def taper_vdf_edges(
     # Everything beyond a bounded rolloff is zeroed.
     out = np.where(((pos < start_left) | (pos > end_right)) & valid, 0.0, out)
 
-    if pedestal_warning is not None and valid.any():
-        before = _index_space_variance(np.clip(cols[:, valid], 0.0, None))
-        after = _index_space_variance(np.clip(out[:, valid], 0.0, None))
+    # Judge the pedestal only on columns that carry appreciable weight: an
+    # almost-empty cell in vacuum has a near-zero variance to begin with, so any
+    # taper multiplies it enormously and would drown the check in false alarms.
+    weight = np.clip(cols, 0.0, None).sum(axis=0)
+    significant = valid & (weight > 0.01 * weight.max()) if weight.size else valid
+
+    if pedestal_warning is not None and significant.any():
+        before = _index_space_variance(np.clip(cols[:, significant], 0.0, None))
+        after = _index_space_variance(np.clip(out[:, significant], 0.0, None))
         with np.errstate(invalid="ignore", divide="ignore"):
             growth = np.where(before > 0, after / before - 1.0, 0.0)
         worst = float(np.nanmax(growth)) if growth.size else 0.0
@@ -1143,5 +1160,287 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
             "velocity_scale_factor": velocity_scale_factor,
             "scattered_power": scattered_power,
             "species_meta": {ps.label: ps.meta for ps in [*electrons_c, *ions_c]},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Readers -- the only code-specific part of the pipeline
+# ---------------------------------------------------------------------------
+
+
+def _attr_text(node, name: str) -> str:
+    """Read an HDF5 attribute that OSIRIS writes as a byte string array."""
+    value = node.attrs[name]
+    value = np.atleast_1d(value)[0]
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _plasma_frequency(reference_density: float) -> float:
+    r"""Electron plasma frequency in rad/s for a density in m\ :sup:`-3`."""
+    return float(
+        np.sqrt(
+            reference_density
+            * const.e.si.value**2
+            / (const.eps0.si.value * const.m_e.si.value)
+        )
+    )
+
+
+def _osiris_axis_layout(handle, ndim: int) -> list[dict[str, Any]]:
+    """
+    Describe an OSIRIS file's axes in numpy order.
+
+    OSIRIS writes ``AXIS/AXIS1`` as the fastest-varying (Fortran-order) axis, so
+    numpy axis ``k`` corresponds to ``AXIS{ndim - k}``.
+    """
+    layout = []
+    for k in range(ndim):
+        node = handle["AXIS"][f"AXIS{ndim - k}"]
+        layout.append(
+            {
+                "numpy_axis": k,
+                "name": _attr_text(node, "NAME"),
+                "min": float(node[0]),
+                "max": float(node[1]),
+            }
+        )
+    return layout
+
+
+def _osiris_dump_index(filename: str) -> int:
+    """Extract the six-digit dump index from an OSIRIS output filename."""
+    return int(filename.rsplit("-", 1)[1].split(".", 1)[0])
+
+
+def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
+    path,
+    field: str,
+    species: str,
+    *,
+    reference_density,
+    label: str | None = None,
+    is_electron: bool | None = None,
+    timesteps=None,
+    spatial_axis: str | None = None,
+    charge_weighted: bool = True,
+    relativistic_jacobian: bool = True,
+    progress: bool = True,
+) -> PICPhaseSpace:
+    r"""
+    Read an OSIRIS phase-space diagnostic into a `PICPhaseSpace`.
+
+    Reads ``<path>/PHA/<field>/<species>/<field>-<species>-<dump>.h5`` for a series
+    of dumps and reduces them to :math:`f(t, v, x)` in SI units. Uses `h5py`
+    directly, so no OSIRIS-specific I/O package is needed.
+
+    Parameters
+    ----------
+    path : path-like
+        The OSIRIS output directory, conventionally named ``MS``.
+    field : `str`
+        Phase-space diagnostic name, for example ``"p1x1"`` or ``"p1x1x2"``.
+    species : `str`
+        Species name as given in the OSIRIS input deck.
+    reference_density : `float` or `~astropy.units.Quantity`
+        Density the simulation is normalised to, in m\ :sup:`-3` if given as a bare
+        float. Sets the plasma frequency, and so the conversion of the OSIRIS length
+        unit :math:`c / \omega_p` and time unit :math:`1 / \omega_p` into SI. Pass
+        the same value to `spectra_from_phase_spaces`.
+    label : `str`, optional
+        `~plasmapy.particles` species identifier, for example ``"Al 13+"``. Defaults
+        to ``"e-"`` when *is_electron* is `True`; otherwise required, since the
+        forward model needs the ion charge and mass.
+    is_electron : `bool`, optional
+        Whether this is an electron population. Inferred from *label* if omitted.
+    timesteps : iterable of `int`, optional
+        Dump indices to read. The default reads every dump present, in order.
+    spatial_axis : `str`, optional
+        Which spatial axis to keep, for example ``"x1"``. Any other spatial axes are
+        summed over -- this is how a ``p1x1x2`` diagnostic is collapsed onto the
+        shock normal. Defaults to the first spatial axis in the file.
+    charge_weighted : `bool`
+        Whether the diagnostic holds charge density, as OSIRIS's ``charge``-weighted
+        phase space does. When `True`, the sign is dropped and the result divided by
+        the species' charge number, so the zeroth moment is a *number* density --
+        which is what population fractions need when species have different charge
+        states.
+    relativistic_jacobian : `bool`
+        Convert :math:`f(u)` to :math:`f(v)` with the Jacobian
+        :math:`du/dv = \gamma^3 / c`. Leave this on; see the notes.
+    progress : `bool`
+        Show a progress bar while reading.
+
+    Returns
+    -------
+    `PICPhaseSpace`
+
+    Notes
+    -----
+    OSIRIS stores momentum as the proper velocity :math:`u = \gamma v / c`,
+    normalised to each species' *own* mass despite the generic ``m_e c`` label its
+    files carry, so :math:`v = u c / \sqrt{1 + u^2}` is correct for every species
+    and no mass enters here.
+
+    That map is nonlinear, so relabelling the axis is not enough: a distribution
+    binned uniformly in :math:`u` is not uniformly binned in :math:`v`. With
+    *relativistic_jacobian* on, ``f`` is multiplied by :math:`\gamma^3 / c`, which
+    both gives a genuine velocity-space density and makes :math:`\int f \, dv` equal
+    the density in units of *reference_density*. The correction is negligible for
+    slow particles and reaches a factor of a few in the tails of a grid spanning
+    :math:`|u| \sim 1`. The ``osiris2thomson`` pipeline this module derives from
+    omitted it.
+
+    Examples
+    --------
+    .. code-block:: python
+
+       electrons = read_osiris_phase_space(
+           "runs/omegashock/MS",
+           "p1x1",
+           "e",
+           reference_density=9e17 * u.cm**-3,
+           is_electron=True,
+       )
+    """
+    path = Path(path)
+    directory = path / "PHA" / field / species
+    if not directory.is_dir():
+        raise FileNotFoundError(f"no OSIRIS phase-space directory at {directory}")
+
+    available = sorted(directory.glob(f"{field}-{species}-*.h5"))
+    if not available:
+        raise FileNotFoundError(f"no {field}-{species}-*.h5 files in {directory}")
+
+    if timesteps is None:
+        files = available
+    else:
+        by_index = {_osiris_dump_index(p.name): p for p in available}
+        files = []
+        for step in timesteps:
+            if int(step) not in by_index:
+                raise FileNotFoundError(
+                    f"dump {int(step)} not found in {directory}; available dumps "
+                    f"run from {min(by_index)} to {max(by_index)}."
+                )
+            files.append(by_index[int(step)])
+
+    if label is None:
+        if not is_electron:
+            raise ValueError(
+                f"a species label is required for {species!r} so the forward model "
+                'knows its charge and mass; pass e.g. label="Al 13+", or '
+                "is_electron=True for electrons."
+            )
+        label = "e-"
+
+    reference_density = float(_si_values(reference_density, u.m**-3))
+    if reference_density <= 0:
+        raise ValueError(
+            f"reference_density must be positive; got {reference_density} m^-3."
+        )
+    omega_p = _plasma_frequency(reference_density)
+    skin_depth = const.c.si.value / omega_p
+
+    # --- axis layout, from the first file ---
+    with h5py.File(files[0], "r") as handle:
+        dataset = handle[field]
+        layout = _osiris_axis_layout(handle, dataset.ndim)
+        shape = dataset.shape
+
+    momentum_axes = [a for a in layout if a["name"].startswith("p")]
+    spatial_axes = [a for a in layout if a["name"].startswith("x")]
+    if len(momentum_axes) != 1:
+        raise ValueError(
+            f"expected exactly one momentum axis in {field!r}; found "
+            f"{[a['name'] for a in momentum_axes]}."
+        )
+    if not spatial_axes:
+        raise ValueError(f"{field!r} has no spatial axis.")
+
+    if spatial_axis is None:
+        kept_space = spatial_axes[0]
+    else:
+        matches = [a for a in spatial_axes if a["name"] == spatial_axis]
+        if not matches:
+            raise ValueError(
+                f"{field!r} has no spatial axis {spatial_axis!r}; available: "
+                f"{[a['name'] for a in spatial_axes]}."
+            )
+        kept_space = matches[0]
+
+    momentum = momentum_axes[0]
+    summed = tuple(
+        a["numpy_axis"]
+        for a in layout
+        if a["numpy_axis"] not in (momentum["numpy_axis"], kept_space["numpy_axis"])
+    )
+
+    u_axis = np.linspace(
+        momentum["min"], momentum["max"], shape[momentum["numpy_axis"]]
+    )
+    x_axis = (
+        np.linspace(
+            kept_space["min"], kept_space["max"], shape[kept_space["numpy_axis"]]
+        )
+        * skin_depth
+    )
+
+    # --- read every dump ---
+    blocks = []
+    times = []
+    iterator = tqdm(files, desc=f"Reading {species} phase space") if progress else files
+    for file in iterator:
+        with h5py.File(file, "r") as handle:
+            data = np.asarray(handle[field][()], dtype=np.float64)
+            times.append(float(np.atleast_1d(handle.attrs["TIME"])[0]))
+        if summed:
+            data = data.sum(axis=summed)
+        # Reduce to (momentum, space) regardless of the file's axis order.
+        remaining = [
+            a["numpy_axis"]
+            for a in sorted(layout, key=lambda a: a["numpy_axis"])
+            if a["numpy_axis"] in (momentum["numpy_axis"], kept_space["numpy_axis"])
+        ]
+        if remaining.index(momentum["numpy_axis"]) != 0:
+            data = data.T
+        blocks.append(data)
+
+    f = np.stack(blocks)
+    t = np.asarray(times, dtype=np.float64) / omega_p
+
+    # --- OSIRIS conventions ---
+    if charge_weighted:
+        # Electron phase space is negative because it holds charge density.
+        f = np.abs(f)
+        charge_number = abs(Particle(label).charge_number)
+        if charge_number != 1:
+            f = f / charge_number
+
+    gamma = np.sqrt(1.0 + u_axis**2)
+    v_axis = u_axis * const.c.si.value / gamma
+    if relativistic_jacobian:
+        f = f * (gamma**3 / const.c.si.value)[np.newaxis, :, np.newaxis]
+
+    return from_arrays(
+        f=f,
+        v=v_axis,
+        x=x_axis,
+        t=t,
+        label=label,
+        is_electron=is_electron,
+        meta={
+            "code": "OSIRIS",
+            "path": str(directory),
+            "field": field,
+            "species": species,
+            "dumps": [_osiris_dump_index(p.name) for p in files],
+            "reference_density": reference_density,
+            "plasma_frequency": omega_p,
+            "skin_depth": skin_depth,
+            "spatial_axis": kept_space["name"],
+            "summed_axes": [a["name"] for a in layout if a["numpy_axis"] in summed],
+            "charge_weighted": charge_weighted,
+            "relativistic_jacobian": relativistic_jacobian,
         },
     )

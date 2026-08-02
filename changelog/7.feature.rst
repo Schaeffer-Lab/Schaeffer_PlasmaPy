@@ -15,5 +15,8 @@ over EPW and IAW wavelength windows at every timestep, returning a
 `~plasmapy.diagnostics.pic_thomson.ThomsonSpectrogram`. It supports several
 electron and ion populations through the forward model's ``efract`` and
 ``ifract``, and excludes populations that are not physically present at a given
-timestep rather than letting them contribute spurious signal. OSIRIS and WarpX
-readers follow.
+timestep rather than letting them contribute spurious signal.
+`~plasmapy.diagnostics.pic_thomson.read_osiris_phase_space` reads OSIRIS
+phase-space diagnostics through `h5py` alone, converting the code's normalised
+units to SI and handling its charge-density sign convention and the Jacobian of
+the proper-velocity-to-velocity map. A WarpX reader follows.

@@ -261,3 +261,6 @@ tramp
 Session*.vim
 .netrwhist
 tags
+
+# Visual output from tools/pic_thomson_figures.py -- local only
+/media/

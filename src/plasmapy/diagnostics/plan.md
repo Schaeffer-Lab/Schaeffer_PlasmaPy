@@ -494,8 +494,77 @@ invariant core and produce physically sane spectra.
    difference of 0.092; with `scattered_power=False` the driver agrees with the
    analytic model at **L1 = 0.032**, and the Jacobian relation reproduces the
    `True` output to a relative error of 7e-18.
-3. OSIRIS reader (h5py, no pyVisOS) + unit test 5.
+3. ✅ **Done.** OSIRIS reader (h5py, no pyVisOS) + unit test 5. 118 tests in the
+   file, all passing; full `tests/diagnostics/` suite green (222 passed).
+   Also added `tools/pic_thomson_figures.py`, which renders the behaviour the
+   tests assert into a git-ignored `media/` directory.
+
+   Confirmed against the real run and the deck:
+
+   - **Momentum is normalised to each species' own mass**, despite the generic
+     `m_e c` label OSIRIS writes in the file. The deck's boundary thermal speeds
+     settle it: `uth_e / uth_cham = 3.7543e-2 / 2.1868e-3 = 17.17`, which matches
+     `√((T_e/m_e)/(T_i/m_i)) = 17.2` for species-mass normalisation and gives
+     T_e = 721 eV, T_i = 169 eV. The `m_e c` reading would imply T_i = 0.04 eV.
+     So `v = u c/√(1+u²)` is right for every species.
+   - **Electron phase space is a negative charge density** (min −2544, max 0).
+     The old pipeline's `abs()` inside `smooth_vdf` was load-bearing for this, not
+     just noise handling — removing it in step 1 would have zeroed every electron
+     distribution. Sign handling now lives in the reader, where the code's
+     convention belongs, along with dividing by the charge number so the zeroth
+     moment is a *number* density.
+   - **The `u → v` map needs its Jacobian.** `f(v) = f(u) γ³/c`. The old pipeline
+     relabelled the axis without it. With the Jacobian, `∫f dv` equals the density
+     in units of `n0` — validated on real data: the upstream electron density
+     reads **n/n₀ = 1.037**.
+
+   Reader-level validation on `omegashock_w3.5e11_exp`: the EPW satellite tracks
+   the plasma frequency across the shock — observed shift 9.8 → 20.8 nm against a
+   bare `ω_pe` prediction of 8.2 → 18.7 nm, a ratio of 1.1–1.3, which is the
+   expected Bohm-Gross excess.
+
+### 3a. The taper pedestal, answered on real data (see §5.5a)
+
+The question flagged in §5.5a is settled, and the answer is worse than the
+synthetic estimate. Median width inflation across all appreciably populated cells:
+
+| species | grid half-width | unbounded | bins=20 | bins=10 | bins=5 | bins=3 |
+|---|---|---|---|---|---|---|
+| `e` | 13σ | **+67 %** | −0.1 % | −0.7 % | −0.9 % | −1.0 % |
+| `cham` | 14σ | **+4086 %** | +35 % | +11 % | +3.9 % | +1.6 % |
+| `targ` | 23σ | **+242 %** | +6.0 % | +2.8 % | +1.3 % | +0.7 % |
+
+The ions are catastrophic because their momentum grid (`u ∈ ±0.1`, `±0.05`) is far
+wider than the actual thermal spread — cold upstream ions occupy a handful of bins
+out of 1024. **The old pipeline's unbounded taper inflated the ion width by a
+factor of ~40**, which together with the ion-normalisation bug (§5.2, factor 10)
+means the IAW output of the existing `spectra.hdf5` should not be trusted.
+
+Recommended settings for this run: `max_taper_bins=20` for electrons,
+`max_taper_bins=3` for ions. A fixed bin count is a blunt knob — a bound expressed
+as a fraction of each slice's own width would be better, and is worth considering
+in step 7.
+
+Two diagnostics were also de-noised so they mean something on real data: the
+negative-value warning in `normalize_vdf` now ignores round-off (boxcar smoothing
+leaves ~1e-20 negatives against a 1e-5 peak, which produced 3.2 million spurious
+warnings), and the pedestal check ignores cells carrying under 1 % of the peak
+weight (an almost-empty vacuum cell has near-zero width, so any taper multiplies
+it enormously — it was reporting 14 575 093 %).
+
 4. End-to-end OSIRIS run vs. the existing `spectra.hdf5`.
+
+   **Open before this step:** the figures label both `cham` and `targ` as
+   `"Al 13+"` as a placeholder. The deck gives `cham` rqm 69 and `targ` rqm 68,
+   which are different species — the chamber gas and the target material. The real
+   labels are needed, since the forward model takes `Z` and mass from them, and
+   `ifract`/`zbar` depend on `Z`.
+
+   Also worth investigating: at late times the sampled point reaches α ≈ 16, where
+   the EPW satellites become faint relative to the ion feature and the
+   per-window area normalisation lets the central line dominate the spectrogram.
+   That looks like correct physics for the collective regime rather than a defect,
+   but it should be confirmed against the old output.
 5. WarpX reader + caching.
 6. End-to-end WarpX run; cross-code comparison.
 7. HDF5 writer, plotting, instrument response.

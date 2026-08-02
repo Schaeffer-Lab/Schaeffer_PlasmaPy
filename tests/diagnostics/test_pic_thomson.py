@@ -7,6 +7,7 @@ import warnings
 
 import astropy.constants as const
 import astropy.units as u
+import h5py
 import numpy as np
 import pytest
 
@@ -1082,3 +1083,401 @@ class TestDriverPhysics:
         peak_uncorrected = wavelengths[red][np.argmax(uncorrected[red])]
         peak_corrected = wavelengths[red][np.argmax(corrected[red])]
         assert peak_corrected < peak_uncorrected
+
+
+# ---------------------------------------------------------------------------
+# 8. The OSIRIS reader
+# ---------------------------------------------------------------------------
+
+OSIRIS_REFERENCE_DENSITY = 9e17 * u.cm**-3
+
+
+def write_osiris_file(directory, field, species, dump, data, *, axes, time):
+    """
+    Write one file in OSIRIS phase-space layout.
+
+    ``axes`` lists ``(name, min, max)`` in **numpy** axis order; the writer
+    reverses them into the Fortran-ordered ``AXIS1..N`` that OSIRIS emits, which
+    is exactly the convention the reader has to undo.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{field}-{species}-{dump:06d}.h5"
+    ndim = data.ndim
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset(field, data=np.asarray(data, dtype=np.float32))
+        group = handle.create_group("AXIS")
+        for k, (name, lo, hi) in enumerate(axes):
+            node = group.create_dataset(
+                f"AXIS{ndim - k}", data=np.array([lo, hi], dtype=np.float64)
+            )
+            node.attrs["NAME"] = np.array([name.encode()], dtype="S256")
+            node.attrs["UNITS"] = np.array([b"a.u."], dtype="S256")
+        handle.attrs["TIME"] = np.array([time], dtype=np.float64)
+        handle.attrs["ITER"] = np.array([dump * 10], dtype=np.int32)
+    return path
+
+
+def make_osiris_run(
+    tmp_path,
+    *,
+    field="p1x1",
+    species="e",
+    n_p=64,
+    n_x=8,
+    n_dumps=3,
+    u_max=1.0,
+    x_max=100.0,
+    sign=-1.0,
+    transverse=None,
+):
+    """Build a small OSIRIS ``MS`` tree and return its path plus the raw blocks."""
+    directory = tmp_path / "MS" / "PHA" / field / species
+    u_axis = np.linspace(-u_max, u_max, n_p)
+    blocks = []
+    for dump in range(n_dumps):
+        profile = np.exp(-(u_axis**2) / (2 * 0.2**2)) * (1 + 0.1 * dump)
+        if transverse is None:
+            data = sign * np.outer(profile, np.ones(n_x))
+            axes = [("p1", -u_max, u_max), ("x1", 0.0, x_max)]
+        else:
+            data = sign * np.einsum(
+                "p,x,y->pxy", profile, np.ones(n_x), np.ones(transverse)
+            )
+            axes = [
+                ("p1", -u_max, u_max),
+                ("x1", 0.0, x_max),
+                ("x2", 0.0, 10.0),
+            ]
+        write_osiris_file(
+            directory, field, species, dump, data, axes=axes, time=100.0 * dump
+        )
+        blocks.append(np.abs(data))
+    return tmp_path / "MS", u_axis, blocks
+
+
+class TestOsirisReader:
+    def test_axis_order_and_shapes(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path, n_p=64, n_x=8, n_dumps=3)
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            progress=False,
+        )
+        # The file stores AXIS1 = x1 and AXIS2 = p1, so numpy axis 0 is momentum.
+        assert phase_space.shape == (3, 64, 8)
+        assert phase_space.label == "e-"
+        assert phase_space.meta["spatial_axis"] == "x1"
+
+    def test_velocity_axis_is_the_relativistic_map(self, tmp_path):
+        ms, u_axis, _ = make_osiris_run(tmp_path, u_max=1.0)
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            progress=False,
+        )
+        expected = u_axis * const.c.si.value / np.sqrt(1 + u_axis**2)
+        np.testing.assert_allclose(phase_space.v, expected, rtol=1e-12)
+        # u = 1 is 0.707 c, not c -- the check that catches a missing gamma.
+        assert phase_space.v[-1] == pytest.approx(
+            const.c.si.value / np.sqrt(2), rel=1e-12
+        )
+
+    def test_spatial_and_time_axes_are_converted_to_si(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path, n_x=8, x_max=100.0, n_dumps=3)
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            progress=False,
+        )
+        density = OSIRIS_REFERENCE_DENSITY.to_value(u.m**-3)
+        omega_p = np.sqrt(
+            density * const.e.si.value**2 / (const.eps0.si.value * const.m_e.si.value)
+        )
+        skin_depth = const.c.si.value / omega_p
+
+        np.testing.assert_allclose(phase_space.x[-1], 100.0 * skin_depth, rtol=1e-12)
+        np.testing.assert_allclose(
+            phase_space.t, [0.0, 100.0, 200.0] / omega_p, rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            phase_space.meta["plasma_frequency"], omega_p, rtol=1e-12
+        )
+
+    def test_electron_charge_density_sign_is_removed(self, tmp_path):
+        """
+        OSIRIS writes electron phase space as a negative charge density. Left
+        alone it would be clipped away entirely by `normalize_vdf`.
+        """
+        ms, _, _ = make_osiris_run(tmp_path, sign=-1.0)
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            progress=False,
+        )
+        assert np.all(phase_space.f >= 0)
+        assert phase_space.f.max() > 0
+
+    def test_charge_weighting_divides_by_the_charge_number(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path, species="al", sign=1.0)
+        weighted = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "al",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            label="Al 13+",
+            progress=False,
+        )
+        unweighted = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "al",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            label="Al 13+",
+            charge_weighted=False,
+            progress=False,
+        )
+        np.testing.assert_allclose(weighted.f * 13, unweighted.f, rtol=1e-12)
+
+    def test_jacobian_preserves_the_momentum_space_integral(self, tmp_path):
+        r"""
+        With the :math:`\gamma^3 / c` Jacobian applied, integrating over velocity
+        reproduces the integral over proper velocity -- so the zeroth moment is
+        still the density in units of the reference density.
+        """
+        ms, u_axis, blocks = make_osiris_run(tmp_path, n_p=512, u_max=1.0)
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            progress=False,
+        )
+        in_u = np.trapezoid(blocks[0][:, 0], u_axis)
+        in_v = pic_thomson.number_density(phase_space.f, phase_space.v)[0, 0]
+        np.testing.assert_allclose(in_v, in_u, rtol=1e-3)
+
+    def test_jacobian_can_be_disabled(self, tmp_path):
+        ms, u_axis, _ = make_osiris_run(tmp_path)
+        with_jacobian = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            progress=False,
+        )
+        without = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            relativistic_jacobian=False,
+            progress=False,
+        )
+        gamma = np.sqrt(1 + u_axis**2)
+        ratio = with_jacobian.f[0, :, 0] / without.f[0, :, 0]
+        np.testing.assert_allclose(ratio, gamma**3 / const.c.si.value, rtol=1e-12)
+
+    def test_transverse_spatial_axis_is_summed(self, tmp_path):
+        ms, _, _ = make_osiris_run(
+            tmp_path, field="p1x1x2", n_p=32, n_x=8, transverse=4
+        )
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1x2",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            progress=False,
+        )
+        assert phase_space.shape == (3, 32, 8)
+        assert phase_space.meta["summed_axes"] == ["x2"]
+
+    def test_can_keep_the_other_spatial_axis(self, tmp_path):
+        ms, _, _ = make_osiris_run(
+            tmp_path, field="p1x1x2", n_p=32, n_x=8, transverse=4
+        )
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1x2",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            spatial_axis="x2",
+            progress=False,
+        )
+        assert phase_space.shape == (3, 32, 4)
+        assert phase_space.meta["summed_axes"] == ["x1"]
+
+    def test_selects_requested_dumps(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path, n_dumps=5)
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            timesteps=[0, 2, 4],
+            progress=False,
+        )
+        assert phase_space.shape[0] == 3
+        assert phase_space.meta["dumps"] == [0, 2, 4]
+
+    def test_rejects_a_missing_dump(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path, n_dumps=3)
+        with pytest.raises(FileNotFoundError, match="dump 9 not found"):
+            pic_thomson.read_osiris_phase_space(
+                ms,
+                "p1x1",
+                "e",
+                reference_density=OSIRIS_REFERENCE_DENSITY,
+                is_electron=True,
+                timesteps=[0, 9],
+                progress=False,
+            )
+
+    def test_rejects_a_missing_species_directory(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path)
+        with pytest.raises(FileNotFoundError, match="no OSIRIS phase-space"):
+            pic_thomson.read_osiris_phase_space(
+                ms,
+                "p1x1",
+                "nonexistent",
+                reference_density=OSIRIS_REFERENCE_DENSITY,
+                is_electron=True,
+                progress=False,
+            )
+
+    def test_requires_a_label_for_ions(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path, species="al", sign=1.0)
+        with pytest.raises(ValueError, match="species label is required"):
+            pic_thomson.read_osiris_phase_space(
+                ms,
+                "p1x1",
+                "al",
+                reference_density=OSIRIS_REFERENCE_DENSITY,
+                progress=False,
+            )
+
+    def test_rejects_an_unknown_spatial_axis(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path)
+        with pytest.raises(ValueError, match="no spatial axis 'x7'"):
+            pic_thomson.read_osiris_phase_space(
+                ms,
+                "p1x1",
+                "e",
+                reference_density=OSIRIS_REFERENCE_DENSITY,
+                is_electron=True,
+                spatial_axis="x7",
+                progress=False,
+            )
+
+    def test_rejects_non_positive_reference_density(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path)
+        with pytest.raises(ValueError, match="reference_density must be positive"):
+            pic_thomson.read_osiris_phase_space(
+                ms,
+                "p1x1",
+                "e",
+                reference_density=0 * u.cm**-3,
+                is_electron=True,
+                progress=False,
+            )
+
+    def test_output_feeds_the_driver(self, tmp_path):
+        """The reader's output must be directly usable by the driver."""
+        pytest.importorskip("numba")
+        ms, _, _ = make_osiris_run(tmp_path, n_p=256, n_x=8, n_dumps=2)
+        make_osiris_run(tmp_path, species="al", n_p=256, n_x=8, n_dumps=2, sign=1.0)
+        electrons = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            progress=False,
+        )
+        ions = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1",
+            "al",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            label="Al 13+",
+            progress=False,
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            spectrogram = pic_thomson.spectra_from_phase_spaces(
+                electrons,
+                [ions],
+                position=electrons.x[4],
+                reference_density=OSIRIS_REFERENCE_DENSITY,
+                probe_wavelength=PROBE_WAVELENGTH,
+                epw_wavelengths=EPW_WINDOW,
+                electron_conditioning={"max_taper_bins": 20},
+                ion_conditioning={"max_taper_bins": 20},
+                progress=False,
+            )
+        assert spectrogram.epw.shape == (2, EPW_WINDOW.size)
+        assert np.all(np.isfinite(spectrogram.epw))
+
+
+# ---------------------------------------------------------------------------
+# 9. Diagnostics must not cry wolf
+# ---------------------------------------------------------------------------
+
+
+class TestDiagnosticFalseAlarms:
+    def test_roundoff_negatives_do_not_warn(self):
+        """
+        Boxcar smoothing of a strictly non-negative distribution leaves
+        negatives of order 1e-20 against a 1e-5 peak. Those are round-off, and
+        warning about millions of them buries the real signal.
+        """
+        v = np.linspace(-5.0, 5.0, 201)
+        f = block(maxwellian(v, 1.0))
+        f[0, 3, 0] = -1e-18 * f.max()
+        # Warnings are errors in this suite, so calling through is the assertion.
+        pic_thomson.normalize_vdf(f, v)
+
+    def test_physical_negatives_still_warn(self):
+        v = np.linspace(-5.0, 5.0, 201)
+        f = block(maxwellian(v, 1.0))
+        f[0, 3, 0] = -0.01 * f.max()
+        with pytest.warns(RuntimeWarning, match="clipped 1 negative"):
+            pic_thomson.normalize_vdf(f, v)
+
+    def test_empty_cells_do_not_trigger_the_pedestal_warning(self):
+        """
+        A near-empty cell has a near-zero width, so any taper multiplies it
+        enormously. Real PIC data is full of such cells in vacuum, and letting
+        them drive the check makes it fire always and mean nothing.
+        """
+        v = np.linspace(-4.0, 4.0, 401)
+        f = block(maxwellian(v, 1.0), n_time=1, n_x=3)
+        # A vacuum cell holding a single noise spike.
+        f[0, :, 2] = 0.0
+        f[0, 200, 2] = 1e-9 * f.max()
+        f[0, 201, 2] = 1e-9 * f.max()
+        pic_thomson.taper_vdf_edges(f, threshold_frac=0.005)
+
+    def test_a_populated_cell_still_triggers_the_pedestal_warning(self):
+        v = np.linspace(-12.0, 12.0, 401)
+        f = block(maxwellian(v, 1.0), n_time=1, n_x=3)
+        f[0, :, 2] = 0.0
+        with pytest.warns(RuntimeWarning, match="fabricating a pedestal"):
+            pic_thomson.taper_vdf_edges(f, threshold_frac=0.005)
