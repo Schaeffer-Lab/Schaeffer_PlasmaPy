@@ -44,6 +44,7 @@ __all__ = [
     "normalize_vdf",
     "number_density",
     "read_osiris_phase_space",
+    "read_warpx_phase_space",
     "rescale_velocity_axis",
     "smooth_vdf",
     "species_presence_mask",
@@ -1469,5 +1470,296 @@ def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
             "summed_axes": [a["name"] for a in layout if a["numpy_axis"] in summed],
             "charge_weighted": charge_weighted,
             "relativistic_jacobian": relativistic_jacobian,
+        },
+    )
+
+
+def _load_yt():
+    """Import yt, with an actionable message when it is not installed."""
+    try:
+        import yt  # noqa: PLC0415  (optional dependency, imported on demand)
+    except ImportError as error:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "reading WarpX output requires yt, which is not a required "
+            "dependency of PlasmaPy. Install it with `pip install yt`, or "
+            "`pip install plasmapy[pic]`."
+        ) from error
+    yt.set_log_level(50)
+    return yt
+
+
+def _warpx_plotfiles(path: Path, prefix: str, timesteps) -> list[Path]:
+    """Sorted plotfile directories for a WarpX diagnostic."""
+    available = sorted(p for p in path.glob(f"{prefix}*") if p.is_dir())
+    if not available:
+        raise FileNotFoundError(f"no {prefix}* plotfiles in {path}")
+    if timesteps is None:
+        return available
+    try:
+        return [available[int(step)] for step in timesteps]
+    except IndexError as error:
+        raise IndexError(
+            f"requested a plotfile beyond the {len(available)} present in {path}."
+        ) from error
+
+
+def _warpx_frame(
+    yt, plotfile: Path, species: str, fields: tuple[str, str]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, tuple[np.ndarray, np.ndarray]]:
+    """Read (position, momentum, weight, time, domain) for one species."""
+    dataset = yt.load(str(plotfile))
+    data = dataset.all_data()
+    position_field, momentum_field = fields
+    try:
+        position = np.asarray(data[species, position_field].to("m"))
+        momentum = np.asarray(data[species, momentum_field].to("kg*m/s"))
+        weight = np.asarray(data[species, "particle_weight"])
+    except Exception as error:
+        raise KeyError(
+            f"could not read {species!r} fields {fields} from {plotfile}; "
+            f"the plotfile carries particle types {dataset.particle_types}."
+        ) from error
+    left = np.asarray(dataset.domain_left_edge.to("m"))
+    right = np.asarray(dataset.domain_right_edge.to("m"))
+    return position, momentum, weight, float(dataset.current_time), (left, right)
+
+
+def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
+    path,
+    species: str,
+    *,
+    mass,
+    label: str | None = None,
+    is_electron: bool | None = None,
+    position_field: str = "particle_position_x",
+    momentum_field: str = "particle_momentum_z",
+    n_velocity_bins: int = 512,
+    n_position_bins: int = 512,
+    velocity_range=None,
+    position_range=None,
+    transverse_area: float | None = None,
+    timesteps=None,
+    prefix: str = "diag1",
+    cache=None,
+    progress: bool = True,
+) -> PICPhaseSpace:
+    r"""
+    Bin WarpX macroparticles into a `PICPhaseSpace`.
+
+    WarpX writes raw macroparticles rather than a binned phase space, so unlike
+    the OSIRIS reader this one has to build :math:`f(t, v, x)` itself, with a
+    weighted two-dimensional histogram per timestep.
+
+    Parameters
+    ----------
+    path : path-like
+        Directory holding the plotfiles, conventionally ``<run>/diags``.
+    species : `str`
+        WarpX species name, for example ``"amb_ions"``.
+    mass : `float` or `~astropy.units.Quantity`
+        The mass the *simulation* gave this species, in kg if a bare float. This
+        is what converts momentum to velocity, and in a reduced-mass-ratio run it
+        is **not** the physical mass of the species named by *label* -- see the
+        notes.
+    label : `str`, optional
+        `~plasmapy.particles` identifier for the physical species the population
+        represents. Defaults to ``"e-"`` when *is_electron* is `True`; otherwise
+        required.
+    is_electron : `bool`, optional
+        Whether this is an electron population. Inferred from *label* if omitted.
+    position_field, momentum_field : `str`
+        Particle fields to read. The defaults suit a 1-D run: WarpX stores the
+        single spatial coordinate as ``particle_position_x`` even when the deck
+        calls that direction ``z``, while the momentum components keep their
+        physical names.
+    n_velocity_bins, n_position_bins : `int`
+        Histogram resolution.
+    velocity_range, position_range : pair of `float`, optional
+        Histogram bounds, in m/s and m. *position_range* defaults to the
+        simulation domain. *velocity_range* defaults to a symmetric range around
+        zero covering the first and last frames with 20% headroom -- pass it
+        explicitly for a reproducible grid.
+    transverse_area : `float`, optional
+        Cross-sectional area in m\ :sup:`2` used to turn macroparticle weights
+        into a density. Defaults to the product of the domain's transverse
+        extents, which is 1 m\ :sup:`2` for a 1-D run.
+    timesteps : iterable of `int`, optional
+        Indices into the sorted list of plotfiles. The default reads all of them.
+    prefix : `str`
+        Plotfile name prefix. Note that a field-only diagnostic written with
+        ``write_species = 0`` carries no particles and cannot be used here.
+    cache : path-like, optional
+        ``.npz`` file to memoise the binned result in. Reading and histogramming
+        millions of macroparticles across a long series is slow, and the result
+        only depends on the settings recorded alongside it.
+    progress : `bool`
+        Show a progress bar while reading.
+
+    Returns
+    -------
+    `PICPhaseSpace`
+
+    Notes
+    -----
+    Macroparticle **weights** are included in the histogram, so ``f`` is a
+    distribution rather than a count. It is scaled by the bin volume such that
+    :math:`\int f \, dv` is the number density in m\ :sup:`-3` -- so pass
+    ``reference_density=1 * u.m**-3`` to `spectra_from_phase_spaces`.
+
+    In a reduced-mass-ratio run, *mass* and *label* describe different things and
+    both are needed. *mass* is the simulation's value, which converts the stored
+    momentum into the velocities the simulation actually evolved; *label* names
+    the physical species, from which the forward model takes the charge and mass
+    entering the susceptibility. Correcting the velocities themselves is a
+    separate step -- see ``velocity_scale_factor`` in `condition_phase_space`.
+
+    Examples
+    --------
+    .. code-block:: python
+
+       ions = read_warpx_phase_space(
+           "runs/R1_paper/diags",
+           "amb_ions",
+           mass=100 * const.m_e,
+           label="p+",
+           cache="amb_ions.npz",
+       )
+    """
+    path = Path(path)
+    mass = float(_si_values(mass, u.kg))
+    if mass <= 0:
+        raise ValueError(f"mass must be positive; got {mass} kg.")
+
+    if label is None:
+        if not is_electron:
+            raise ValueError(
+                f"a species label is required for {species!r} so the forward model "
+                'knows its charge and mass; pass e.g. label="p+", or '
+                "is_electron=True for electrons."
+            )
+        label = "e-"
+
+    settings = {
+        "species": species,
+        "mass": mass,
+        "position_field": position_field,
+        "momentum_field": momentum_field,
+        "n_velocity_bins": n_velocity_bins,
+        "n_position_bins": n_position_bins,
+        "velocity_range": None if velocity_range is None else list(velocity_range),
+        "position_range": None if position_range is None else list(position_range),
+        "prefix": prefix,
+    }
+    signature = repr(sorted(settings.items()))
+
+    cache = None if cache is None else Path(cache)
+    if cache is not None and cache.is_file():
+        stored = np.load(cache, allow_pickle=False)
+        if str(stored["signature"]) == signature:
+            return from_arrays(
+                f=stored["f"],
+                v=stored["v"],
+                x=stored["x"],
+                t=stored["t"],
+                label=label,
+                is_electron=is_electron,
+                meta={"code": "WarpX", "cache": str(cache), **settings},
+            )
+
+    yt = _load_yt()
+    plotfiles = _warpx_plotfiles(path, prefix, timesteps)
+
+    def velocities(momentum):
+        proper = momentum / (mass * const.c.si.value)
+        return proper * const.c.si.value / np.sqrt(1.0 + proper**2)
+
+    # --- fix the histogram grid, so every frame shares one axis ---
+    fields = (position_field, momentum_field)
+    probes = [_warpx_frame(yt, plotfiles[0], species, fields)]
+    if len(plotfiles) > 1:
+        probes.append(_warpx_frame(yt, plotfiles[-1], species, fields))
+
+    extreme = max(
+        (
+            float(np.max(np.abs(velocities(momentum))))
+            for _, momentum, _, _, _ in probes
+            if momentum.size
+        ),
+        default=0.0,
+    )
+    left, right = probes[0][4]
+
+    if velocity_range is None:
+        if extreme <= 0:
+            raise ValueError(
+                f"species {species!r} has no particles in the first or last "
+                "plotfile, so no velocity range could be inferred; pass "
+                "velocity_range explicitly."
+            )
+        # Headroom, but never past the speed of light: no particle can live
+        # there, and the empty bins would only give the taper more room to
+        # invent a tail.
+        headroom = min(1.2 * extreme, 0.999 * const.c.si.value)
+        v_lo, v_hi = -headroom, headroom
+    else:
+        v_lo, v_hi = float(velocity_range[0]), float(velocity_range[1])
+
+    if position_range is None:
+        x_lo, x_hi = float(left[0]), float(right[0])
+    else:
+        x_lo, x_hi = float(position_range[0]), float(position_range[1])
+
+    if transverse_area is None:
+        widths = (right - left)[1:]
+        transverse_area = float(np.prod(widths)) if widths.size else 1.0
+
+    v_edges = np.linspace(v_lo, v_hi, n_velocity_bins + 1)
+    x_edges = np.linspace(x_lo, x_hi, n_position_bins + 1)
+    v_axis = 0.5 * (v_edges[:-1] + v_edges[1:])
+    x_axis = 0.5 * (x_edges[:-1] + x_edges[1:])
+    bin_volume = np.diff(v_edges)[0] * np.diff(x_edges)[0] * transverse_area
+
+    blocks = []
+    times = []
+    iterator = (
+        tqdm(plotfiles, desc=f"Binning {species} macroparticles")
+        if progress
+        else plotfiles
+    )
+    for plotfile in iterator:
+        position, momentum, weight, time, _ = _warpx_frame(
+            yt, plotfile, species, fields
+        )
+        histogram, _, _ = np.histogram2d(
+            velocities(momentum),
+            position,
+            bins=[v_edges, x_edges],
+            weights=weight,
+        )
+        blocks.append(histogram / bin_volume)
+        times.append(time)
+
+    f = np.stack(blocks)
+    t = np.asarray(times, dtype=np.float64)
+
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache, f=f, v=v_axis, x=x_axis, t=t, signature=np.str_(signature)
+        )
+
+    return from_arrays(
+        f=f,
+        v=v_axis,
+        x=x_axis,
+        t=t,
+        label=label,
+        is_electron=is_electron,
+        meta={
+            "code": "WarpX",
+            "path": str(path),
+            "plotfiles": [p.name for p in plotfiles],
+            "transverse_area": transverse_area,
+            **settings,
         },
     )

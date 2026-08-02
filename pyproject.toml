@@ -80,6 +80,12 @@ thomson = [
   "numba>=0.59",
   "torch>=2.2",
 ]
+# Reading WarpX (AMReX plotfile) output in
+# ``plasmapy.diagnostics.pic_thomson``. The OSIRIS reader needs only h5py,
+# which is a required dependency, so this is not needed for that path.
+pic = [
+  "yt>=4.4",
+]
 
 [dependency-groups]
 # Define development dependencies using dependency groups (see PEP 735).

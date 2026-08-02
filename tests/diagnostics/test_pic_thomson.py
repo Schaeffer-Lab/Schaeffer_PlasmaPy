@@ -1537,3 +1537,362 @@ class TestAtPosition:
     def test_rejects_out_of_bounds(self):
         with pytest.raises(ValueError, match="outside the spatial axis"):
             simple_phase_space().at_position(1.0 * u.m)
+
+
+# ---------------------------------------------------------------------------
+# 11. The WarpX reader
+# ---------------------------------------------------------------------------
+
+
+def _no_yt_needed():
+    """Stand-in for the yt module, which the fake frame reader never uses."""
+    return object()
+
+
+def _yt_must_not_be_used():
+    """Fail the test if the reader tries to read rather than use its cache."""
+    pytest.fail("the cache was not used")
+
+
+WARPX_DENSITY = 1e16  # m^-3
+WARPX_DOMAIN = 10.0  # m
+WARPX_SIGMA = 1e6  # m/s
+
+
+def fake_warpx_frames(monkeypatch, mass, *, drift=0.0, n_particles=400_000):
+    """
+    Stand in for the yt layer with macroparticles drawn from a known
+    Maxwellian, so the reader's binning and normalisation can be checked
+    without any WarpX output on disk.
+    """
+    speed_of_light = const.c.si.value
+
+    def frame(_yt, plotfile, _species, _fields):
+        index = int(str(plotfile).rsplit("diag1", 1)[1])
+        rng = np.random.default_rng(index)
+        velocity = rng.normal(drift, WARPX_SIGMA, n_particles)
+        gamma = 1.0 / np.sqrt(1.0 - (velocity / speed_of_light) ** 2)
+        momentum = mass * gamma * velocity
+        position = rng.uniform(0.0, WARPX_DOMAIN, n_particles)
+        # Weights chosen so the domain holds exactly WARPX_DENSITY per m^3.
+        weight = np.full(n_particles, WARPX_DENSITY * WARPX_DOMAIN / n_particles)
+        domain = (np.zeros(3), np.array([WARPX_DOMAIN, 1.0, 1.0]))
+        return position, momentum, weight, index * 1e-9, domain
+
+    monkeypatch.setattr(pic_thomson, "_load_yt", _no_yt_needed)
+    monkeypatch.setattr(pic_thomson, "_warpx_frame", frame)
+
+
+def make_warpx_plotfiles(tmp_path, n_frames=3, prefix="diag1"):
+    """Create empty plotfile directories for the reader to enumerate."""
+    diags = tmp_path / "diags"
+    for index in range(n_frames):
+        (diags / f"{prefix}{index:06d}").mkdir(parents=True)
+    return diags
+
+
+class TestWarpxReader:
+    def test_shapes_and_axes(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=256,
+            n_position_bins=64,
+            progress=False,
+        )
+        assert phase_space.shape == (3, 256, 64)
+        assert phase_space.label == "p+"
+        assert not phase_space.is_electron
+        assert phase_space.x[0] > 0
+        assert phase_space.x[-1] < WARPX_DOMAIN
+        np.testing.assert_allclose(phase_space.t, [0.0, 1e-9, 2e-9])
+
+    def test_weights_give_a_number_density(self, tmp_path, monkeypatch):
+        """
+        The zeroth moment must come out as a physical number density in m^-3,
+        which is what lets the driver be handed reference_density = 1 m^-3.
+        """
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=512,
+            n_position_bins=32,
+            progress=False,
+        )
+        density = pic_thomson.number_density(phase_space.f, phase_space.v)
+        # Tolerance set by macroparticle shot noise, not by the scaling.
+        np.testing.assert_allclose(density[0], WARPX_DENSITY, rtol=0.05)
+
+    def test_recovers_the_input_distribution(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        drift = 3e5
+        fake_warpx_frames(monkeypatch, mass, drift=drift)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=512,
+            n_position_bins=8,
+            progress=False,
+        )
+        f = phase_space.f[0, :, 3]
+        v = phase_space.v
+        total = np.trapezoid(f, v)
+        mean = np.trapezoid(f * v, v) / total
+        width = np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / total)
+        np.testing.assert_allclose(mean, drift, rtol=0.05)
+        np.testing.assert_allclose(width, WARPX_SIGMA, rtol=0.05)
+
+    def test_momentum_conversion_is_relativistic(self, tmp_path, monkeypatch):
+        """
+        Velocity must come from p/(m c) through v = u c / sqrt(1 + u^2), not
+        from p/m, which would exceed c for energetic particles.
+        """
+        mass = const.m_e.si.value
+        speed_of_light = const.c.si.value
+
+        def frame(_yt, _plotfile, _species, _fields):
+            # A single particle at u = 3, i.e. v = 0.949 c.
+            momentum = np.array([3.0 * mass * speed_of_light])
+            return (
+                np.array([5.0]),
+                momentum,
+                np.array([1.0]),
+                0.0,
+                (np.zeros(3), np.array([WARPX_DOMAIN, 1.0, 1.0])),
+            )
+
+        monkeypatch.setattr(pic_thomson, "_load_yt", _no_yt_needed)
+        monkeypatch.setattr(pic_thomson, "_warpx_frame", frame)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "electrons",
+            mass=mass,
+            is_electron=True,
+            n_velocity_bins=64,
+            progress=False,
+        )
+        expected = 3.0 * speed_of_light / np.sqrt(10.0)
+        assert expected < speed_of_light
+        # The auto-derived axis is clamped to below c as well.
+        assert phase_space.v.max() < speed_of_light
+        # The single particle lands in the bin holding its velocity.
+        occupied = phase_space.v[phase_space.f[0, :, :].sum(axis=1) > 0]
+        assert abs(occupied[0] - expected) < np.diff(phase_space.v)[0]
+
+    def test_explicit_ranges_are_respected(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            velocity_range=(-5e6, 5e6),
+            position_range=(2.0, 8.0),
+            n_velocity_bins=100,
+            n_position_bins=60,
+            progress=False,
+        )
+        assert phase_space.v[0] > -5e6
+        assert phase_space.v[-1] < 5e6
+        assert 2.0 < phase_space.x[0] < 2.2
+        assert 7.8 < phase_space.x[-1] < 8.0
+
+    def test_cache_round_trip(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=2)
+        cache = tmp_path / "cache" / "amb_ions.npz"
+
+        settings = {
+            "mass": mass,
+            "label": "p+",
+            "n_velocity_bins": 128,
+            "n_position_bins": 16,
+            "velocity_range": (-4e6, 4e6),
+            "progress": False,
+        }
+        first = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", cache=cache, **settings
+        )
+        assert cache.is_file()
+
+        # With the yt layer removed entirely, only the cache can answer.
+        monkeypatch.setattr(pic_thomson, "_load_yt", _yt_must_not_be_used)
+        second = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", cache=cache, **settings
+        )
+        np.testing.assert_array_equal(first.f, second.f)
+        np.testing.assert_array_equal(first.v, second.v)
+        np.testing.assert_array_equal(first.t, second.t)
+        assert second.meta["cache"] == str(cache)
+
+    def test_cache_is_rebuilt_when_settings_change(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        cache = tmp_path / "amb_ions.npz"
+
+        coarse = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=64,
+            cache=cache,
+            progress=False,
+        )
+        fine = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=128,
+            cache=cache,
+            progress=False,
+        )
+        assert coarse.shape[1] == 64
+        assert fine.shape[1] == 128
+
+    def test_selects_requested_frames(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=5)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            timesteps=[0, 2, 4],
+            n_velocity_bins=32,
+            progress=False,
+        )
+        assert phase_space.shape[0] == 3
+        np.testing.assert_allclose(phase_space.t, [0.0, 2e-9, 4e-9])
+
+    def test_rejects_missing_plotfiles(self, tmp_path, monkeypatch):
+        fake_warpx_frames(monkeypatch, const.m_e.si.value)
+        (tmp_path / "diags").mkdir()
+        with pytest.raises(FileNotFoundError, match="no diag1"):
+            pic_thomson.read_warpx_phase_space(
+                tmp_path / "diags",
+                "amb_ions",
+                mass=1e-27,
+                label="p+",
+                progress=False,
+            )
+
+    def test_rejects_a_frame_beyond_the_series(self, tmp_path, monkeypatch):
+        fake_warpx_frames(monkeypatch, const.m_e.si.value)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=2)
+        with pytest.raises(IndexError, match="beyond the 2 present"):
+            pic_thomson.read_warpx_phase_space(
+                diags,
+                "amb_ions",
+                mass=1e-27,
+                label="p+",
+                timesteps=[0, 7],
+                progress=False,
+            )
+
+    def test_requires_a_label_for_ions(self, tmp_path, monkeypatch):
+        fake_warpx_frames(monkeypatch, const.m_e.si.value)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        with pytest.raises(ValueError, match="species label is required"):
+            pic_thomson.read_warpx_phase_space(
+                diags, "amb_ions", mass=1e-27, progress=False
+            )
+
+    def test_rejects_non_positive_mass(self, tmp_path, monkeypatch):
+        fake_warpx_frames(monkeypatch, const.m_e.si.value)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        with pytest.raises(ValueError, match="mass must be positive"):
+            pic_thomson.read_warpx_phase_space(
+                diags, "amb_ions", mass=0.0, label="p+", progress=False
+            )
+
+    def test_accepts_mass_as_a_quantity(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e
+        fake_warpx_frames(monkeypatch, mass.si.value)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=64,
+            progress=False,
+        )
+        assert phase_space.meta["mass"] == pytest.approx(mass.si.value)
+
+    def test_output_feeds_the_driver(self, tmp_path, monkeypatch):
+        """
+        The whole point of the reader contract: WarpX output must reach the
+        same driver as OSIRIS output, with no code-specific handling.
+        """
+        pytest.importorskip("numba")
+        electron_mass = const.m_e.si.value
+        fake_warpx_frames(monkeypatch, electron_mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=2)
+
+        electrons = pic_thomson.read_warpx_phase_space(
+            diags,
+            "electrons",
+            mass=electron_mass,
+            is_electron=True,
+            n_velocity_bins=512,
+            n_position_bins=8,
+            progress=False,
+        )
+        fake_warpx_frames(monkeypatch, 100 * electron_mass)
+        ions = pic_thomson.read_warpx_phase_space(
+            diags,
+            "ions",
+            mass=100 * electron_mass,
+            label="p+",
+            n_velocity_bins=512,
+            n_position_bins=8,
+            progress=False,
+        )
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            spectrogram = pic_thomson.spectra_from_phase_spaces(
+                electrons,
+                [ions],
+                position=electrons.x[4],
+                reference_density=1 * u.m**-3,
+                probe_wavelength=PROBE_WAVELENGTH,
+                epw_wavelengths=EPW_WINDOW,
+                electron_conditioning={"max_taper_bins": 20},
+                ion_conditioning={"max_taper_bins": 20},
+                progress=False,
+            )
+        assert spectrogram.epw.shape == (2, EPW_WINDOW.size)
+        assert np.all(np.isfinite(spectrogram.epw))
+        # reference_density = 1 m^-3 means the reader's own scaling carries the
+        # density, so it must come back out at the value the weights encode.
+        np.testing.assert_allclose(
+            spectrogram.electron_density, WARPX_DENSITY, rtol=0.05
+        )

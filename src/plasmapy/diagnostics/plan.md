@@ -636,7 +636,66 @@ So the ions are almost certainly a **fully-stripped low-Z species, not protons**
 `tools/pic_thomson_osiris_comparison.py --ion-rqm` prints this check and flags a
 mismatch, so it cannot be forgotten. **The actual `cham` and `targ` species are
 needed before the IAW output means anything.**
-5. WarpX reader + caching.
+5. ✅ **Done.** WarpX reader + caching. 145 tests in the file, all passing; full
+   `tests/diagnostics/` suite green (246 passed); `ruff` and `ty` clean.
+
+   `read_warpx_phase_space` bins raw macroparticles into a `PICPhaseSpace`.
+   Confirmed against `KinShock2020/runs/R1_paper` (1-D, 51 particle plotfiles,
+   ~3M macroparticles per species per frame, ~0.6 s to read one):
+
+   - **Weights carry the density.** `f` is divided by the bin volume, so
+     `∫f dv` is a number density in m⁻³ and the driver takes
+     `reference_density = 1 * u.m**-3`. Validated twice: `sum(w)/volume` from the
+     raw yt arrays gives 7.979e15 m⁻³ against the deck's `namb = 0.008 n0 = 8e15`,
+     and the binned reader reproduces **7.9995e15 m⁻³** — 0.006%.
+   - **`mass` and `label` are different things** and both are required. `mass` is
+     the *simulation's* mass (here `Mi = 100 mₑ`), which converts stored momentum
+     into the velocities the run actually evolved; `label` names the physical
+     species, from which the forward model takes charge and mass. Conflating them
+     in a reduced-mass-ratio run is a factor-of-18 error.
+   - **1-D field naming.** WarpX stores the single spatial coordinate as
+     `particle_position_x` even when the deck calls that direction `z`, while
+     momenta keep their physical names — so the defaults are
+     `particle_position_x` and `particle_momentum_z`, both overridable.
+   - **Caching** to `.npz`, keyed on a signature of every setting that affects the
+     result, so a changed bin count rebuilds rather than silently returning a
+     stale grid.
+   - The auto-derived velocity range is clamped below `c`. Without it, the 1.2×
+     headroom around a 0.95`c` particle put the grid edge past `c`, where no
+     particle can live and the taper would have had more empty axis to invent a
+     tail across.
+
+   `yt` is an optional dependency, imported on demand with an actionable error,
+   and added to `pyproject.toml` as the `pic` extra. The OSIRIS path still needs
+   only `h5py`.
+
+   **Cross-code check, unplanned but valuable:** the driver consumed the WarpX
+   phase spaces with no code-specific handling, and `efract` handed over from
+   ambient electrons (100%) to piston electrons (99.7%) as the piston reached the
+   sampling point — the multi-electron-population path that only the WarpX case
+   exercises.
+
+### 5a. R1_paper is not a collective-Thomson plasma at 532 nm
+
+Worth knowing before step 6 sets expectations. At the sampled point:
+
+| | R1_paper (WarpX) | omegashock_w3.5e11_exp (OSIRIS) |
+|---|---|---|
+| `n_e` | 8e15 – 2e17 m⁻³ | 9e23 – 4e25 m⁻³ |
+| α at 532 nm, 90° | **~1e-5** | 1.9 – 15.4 |
+
+Seven orders of magnitude in density puts R1_paper in the **deeply non-collective**
+regime, where there are no EPW or IAW features at all: `S(k, ω) ∝ f_e(ω/k)`, so the
+spectrum is just the electron distribution read through the Doppler map, and the
+Doppler width spans essentially the whole visible. That is a property of the
+simulation — it is scaled to ion-scale physics with reduced electron parameters,
+not to a Thomson diagnostic — not a defect in the pipeline.
+
+It does make a *different* and rather clean validation available for step 6:
+in the non-collective limit the computed spectrum must reproduce the conditioned
+electron VDF under `v = (λ - λ₀)c / (2 λ₀ sin(θ/2))`. A meaningful *collective*
+WarpX comparison would need either a denser run or a much longer probe wavelength
+(α scales with λ_probe).
 6. End-to-end WarpX run; cross-code comparison.
 7. HDF5 writer, plotting, instrument response.
 8. Changelog entry, docs stub, `uvx pre-commit`, `nox --session ty`.

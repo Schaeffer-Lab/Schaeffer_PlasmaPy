@@ -22,4 +22,7 @@ units to SI and handling its charge-density sign convention and the Jacobian of
 the proper-velocity-to-velocity map. Validated end to end against a 513-timestep
 OSIRIS shock simulation, where the synthetic electron-plasma-wave satellite sits
 within 2.3% of the Bohm-Gross prediction implied by the scattering parameter the
-model reports. A WarpX reader follows.
+model reports. `~plasmapy.diagnostics.pic_thomson.read_warpx_phase_space` bins
+WarpX macroparticles into the same container, weighting the histogram so that its
+zeroth moment is a number density, and caching the result. It requires ``yt``,
+available as the new ``pic`` extra; the OSIRIS path needs only `h5py`.
