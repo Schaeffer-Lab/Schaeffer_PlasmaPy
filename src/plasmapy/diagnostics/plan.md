@@ -696,6 +696,111 @@ in the non-collective limit the computed spectrum must reproduce the conditioned
 electron VDF under `v = (λ - λ₀)c / (2 λ₀ sin(θ/2))`. A meaningful *collective*
 WarpX comparison would need either a denser run or a much longer probe wavelength
 (α scales with λ_probe).
-6. End-to-end WarpX run; cross-code comparison.
+6. ✅ **Done.** End-to-end WarpX run on `R1_paper`, all 51 particle plotfiles,
+   at x = 30 m. Driven by `tools/pic_thomson_warpx.py`, which writes
+   `media/08_warpx_phase_space.png` and `media/09_warpx_spectra.png`.
+
+   **The non-collective limit gives an exact validation.** With α ~ 1e-5 the
+   electron susceptibility vanishes, the shielding factor `|1 - χ_e/ε|²` goes to
+   one, and the ion feature disappears entirely, leaving
+
+   > `S(k, ω) ∝ (2π/k) · f_e(ω/k)`
+
+   Comparing the pipeline's spectrum against the conditioned electron VDF pushed
+   through that map, over all 51 timesteps:
+
+   | | |
+   |---|---|
+   | normalised L1 difference, median | **0.0000** |
+   | 90th percentile | **0.0009** |
+
+   Essentially exact. This is a stronger statement than the OSIRIS Bohm-Gross
+   check: there the agreement was 2.3% against an approximate dispersion
+   relation, here the non-collective limit is exact and the pipeline reproduces
+   it to the noise floor.
+
+   Getting it required using the *exact* `k(λ)` the forward model uses,
+   `k = |k_s - k_0|` with both wavenumbers carrying the
+   `√(ω² - ω_pe²)` correction. A constant-`k` Doppler map gives L1 = 0.226 —
+   over a 40–1024 nm window `k` varies by more than an order of magnitude, so the
+   textbook `Δλ = λ₀ · 2(v/c) sin(θ/2)` is not usable here. That was the check
+   being wrong, not the pipeline.
+
+   **The reader is confirmed by the physics too.** The phase-space figure shows
+   `amb_ions` with the bifurcated incoming/reflected structure at x ≈ 40–48 m
+   that is the supercritical shock signature the paper is about, `piston_ions`
+   in free expansion, and `amb_electrons` swept into a thin compressed sheet
+   ahead of the piston. Population fractions hand over cleanly from ambient to
+   piston at t ≈ 830 ns, ions marginally before electrons.
+
+### 6a. Cross-code comparison: what is and is not possible
+
+| | R1_paper (WarpX) | omegashock_w3.5e11_exp (OSIRIS) |
+|---|---|---|
+| `n_e` at the sampled point | 7.9e15 – 2.0e17 m⁻³ | 9.3e23 – 3.5e25 m⁻³ |
+| α at 532 nm, 90° | 7.7e-6 – 3.2e-5 | 1.9 – 15.4 |
+| regime | non-collective | collective |
+| validation used | exact non-collective limit (L1 = 0.000) | Bohm-Gross shift (2.3%) |
+
+A *quantitative* cross-code comparison of spectra is not meaningful between these
+two runs: they are eight orders of magnitude apart in density and sit on opposite
+sides of α = 1. What the exercise does establish is the structural claim the whole
+design rests on — **the same `spectra_from_phase_spaces` consumed both codes with
+no code-specific handling**, and was independently validated in each regime.
+
+For a collective WarpX comparison you would need either a much denser run, or a
+much longer probe wavelength: α scales with λ_probe, so a 10.6 µm CO₂ probe buys a
+factor of 20, reaching only ~6e-4 — still non-collective. Density is the binding
+constraint.
+
+### 6b. A collective view of the same run
+
+To see what Thomson structure this plasma *would* show, the run was repeated with
+a **30 mm (10 GHz) microwave probe** — `media/09_warpx_spectra_collective.png`.
+That is the band this density calls for: λ_De is 2.3–9.8 mm, so α ~ 1 needs a
+probe of a few cm, and f_pe peaks at 4.0 GHz so 10 GHz still propagates
+comfortably. α comes out **0.51 – 2.27**, and the spectrogram shows a proper
+collective feature that Doppler-shifts blue to ~25 mm once the flowing piston
+plasma reaches the sampling point.
+
+Two things this exercise established:
+
+- **The non-collective check correctly stops holding.** Its L1 rises from 0.0000
+  at 532 nm to 0.148 at 30 mm, which is the intended behaviour: shielding is now
+  present and the spectrum is no longer just the Doppler-mapped VDF. The
+  agreement at 532 nm is therefore a real test, not a tautology.
+- **The collective regime needs far more smoothing than the non-collective one.**
+  At the light setting used for 532 nm (`smoothing_window = 9`) the collective
+  spectrogram is speckled with sharp spurious pixels. Widening to 41 removes them
+  entirely:
+
+  | `smoothing_window` | non-collective-check L1 | spectrogram |
+  |---|---|---|
+  | 9 | 0.360 | heavily speckled |
+  | 41 | 0.148 | clean |
+  | 81 | 0.072 | clean, over-smoothed |
+
+  The cause is physical, not a defect: for α > 1 the spectrum carries
+  `|1 - χ_e/ε|²`, which diverges as `ε → 0` at the electron-plasma-wave
+  resonance. Shot noise in the VDF enters χ through `df/du`, so the resonance
+  amplifies it into speckle. At α ≪ 1 the same noise passes through untouched.
+  **Anyone running this pipeline in the collective regime should smooth harder
+  than the non-collective case suggests.**
+
+There is also a hard ceiling on α for this run, worth knowing before chasing a
+better probe. Combining `α = ω_pe/(k σ_e)` with the propagation requirement
+`ω_probe > ω_pe` gives `α_max = c / (2 sin(θ/2) σ_e)`. The piston electrons reach
+σ_e ≈ 0.54 c in simulation units, capping α at ≈ 1.3 there no matter what probe
+is used; only the cold ambient (σ_e ≈ 0.045 c) admits strongly collective
+scattering. Relativistic electrons and collective Thomson scattering are close to
+mutually exclusive.
+
+Note also that the WarpX spectra are shown in the simulation's **own velocity
+units**; `--velocity-scale-factor` is left off by default because the right
+convention for this run is unsettled, and it matters a great deal — the electron
+distribution reaches 0.54 c in sim units, giving a 1σ Doppler width of 403 nm.
+See §5.1: the deck's `mass_ratio = 100` against a real 1836 suggests R = 18.36,
+while the paper's Table I reports `c_sim/c_phys = 0.02`, a factor of 50. These
+disagree and should be reconciled before the WarpX spectra are read as physical.
 7. HDF5 writer, plotting, instrument response.
 8. Changelog entry, docs stub, `uvx pre-commit`, `nox --session ty`.

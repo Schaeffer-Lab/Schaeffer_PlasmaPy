@@ -374,6 +374,7 @@ lint.per-file-ignores."setup.py" = [ "D100" ]
 # Standalone visual/validation scripts; reporting on stdout is the point.
 lint.per-file-ignores."tools/pic_thomson_figures.py" = [ "T201" ]
 lint.per-file-ignores."tools/pic_thomson_osiris_comparison.py" = [ "T201" ]
+lint.per-file-ignores."tools/pic_thomson_warpx.py" = [ "T201" ]
 lint.per-file-ignores."src/plasmapy/analysis/fit_functions.py" = [ "D301" ]
 lint.per-file-ignores."src/plasmapy/analysis/swept_langmuir/__init__.py" = [ "E402" ]
 lint.per-file-ignores."src/plasmapy/formulary/braginskii.py" = [ "C901", "RET503", "RET504" ]
