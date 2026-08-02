@@ -316,6 +316,39 @@ Two contradictory policies for the same PIC shot noise, applied in sequence
 (`synspectra.py:157` vs `:126`). `abs()` reflects noise into fake signal. Pick one:
 clip, and warn (the `normalize_vdf` behaviour, which already has the right comment).
 
+### 5.5a The taper fabricates a pedestal — **found during implementation**
+
+`taper_vdfs` rolls the distribution off from the signal edge all the way to the
+*grid boundary*. When the distribution occupies only a small part of the velocity
+grid, that rolloff runs across a long stretch of empty axis, and the fabricated
+pedestal lands at large :math:`|v|` — exactly where the :math:`v^2` weighting of the
+second moment is largest. Measured on a Maxwellian at the default
+`threshold_frac=0.005`, the recovered width comes out:
+
+| grid half-width | width error |
+|---|---|
+| 4σ | +0.4 % |
+| 6σ | +5.4 % |
+| 8σ | +13.7 % |
+| 12σ | +40.4 % |
+
+The forward model reads the thermal speed straight off the VDF
+(`thomson.py:392-397`), so this propagates directly into `α`, the Bohm-Gross shift,
+and any temperature inferred from the result. **This matters for OmegaShock**: the
+electron phase space spans `u ∈ [−1, 1]`, i.e. ±c, while a 100 eV electron
+distribution has σ ≈ 0.014 c — roughly a 70σ half-width. Whether the pipeline is
+actually in this regime depends on where the raw PIC noise floor crosses
+`0.005 × peak`; if the shot noise reaches the grid edges the taper does little, and
+if it does not the second moment is badly inflated. **Check this explicitly on real
+OSIRIS data before trusting the OmegaShock spectra** — it is a candidate explanation
+for any anomalously broad EPW feature in the existing outputs.
+
+Implemented: the default is left numerically identical to the original (so the
+OSIRIS comparison stays apples-to-apples), but `taper_vdf_edges` grows a
+`max_taper_bins` argument that bounds the rolloff, and a `pedestal_warning`
+(default 5%) that raises a `RuntimeWarning` when the taper has materially widened
+any slice.
+
 ### 5.6 Dead/vestigial code to not carry over
 
 `moving_average_numpy` (unused), the `fill_value=1e-20` in `rescale_and_pad_vdf`
@@ -408,9 +441,28 @@ invariant core and produce physically sane spectra.
 
 ## 8. Implementation order
 
-1. `PICPhaseSpace`, `ThomsonSpectrogram`, `from_arrays` + conditioning functions
-   (with §5.2, §5.4, §5.5 fixed) — plus unit tests 1–4.
-2. `spectra_from_phase_spaces` driver, `efract` support, presence masking.
+1. ✅ **Done.** `PICPhaseSpace`, `from_arrays` + conditioning functions (with §5.2,
+   §5.4, §5.5, §5.5a addressed) — plus unit tests 1–4. 70 tests, all passing;
+   `ruff check`, `ruff format` and `ty` clean.
+
+   The Maxwellian cross-check (test 4) agrees with `thomson.spectral_density` to a
+   normalised L1 difference of **0.036**, with both EPW peaks matching to within one
+   wavelength bin (0.31 nm). `ThomsonSpectrogram` was deferred to step 2, since its
+   fields follow from the driver's design.
+
+   Two things the tests pinned down, beyond §5.5a:
+
+   - The `eps` guard in `normalize_vdf` (`1e-30 + 1e-12 × max|integral|`) biased
+     low-amplitude slices by up to 1e-6 relative when amplitudes span decades.
+     Replaced with an exact `np.divide(..., where=integral > 0)`.
+   - `arbitrary_forwardmodel` reports `α = √2 · ω_pe / (k σ)` with σ the VDF standard
+     deviation, whereas `spectral_density` reports `1/(k λ_De)`. The two differ by
+     exactly √2 (measured ratio 1.4143). A test documents this so it is not later
+     mistaken for a physics bug. `S(k,ω)` itself is unaffected — `arbitrary_chi`
+     uses the normalisation consistently.
+
+2. `spectra_from_phase_spaces` driver, `ThomsonSpectrogram`, `efract` support,
+   presence masking.
 3. OSIRIS reader (h5py, no pyVisOS) + unit test 5.
 4. End-to-end OSIRIS run vs. the existing `spectra.hdf5`.
 5. WarpX reader + caching.

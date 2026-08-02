@@ -1,0 +1,12 @@
+Added `plasmapy.diagnostics.pic_thomson`, which builds synthetic Thomson
+scattering spectra from particle-in-cell simulation output. This first
+instalment provides the code-agnostic core: the `~plasmapy.diagnostics.
+pic_thomson.PICPhaseSpace` container that PIC readers produce, and the
+conditioning steps that turn raw, noisy phase space into the unit-normalised
+distributions that
+`~plasmapy.diagnostics.thomson.arbitrary_forwardmodel` expects --
+`~plasmapy.diagnostics.pic_thomson.smooth_vdf`,
+`~plasmapy.diagnostics.pic_thomson.taper_vdf_edges`,
+`~plasmapy.diagnostics.pic_thomson.normalize_vdf`, and
+`~plasmapy.diagnostics.pic_thomson.rescale_velocity_axis`. OSIRIS and WarpX
+readers and the spectrogram driver follow.
