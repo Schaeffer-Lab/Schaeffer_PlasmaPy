@@ -13,6 +13,7 @@
    Charged particle radiography <charged_particle_radiography/index>
    Swept Langmuir (will be deprecated) <langmuir>
    thomson
+   Thomson scattering from PIC output <pic_thomson>
 
 API
 ---

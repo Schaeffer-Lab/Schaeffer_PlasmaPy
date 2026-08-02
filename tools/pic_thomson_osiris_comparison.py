@@ -45,6 +45,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from plasmapy.diagnostics import pic_thomson as pt
+from plasmapy.particles import Particle
 
 MEDIA = Path(__file__).resolve().parent.parent / "media"
 
@@ -160,7 +161,7 @@ def describe_species(args) -> None:
     print("\nion species check (deck rqm x rqm_factor / 1836 = true A/Z):")
     for name, label, rqm in zip(args.ions, args.ion_labels, args.ion_rqm, strict=True):
         implied = rqm * args.velocity_scale_factor / PROTON_RQM
-        particle = pt.Particle(label)
+        particle = Particle(label)
         assumed = float(
             (particle.mass / const.m_p).decompose().value / particle.charge_number
         )

@@ -8,7 +8,7 @@ PIC output (OSIRIS, WarpX, and ideally anything else) and produces synthetic EPW
 Thomson spectra via `thomson.arbitrary_forwardmodel`. Only what is needed for the
 spectra — no temperature/B-field/`ufl`/`uth` diagnostics.
 
----
+______________________________________________________________________
 
 ## 1. What the existing pipeline actually does
 
@@ -18,24 +18,24 @@ loading, and moments helpers).
 
 Traced end to end, `data_to_spectra` does the following:
 
-| # | Step | Functions | Code-specific? |
-|---|---|---|---|
-| 1 | Build OSIRIS filenames `MS/PHA/<field>/<species>/<field>-<species>-NNNNNN.h5` and read every timestep with `osh5io.read_h5` | `file_name_phase`, `input_PHA_t` | **Yes** |
-| 2 | Read `MS/FLD/<b_field>/…` B-field series | `file_name_mag`, `input_mag_t` | **Yes** — *drop* |
-| 3 | If the phase space is 3-D (`p1x1x2`/`p2x1x2`), sum over the transverse spatial axis to get `(t, p, x)` | inline | Partly (reduce-to-1D concept is general) |
-| 4 | Momentum axis → velocity axis: `v = u·c/√(1+u²)` where `u = p/(m c)` is OSIRIS proper velocity | inline | Boundary — general once `u` is defined |
-| 5 | Pick the spatial slice `y_slice = argmin|x − y_value|` | inline | Invariant |
-| 6 | Zeroth moment along `p` → density vs `(t, x)`; scale by reference density `n` [cm⁻³]; first/second moments → drift + `T` | `moments.moment`, `second_moment_to_eV` | Invariant (only the 0th moment is needed) |
-| 7 | Ion fractions `ifract_s = n_s / Σ n_s` at the slice; presence masks (species below 1 % of reference is "absent") | `species_presence_mask` | Invariant |
-| 8 | Smooth VDFs: repeated boxcar (`uniform_filter1d`) along the velocity axis | `smooth_vdf` | Invariant |
-| 9 | Normalise so `∫f dv = 1` per (t, x); clip negatives; guard div-by-zero | `normalize_vdf` | Invariant |
-| 10 | Half-cosine taper of the VDF tails to kill the sharp PIC noise floor at the grid edge | `taper_vdfs` / `taper_vdf_edges` | Invariant |
-| 11 | Floor at 1e-30 | inline | Invariant |
-| 12 | "Fudge factor": divide the velocity axes by `√rqm` and re-interpolate onto a padded grid, to undo the reduced ion/electron mass ratio | `rescale_and_pad_vdf` | Invariant (but see §5.1) |
-| 13 | Per timestep, call `thomson.arbitrary_forwardmodel` twice — once over the EPW window (with a notch) and once over the IAW window | `vdfs_to_spectra` | Invariant |
-| 14 | Instrument smoothing of the spectrogram (Gaussian 1-D/2-D or boxcar) to e.g. 100 ps / 0.5 nm | `smooth_spectra.*` | Invariant |
-| 15 | Write everything to a structured HDF5 file | `create_hdf5_file` | Invariant |
-| 16 | Plot the two spectrograms | `plot_spectra` | Invariant |
+| #   | Step                                                                                                                                  | Functions                               | Code-specific?                            |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- | ----------------------------------------- |
+| 1   | Build OSIRIS filenames `MS/PHA/<field>/<species>/<field>-<species>-NNNNNN.h5` and read every timestep with `osh5io.read_h5`           | `file_name_phase`, `input_PHA_t`        | **Yes**                                   |
+| 2   | Read `MS/FLD/<b_field>/…` B-field series                                                                                              | `file_name_mag`, `input_mag_t`          | **Yes** — *drop*                          |
+| 3   | If the phase space is 3-D (`p1x1x2`/`p2x1x2`), sum over the transverse spatial axis to get `(t, p, x)`                                | inline                                  | Partly (reduce-to-1D concept is general)  |
+| 4   | Momentum axis → velocity axis: `v = u·c/√(1+u²)` where `u = p/(m c)` is OSIRIS proper velocity                                        | inline                                  | Boundary — general once `u` is defined    |
+| 5   | Pick the spatial slice \`y_slice = argmin                                                                                             | x − y_value                             | \`                                        |
+| 6   | Zeroth moment along `p` → density vs `(t, x)`; scale by reference density `n` [cm⁻³]; first/second moments → drift + `T`              | `moments.moment`, `second_moment_to_eV` | Invariant (only the 0th moment is needed) |
+| 7   | Ion fractions `ifract_s = n_s / Σ n_s` at the slice; presence masks (species below 1 % of reference is "absent")                      | `species_presence_mask`                 | Invariant                                 |
+| 8   | Smooth VDFs: repeated boxcar (`uniform_filter1d`) along the velocity axis                                                             | `smooth_vdf`                            | Invariant                                 |
+| 9   | Normalise so `∫f dv = 1` per (t, x); clip negatives; guard div-by-zero                                                                | `normalize_vdf`                         | Invariant                                 |
+| 10  | Half-cosine taper of the VDF tails to kill the sharp PIC noise floor at the grid edge                                                 | `taper_vdfs` / `taper_vdf_edges`        | Invariant                                 |
+| 11  | Floor at 1e-30                                                                                                                        | inline                                  | Invariant                                 |
+| 12  | "Fudge factor": divide the velocity axes by `√rqm` and re-interpolate onto a padded grid, to undo the reduced ion/electron mass ratio | `rescale_and_pad_vdf`                   | Invariant (but see §5.1)                  |
+| 13  | Per timestep, call `thomson.arbitrary_forwardmodel` twice — once over the EPW window (with a notch) and once over the IAW window      | `vdfs_to_spectra`                       | Invariant                                 |
+| 14  | Instrument smoothing of the spectrogram (Gaussian 1-D/2-D or boxcar) to e.g. 100 ps / 0.5 nm                                          | `smooth_spectra.*`                      | Invariant                                 |
+| 15  | Write everything to a structured HDF5 file                                                                                            | `create_hdf5_file`                      | Invariant                                 |
+| 16  | Plot the two spectrograms                                                                                                             | `plot_spectra`                          | Invariant                                 |
 
 **The code-specific part is steps 1–4 only.** Everything from step 5 on operates on a
 plain `(n_time, n_v, n_x)` array plus a velocity axis in m/s — exactly the invariance
@@ -54,7 +54,7 @@ VDFs itself, so we never need them at pipeline level.
 The `moments.py` helper collapses to a single `∫f dp` (Simpson) call; not worth a
 separate abstraction.
 
----
+______________________________________________________________________
 
 ## 2. The invariance boundary
 
@@ -64,13 +64,14 @@ One dataclass is the contract between readers and physics:
 @dataclass(frozen=True)
 class PICPhaseSpace:
     """Reduced 1V phase space f(t, v, x) for a single species, in SI."""
-    f: np.ndarray          # (n_time, n_v, n_x), arbitrary normalisation
-    v: np.ndarray          # (n_v,) lab-frame velocity along the diagnostic axis [m/s]
-    x: np.ndarray          # (n_x,) position along the same axis [m]
-    t: np.ndarray          # (n_time,) [s]
-    label: str             # PlasmaPy `ParticleLike`, e.g. "e-", "Al 13+", "p+"
+
+    f: np.ndarray  # (n_time, n_v, n_x), arbitrary normalisation
+    v: np.ndarray  # (n_v,) lab-frame velocity along the diagnostic axis [m/s]
+    x: np.ndarray  # (n_x,) position along the same axis [m]
+    t: np.ndarray  # (n_time,) [s]
+    label: str  # PlasmaPy `ParticleLike`, e.g. "e-", "Al 13+", "p+"
     is_electron: bool
-    meta: dict             # code name, source paths, normalisations used
+    meta: dict  # code name, source paths, normalisations used
 ```
 
 Rules the readers must satisfy:
@@ -88,7 +89,7 @@ Rules the readers must satisfy:
 Everything downstream consumes only `PICPhaseSpace`. Adding a third PIC code =
 writing one reader function.
 
----
+______________________________________________________________________
 
 ## 3. Readers
 
@@ -115,7 +116,7 @@ species mass enters here.
 
 Reader signature:
 
-```python
+```text
 def read_osiris_phase_space(ms_path, field, species, timesteps, *,
                             is_electron=None, label=None,
                             transverse_axis="sum") -> PICPhaseSpace
@@ -137,23 +138,23 @@ contains `Header`, `WarpXHeader`, `Level_0/`, and one directory per species) —
 macroparticles, not a binned phase space**. So the WarpX reader must do the binning
 that OSIRIS does in-code:
 
-```python
+```text
 def read_warpx_phase_space(diag_glob, species, *, mass, n_v=512, n_x=512,
                            v_range=None, x_range=None, axis="z",
                            backend="auto") -> PICPhaseSpace
 ```
 
 1. Enumerate plotfiles (`sorted(glob("diag1*"))`), one per timestep.
-2. Per frame, read `particle_position_*`, `particle_momentum_<axis>`,
+1. Per frame, read `particle_position_*`, `particle_momentum_<axis>`,
    `particle_weight`. Backends: `openpmd-api` if the run wrote openPMD, else `yt`
    (what `KinShock2020/src/kinshock/io.py:71-192` uses today). Both are **optional
    imports** with a clear error message — neither belongs in PlasmaPy's core deps.
-3. `u = p_axis / (m c)`; `v = u c/√(1+u²)`.
-4. `f[t] = np.histogram2d(v, x, bins=[v_edges, x_edges], weights=w)` — weights are
+1. `u = p_axis / (m c)`; `v = u c/√(1+u²)`.
+1. `f[t] = np.histogram2d(v, x, bins=[v_edges, x_edges], weights=w)` — weights are
    essential; a raw count histogram is not a distribution function.
-5. Bin edges fixed across all timesteps (computed from a percentile of the first and
+1. Bin edges fixed across all timesteps (computed from a percentile of the first and
    last frames, or user-supplied) so `f` is a well-defined array.
-6. WarpX is already SI, so no unit conversion — `v` in m/s, `x` in m, `t` in s
+1. WarpX is already SI, so no unit conversion — `v` in m/s, `x` in m, `t` in s
    straight from the dataset.
 
 Note WarpX 1-D runs put the propagation direction in `particle_position_x` even when
@@ -169,7 +170,7 @@ support a `cache=` path that memoises the binned `(t, v, x)` array to `.npz`.
 third code (PSC, Smilei, EPOCH, hybrid) or a hand-built distribution only has to
 produce the array. This is also what the unit tests use.
 
----
+______________________________________________________________________
 
 ## 4. Module layout
 
@@ -208,7 +209,7 @@ pic_thomson.py
 
 ### Public API sketch
 
-```python
+```text
 # 1. read (code-specific)
 e   = read_osiris_phase_space("…/MS", "p1x1", "e",    timesteps, is_electron=True)
 al  = read_osiris_phase_space("…/MS", "p1x1", "cham", timesteps, label="Al 13+")
@@ -239,7 +240,7 @@ reaches it.
 A thin `main()` + `argparse` CLI (`python -m plasmapy.diagnostics.pic_thomson …`)
 driven by a YAML/JSON config is a nice-to-have, deferred until the API settles.
 
----
+______________________________________________________________________
 
 ## 5. Physics issues found in the existing pipeline
 
@@ -280,7 +281,7 @@ target grid, zero-pad outside" primitive; the policy lives in
 
 `synspectra.py:676`:
 
-```python
+```text
 ions_pyt = [normalize_vdf(ion_pyt, v_e, …) for ion_pyt in ions_pyt]
 #                                    ^^^ should be v_ion
 ```
@@ -326,11 +327,11 @@ second moment is largest. Measured on a Maxwellian at the default
 `threshold_frac=0.005`, the recovered width comes out:
 
 | grid half-width | width error |
-|---|---|
-| 4σ | +0.4 % |
-| 6σ | +5.4 % |
-| 8σ | +13.7 % |
-| 12σ | +40.4 % |
+| --------------- | ----------- |
+| 4σ              | +0.4 %      |
+| 6σ              | +5.4 %      |
+| 8σ              | +13.7 %     |
+| 12σ             | +40.4 %     |
 
 The forward model reads the thermal speed straight off the VDF
 (`thomson.py:392-397`), so this propagates directly into `α`, the Bohm-Gross shift,
@@ -363,26 +364,26 @@ described in its own comment as "zero", `import scipy.integrate as integrate` in
 wavelengths this is the dominant cost. Keep the `tqdm` progress bar, and add an
 optional `n_jobs`/chunking hook later — do not optimise before the physics is right.
 
----
+______________________________________________________________________
 
 ## 6. Testing
 
 ### 6.1 Unit tests (`tests/diagnostics/test_pic_thomson.py`)
 
 1. **Reader round-trip** — `from_arrays` → conditioning → shapes/units preserved.
-2. **`normalize_vdf`** — `∫f dv = 1` for every `(t, x)` on a non-uniform-amplitude
+1. **`normalize_vdf`** — `∫f dv = 1` for every `(t, x)` on a non-uniform-amplitude
    input; per-species axes respected (the §5.2 regression).
-3. **`taper_vdf_edges`** — vectorised version matches a straightforward per-slice loop
+1. **`taper_vdf_edges`** — vectorised version matches a straightforward per-slice loop
    (the existing repo has this equivalence test; port it).
-4. **Maxwellian consistency** — build an analytic Maxwellian `f(v)` at known `n`, `T`,
+1. **Maxwellian consistency** — build an analytic Maxwellian `f(v)` at known `n`, `T`,
    drift; push it through `spectra_from_phase_spaces`; compare against
    `thomson.spectral_density` (the standard PlasmaPy Maxwellian path) on the same
    geometry. This is the real validation that the pipeline's conditioning does not
    distort the physics, and it is code-independent.
-5. **OSIRIS reader** — against a tiny committed fixture (one 8×8 phase-space HDF5
+1. **OSIRIS reader** — against a tiny committed fixture (one 8×8 phase-space HDF5
    written by the test itself in OSIRIS layout), asserting axis order, the
    `AXIS{ndim-k}` flip, and the `c/ω_p → m` conversion.
-6. **Presence masking** — a species that vanishes mid-run yields `NaN` columns, not
+1. **Presence masking** — a species that vanishes mid-run yields `NaN` columns, not
    fabricated spectra.
 
 ### 6.2 End-to-end against the two shock runs
@@ -391,6 +392,7 @@ Both are magnetized piston-driven shocks, which makes a genuine cross-code
 comparison possible.
 
 **OSIRIS —** `/home/hhelal/OmegaShock/runs/omegashock_w3.5e11_exp/`
+
 - `MS/PHA/p1x1/{e, cham, targ}/`, 513 dumps, `ps_np = 1024`, `ps_nx = 512`
 - deck: `e` rqm −1; `cham` rqm 69; `targ` rqm 68
 - `run.yaml`: `reference_density: 9.0e17` cm⁻³, `rqm_factor: 50`, `dx: 0.075`,
@@ -403,6 +405,7 @@ comparison possible.
   normalisation fix (check it moves the IAW width in the direction `√10` implies).
 
 **WarpX —** `/home/hhelal/KinShock2020/runs/R1_paper/`
+
 - `diags/diag1*` — Full diagnostics with particles, ~50 frames (`diag1.intervals = 6448`)
 - species: `piston_electrons`, `piston_ions`, `amb_electrons`, `amb_ions`
 - `mass_ratio = 100`, `theta_e_heat = 0.092`; densities in `config.yaml`
@@ -418,26 +421,26 @@ comparison possible.
 different mass ratios); the deliverable is that both paths run through the *same*
 invariant core and produce physically sane spectra.
 
----
+______________________________________________________________________
 
 ## 7. Open questions
 
 1. ~~§5.1 mass-ratio convention~~ — resolved: global `1/√R` rescale of all species,
    exposed as `velocity_scale_factor` (default 1.0). Only the numeric value of `R`
    for `omegashock_w3.5e11_exp` (50 vs 69) remains, and that is a test-time check.
-2. ~~File name~~ — resolved: `pic_thomson.py`.
-3. **Optional deps.** `yt` and `openpmd-api` for WarpX — add a
+1. ~~File name~~ — resolved: `pic_thomson.py`.
+1. **Optional deps.** `yt` and `openpmd-api` for WarpX — add a
    `[project.optional-dependencies] pic` extra, or leave them as import-time errors
    with instructions? I lean toward the extra, mirroring the existing `thomson`
    extra for numba/torch.
-4. **Multiple electron populations** (§6.2 WarpX): confirm we want `efract` support
+1. **Multiple electron populations** (§6.2 WarpX): confirm we want `efract` support
    in v1. I plan to build it in, since the WarpX test run needs it.
-5. **Upstreamability.** This is a fork-specific module depending on
+1. **Upstreamability.** This is a fork-specific module depending on
    `arbitrary_forwardmodel`, which upstream PlasmaPy does not have. Keeping it in
    `plasmapy/diagnostics/` is fine for the fork; worth a header note that it is not an
    upstream-mergeable file as written.
 
----
+______________________________________________________________________
 
 ## 8. Implementation order
 
@@ -461,7 +464,7 @@ invariant core and produce physically sane spectra.
      mistaken for a physics bug. `S(k,ω)` itself is unaffected — `arbitrary_chi`
      uses the normalisation consistently.
 
-2. ✅ **Done.** `spectra_from_phase_spaces` driver, `ThomsonSpectrogram`, `efract`
+1. ✅ **Done.** `spectra_from_phase_spaces` driver, `ThomsonSpectrogram`, `efract`
    support, presence masking. 98 tests in the file, all passing; `ruff` and `ty`
    clean; the full `tests/diagnostics/` suite is green (209 passed).
 
@@ -494,7 +497,8 @@ invariant core and produce physically sane spectra.
    difference of 0.092; with `scattered_power=False` the driver agrees with the
    analytic model at **L1 = 0.032**, and the Jacobian relation reproduces the
    `True` output to a relative error of 7e-18.
-3. ✅ **Done.** OSIRIS reader (h5py, no pyVisOS) + unit test 5. 118 tests in the
+
+1. ✅ **Done.** OSIRIS reader (h5py, no pyVisOS) + unit test 5. 118 tests in the
    file, all passing; full `tests/diagnostics/` suite green (222 passed).
    Also added `tools/pic_thomson_figures.py`, which renders the behaviour the
    tests assert into a git-ignored `media/` directory.
@@ -528,11 +532,11 @@ invariant core and produce physically sane spectra.
 The question flagged in §5.5a is settled, and the answer is worse than the
 synthetic estimate. Median width inflation across all appreciably populated cells:
 
-| species | grid half-width | unbounded | bins=20 | bins=10 | bins=5 | bins=3 |
-|---|---|---|---|---|---|---|
-| `e` | 13σ | **+67 %** | −0.1 % | −0.7 % | −0.9 % | −1.0 % |
-| `cham` | 14σ | **+4086 %** | +35 % | +11 % | +3.9 % | +1.6 % |
-| `targ` | 23σ | **+242 %** | +6.0 % | +2.8 % | +1.3 % | +0.7 % |
+| species | grid half-width | unbounded   | bins=20 | bins=10 | bins=5 | bins=3 |
+| ------- | --------------- | ----------- | ------- | ------- | ------ | ------ |
+| `e`     | 13σ             | **+67 %**   | −0.1 %  | −0.7 %  | −0.9 % | −1.0 % |
+| `cham`  | 14σ             | **+4086 %** | +35 %   | +11 %   | +3.9 % | +1.6 % |
+| `targ`  | 23σ             | **+242 %**  | +6.0 %  | +2.8 %  | +1.3 % | +0.7 % |
 
 The ions are catastrophic because their momentum grid (`u ∈ ±0.1`, `±0.05`) is far
 wider than the actual thermal spread — cold upstream ions occupy a handful of bins
@@ -570,10 +574,10 @@ it enormously — it was reporting 14 575 093 %).
    Bohm-Gross excess, and the size of that excess is fixed by α, which the forward
    model reports independently:
 
-   | quantity | value |
-   |---|---|
+   | quantity                                                      | value     |
+   | ------------------------------------------------------------- | --------- |
    | observed EPW shift / bare `ω_pe` shift, median over 513 steps | **1.291** |
-   | `√(1 + 3k²λ_De²)` from the reported α | **1.262** |
+   | `√(1 + 3k²λ_De²)` from the reported α                         | **1.262** |
 
    Agreement to 2.3%, over the whole run, validating the entire chain: reader unit
    conversions, the `γ³/c` Jacobian, conditioning, and the forward model. Getting
@@ -584,10 +588,10 @@ it enormously — it was reporting 14 575 093 %).
 
    **What bounding the taper changes, on real data:**
 
-   | metric | legacy (unbounded) | corrected (bounded) |
-   |---|---|---|
-   | α, median | 1.685 | **3.182** |
-   | α, range | 1.61 – 10.28 | 1.89 – 15.38 |
+   | metric    | legacy (unbounded) | corrected (bounded) |
+   | --------- | ------------------ | ------------------- |
+   | α, median | 1.685              | **3.182**           |
+   | α, range  | 1.61 – 10.28       | 1.89 – 15.38        |
 
    The two configurations differ from each other by a median L1 of **0.900** in
    the EPW window and **0.794** in the IAW window.
@@ -622,10 +626,10 @@ completes comfortably.
 The deck's `rqm` and `rqm_factor` pin down A/Z for each ion, and the placeholder
 `"p+"` is wrong:
 
-| species | deck rqm | implied A/Z (R = 50) | `"p+"` gives | fully-stripped low-Z gives |
-|---|---|---|---|---|
-| `cham` | 69 | 1.88 | 1.00 | ~1.99 (He²⁺, C⁶⁺, N⁷⁺, O⁸⁺, Si¹⁴⁺ all within 1%) |
-| `targ` | 68 | 1.85 | 1.00 | ~1.99 |
+| species | deck rqm | implied A/Z (R = 50) | `"p+"` gives | fully-stripped low-Z gives                       |
+| ------- | -------- | -------------------- | ------------ | ------------------------------------------------ |
+| `cham`  | 69       | 1.88                 | 1.00         | ~1.99 (He²⁺, C⁶⁺, N⁷⁺, O⁸⁺, Si¹⁴⁺ all within 1%) |
+| `targ`  | 68       | 1.85                 | 1.00         | ~1.99                                            |
 
 So the ions are almost certainly a **fully-stripped low-Z species, not protons**.
 `"p+"` makes the ion mass a factor ~2 too light, widening the IAW feature by
@@ -636,53 +640,53 @@ So the ions are almost certainly a **fully-stripped low-Z species, not protons**
 `tools/pic_thomson_osiris_comparison.py --ion-rqm` prints this check and flags a
 mismatch, so it cannot be forgotten. **The actual `cham` and `targ` species are
 needed before the IAW output means anything.**
-5. ✅ **Done.** WarpX reader + caching. 145 tests in the file, all passing; full
-   `tests/diagnostics/` suite green (246 passed); `ruff` and `ty` clean.
+5\. ✅ **Done.** WarpX reader + caching. 145 tests in the file, all passing; full
+`tests/diagnostics/` suite green (246 passed); `ruff` and `ty` clean.
 
-   `read_warpx_phase_space` bins raw macroparticles into a `PICPhaseSpace`.
-   Confirmed against `KinShock2020/runs/R1_paper` (1-D, 51 particle plotfiles,
-   ~3M macroparticles per species per frame, ~0.6 s to read one):
+`read_warpx_phase_space` bins raw macroparticles into a `PICPhaseSpace`.
+Confirmed against `KinShock2020/runs/R1_paper` (1-D, 51 particle plotfiles,
+~3M macroparticles per species per frame, ~0.6 s to read one):
 
-   - **Weights carry the density.** `f` is divided by the bin volume, so
-     `∫f dv` is a number density in m⁻³ and the driver takes
-     `reference_density = 1 * u.m**-3`. Validated twice: `sum(w)/volume` from the
-     raw yt arrays gives 7.979e15 m⁻³ against the deck's `namb = 0.008 n0 = 8e15`,
-     and the binned reader reproduces **7.9995e15 m⁻³** — 0.006%.
-   - **`mass` and `label` are different things** and both are required. `mass` is
-     the *simulation's* mass (here `Mi = 100 mₑ`), which converts stored momentum
-     into the velocities the run actually evolved; `label` names the physical
-     species, from which the forward model takes charge and mass. Conflating them
-     in a reduced-mass-ratio run is a factor-of-18 error.
-   - **1-D field naming.** WarpX stores the single spatial coordinate as
-     `particle_position_x` even when the deck calls that direction `z`, while
-     momenta keep their physical names — so the defaults are
-     `particle_position_x` and `particle_momentum_z`, both overridable.
-   - **Caching** to `.npz`, keyed on a signature of every setting that affects the
-     result, so a changed bin count rebuilds rather than silently returning a
-     stale grid.
-   - The auto-derived velocity range is clamped below `c`. Without it, the 1.2×
-     headroom around a 0.95`c` particle put the grid edge past `c`, where no
-     particle can live and the taper would have had more empty axis to invent a
-     tail across.
+- **Weights carry the density.** `f` is divided by the bin volume, so
+  `∫f dv` is a number density in m⁻³ and the driver takes
+  `reference_density = 1 * u.m**-3`. Validated twice: `sum(w)/volume` from the
+  raw yt arrays gives 7.979e15 m⁻³ against the deck's `namb = 0.008 n0 = 8e15`,
+  and the binned reader reproduces **7.9995e15 m⁻³** — 0.006%.
+- **`mass` and `label` are different things** and both are required. `mass` is
+  the *simulation's* mass (here `Mi = 100 mₑ`), which converts stored momentum
+  into the velocities the run actually evolved; `label` names the physical
+  species, from which the forward model takes charge and mass. Conflating them
+  in a reduced-mass-ratio run is a factor-of-18 error.
+- **1-D field naming.** WarpX stores the single spatial coordinate as
+  `particle_position_x` even when the deck calls that direction `z`, while
+  momenta keep their physical names — so the defaults are
+  `particle_position_x` and `particle_momentum_z`, both overridable.
+- **Caching** to `.npz`, keyed on a signature of every setting that affects the
+  result, so a changed bin count rebuilds rather than silently returning a
+  stale grid.
+- The auto-derived velocity range is clamped below `c`. Without it, the 1.2×
+  headroom around a 0.95`c` particle put the grid edge past `c`, where no
+  particle can live and the taper would have had more empty axis to invent a
+  tail across.
 
-   `yt` is an optional dependency, imported on demand with an actionable error,
-   and added to `pyproject.toml` as the `pic` extra. The OSIRIS path still needs
-   only `h5py`.
+`yt` is an optional dependency, imported on demand with an actionable error,
+and added to `pyproject.toml` as the `pic` extra. The OSIRIS path still needs
+only `h5py`.
 
-   **Cross-code check, unplanned but valuable:** the driver consumed the WarpX
-   phase spaces with no code-specific handling, and `efract` handed over from
-   ambient electrons (100%) to piston electrons (99.7%) as the piston reached the
-   sampling point — the multi-electron-population path that only the WarpX case
-   exercises.
+**Cross-code check, unplanned but valuable:** the driver consumed the WarpX
+phase spaces with no code-specific handling, and `efract` handed over from
+ambient electrons (100%) to piston electrons (99.7%) as the piston reached the
+sampling point — the multi-electron-population path that only the WarpX case
+exercises.
 
 ### 5a. R1_paper is not a collective-Thomson plasma at 532 nm
 
 Worth knowing before step 6 sets expectations. At the sampled point:
 
-| | R1_paper (WarpX) | omegashock_w3.5e11_exp (OSIRIS) |
-|---|---|---|
-| `n_e` | 8e15 – 2e17 m⁻³ | 9e23 – 4e25 m⁻³ |
-| α at 532 nm, 90° | **~1e-5** | 1.9 – 15.4 |
+|                  | R1_paper (WarpX) | omegashock_w3.5e11_exp (OSIRIS) |
+| ---------------- | ---------------- | ------------------------------- |
+| `n_e`            | 8e15 – 2e17 m⁻³  | 9e23 – 4e25 m⁻³                 |
+| α at 532 nm, 90° | **~1e-5**        | 1.9 – 15.4                      |
 
 Seven orders of magnitude in density puts R1_paper in the **deeply non-collective**
 regime, where there are no EPW or IAW features at all: `S(k, ω) ∝ f_e(ω/k)`, so the
@@ -696,51 +700,51 @@ in the non-collective limit the computed spectrum must reproduce the conditioned
 electron VDF under `v = (λ - λ₀)c / (2 λ₀ sin(θ/2))`. A meaningful *collective*
 WarpX comparison would need either a denser run or a much longer probe wavelength
 (α scales with λ_probe).
-6. ✅ **Done.** End-to-end WarpX run on `R1_paper`, all 51 particle plotfiles,
-   at x = 30 m. Driven by `tools/pic_thomson_warpx.py`, which writes
-   `media/08_warpx_phase_space.png` and `media/09_warpx_spectra.png`.
+6\. ✅ **Done.** End-to-end WarpX run on `R1_paper`, all 51 particle plotfiles,
+at x = 30 m. Driven by `tools/pic_thomson_warpx.py`, which writes
+`media/08_warpx_phase_space.png` and `media/09_warpx_spectra.png`.
 
-   **The non-collective limit gives an exact validation.** With α ~ 1e-5 the
-   electron susceptibility vanishes, the shielding factor `|1 - χ_e/ε|²` goes to
-   one, and the ion feature disappears entirely, leaving
+**The non-collective limit gives an exact validation.** With α ~ 1e-5 the
+electron susceptibility vanishes, the shielding factor `|1 - χ_e/ε|²` goes to
+one, and the ion feature disappears entirely, leaving
 
-   > `S(k, ω) ∝ (2π/k) · f_e(ω/k)`
+> `S(k, ω) ∝ (2π/k) · f_e(ω/k)`
 
-   Comparing the pipeline's spectrum against the conditioned electron VDF pushed
-   through that map, over all 51 timesteps:
+Comparing the pipeline's spectrum against the conditioned electron VDF pushed
+through that map, over all 51 timesteps:
 
-   | | |
-   |---|---|
-   | normalised L1 difference, median | **0.0000** |
-   | 90th percentile | **0.0009** |
+|                                  |            |
+| -------------------------------- | ---------- |
+| normalised L1 difference, median | **0.0000** |
+| 90th percentile                  | **0.0009** |
 
-   Essentially exact. This is a stronger statement than the OSIRIS Bohm-Gross
-   check: there the agreement was 2.3% against an approximate dispersion
-   relation, here the non-collective limit is exact and the pipeline reproduces
-   it to the noise floor.
+Essentially exact. This is a stronger statement than the OSIRIS Bohm-Gross
+check: there the agreement was 2.3% against an approximate dispersion
+relation, here the non-collective limit is exact and the pipeline reproduces
+it to the noise floor.
 
-   Getting it required using the *exact* `k(λ)` the forward model uses,
-   `k = |k_s - k_0|` with both wavenumbers carrying the
-   `√(ω² - ω_pe²)` correction. A constant-`k` Doppler map gives L1 = 0.226 —
-   over a 40–1024 nm window `k` varies by more than an order of magnitude, so the
-   textbook `Δλ = λ₀ · 2(v/c) sin(θ/2)` is not usable here. That was the check
-   being wrong, not the pipeline.
+Getting it required using the *exact* `k(λ)` the forward model uses,
+`k = |k_s - k_0|` with both wavenumbers carrying the
+`√(ω² - ω_pe²)` correction. A constant-`k` Doppler map gives L1 = 0.226 —
+over a 40–1024 nm window `k` varies by more than an order of magnitude, so the
+textbook `Δλ = λ₀ · 2(v/c) sin(θ/2)` is not usable here. That was the check
+being wrong, not the pipeline.
 
-   **The reader is confirmed by the physics too.** The phase-space figure shows
-   `amb_ions` with the bifurcated incoming/reflected structure at x ≈ 40–48 m
-   that is the supercritical shock signature the paper is about, `piston_ions`
-   in free expansion, and `amb_electrons` swept into a thin compressed sheet
-   ahead of the piston. Population fractions hand over cleanly from ambient to
-   piston at t ≈ 830 ns, ions marginally before electrons.
+**The reader is confirmed by the physics too.** The phase-space figure shows
+`amb_ions` with the bifurcated incoming/reflected structure at x ≈ 40–48 m
+that is the supercritical shock signature the paper is about, `piston_ions`
+in free expansion, and `amb_electrons` swept into a thin compressed sheet
+ahead of the piston. Population fractions hand over cleanly from ambient to
+piston at t ≈ 830 ns, ions marginally before electrons.
 
 ### 6a. Cross-code comparison: what is and is not possible
 
-| | R1_paper (WarpX) | omegashock_w3.5e11_exp (OSIRIS) |
-|---|---|---|
-| `n_e` at the sampled point | 7.9e15 – 2.0e17 m⁻³ | 9.3e23 – 3.5e25 m⁻³ |
-| α at 532 nm, 90° | 7.7e-6 – 3.2e-5 | 1.9 – 15.4 |
-| regime | non-collective | collective |
-| validation used | exact non-collective limit (L1 = 0.000) | Bohm-Gross shift (2.3%) |
+|                            | R1_paper (WarpX)                        | omegashock_w3.5e11_exp (OSIRIS) |
+| -------------------------- | --------------------------------------- | ------------------------------- |
+| `n_e` at the sampled point | 7.9e15 – 2.0e17 m⁻³                     | 9.3e23 – 3.5e25 m⁻³             |
+| α at 532 nm, 90°           | 7.7e-6 – 3.2e-5                         | 1.9 – 15.4                      |
+| regime                     | non-collective                          | collective                      |
+| validation used            | exact non-collective limit (L1 = 0.000) | Bohm-Gross shift (2.3%)         |
 
 A *quantitative* cross-code comparison of spectra is not meaningful between these
 two runs: they are eight orders of magnitude apart in density and sit on opposite
@@ -769,16 +773,17 @@ Two things this exercise established:
   at 532 nm to 0.148 at 30 mm, which is the intended behaviour: shielding is now
   present and the spectrum is no longer just the Doppler-mapped VDF. The
   agreement at 532 nm is therefore a real test, not a tautology.
+
 - **The collective regime needs far more smoothing than the non-collective one.**
   At the light setting used for 532 nm (`smoothing_window = 9`) the collective
   spectrogram is speckled with sharp spurious pixels. Widening to 41 removes them
   entirely:
 
-  | `smoothing_window` | non-collective-check L1 | spectrogram |
-  |---|---|---|
-  | 9 | 0.360 | heavily speckled |
-  | 41 | 0.148 | clean |
-  | 81 | 0.072 | clean, over-smoothed |
+  | `smoothing_window` | non-collective-check L1 | spectrogram          |
+  | ------------------ | ----------------------- | -------------------- |
+  | 9                  | 0.360                   | heavily speckled     |
+  | 41                 | 0.148                   | clean                |
+  | 81                 | 0.072                   | clean, over-smoothed |
 
   The cause is physical, not a defect: for α > 1 the spectrum carries
   `|1 - χ_e/ε|²`, which diverges as `ε → 0` at the electron-plasma-wave
@@ -802,51 +807,51 @@ distribution reaches 0.54 c in sim units, giving a 1σ Doppler width of 403 nm.
 See §5.1: the deck's `mass_ratio = 100` against a real 1836 suggests R = 18.36,
 while the paper's Table I reports `c_sim/c_phys = 0.02`, a factor of 50. These
 disagree and should be reconciled before the WarpX spectra are read as physical.
-7. ✅ **Done.** Instrument response, HDF5 output, plotting. 27 new tests
-   (267 in `tests/diagnostics/` overall, all passing); `ruff` and `ty` clean.
+7\. ✅ **Done.** Instrument response, HDF5 output, plotting. 27 new tests
+(267 in `tests/diagnostics/` overall, all passing); `ruff` and `ty` clean.
 
-   - **`ThomsonSpectrogram.apply_instrument_response`** degrades a synthetic
-     spectrogram to a real instrument's resolution, taking FWHM values in
-     physical units — `time_fwhm=100*u.ps`, `epw_wavelength_fwhm=0.5*u.nm`,
-     `iaw_wavelength_fwhm=0.05*u.nm` — with a Gaussian or boxcar kernel. The two
-     wavelength windows take separate widths because their dispersions differ by
-     an order of magnitude.
+- **`ThomsonSpectrogram.apply_instrument_response`** degrades a synthetic
+  spectrogram to a real instrument's resolution, taking FWHM values in
+  physical units — `time_fwhm=100*u.ps`, `epw_wavelength_fwhm=0.5*u.nm`,
+  `iaw_wavelength_fwhm=0.05*u.nm` — with a Gaussian or boxcar kernel. The two
+  wavelength windows take separate widths because their dispersions differ by
+  an order of magnitude.
 
-     Because `ThomsonSpectrogram` carries `t` in seconds and wavelengths in
-     metres, the conversion to bins is direct. The old `smooth_spectra` module
-     had to reconstruct it from `ω_p` and the simulation timestep, which is where
-     its hard-coded `dt_sim = 20` came from — a footgun the SI contract removes.
+  Because `ThomsonSpectrogram` carries `t` in seconds and wavelengths in
+  metres, the conversion to bins is direct. The old `smooth_spectra` module
+  had to reconstruct it from `ω_p` and the simulation timestep, which is where
+  its hard-coded `dt_sim = 20` came from — a footgun the SI contract removes.
 
-     Gaps are handled properly. A vacuum timestep is `NaN`, and a plain filter
-     spreads that over every point the kernel reaches; filtering values and the
-     validity mask separately and dividing gives the average over valid samples
-     alone. A gap narrower than the instrument function is then *filled* from
-     either side — which is what an instrument integrating over a finite gate
-     really does — while a gap wider than the kernel's reach stays `NaN`. Both
-     branches are tested, as is the contrast with the naive filter.
+  Gaps are handled properly. A vacuum timestep is `NaN`, and a plain filter
+  spreads that over every point the kernel reaches; filtering values and the
+  validity mask separately and dividing gives the average over valid samples
+  alone. A gap narrower than the instrument function is then *filled* from
+  either side — which is what an instrument integrating over a finite gate
+  really does — while a gap wider than the kernel's reach stays `NaN`. Both
+  branches are tested, as is the contrast with the naive filter.
 
-   - **`to_hdf5` / `from_hdf5`** round-trip the spectrogram. Every dataset carries
-     a `UNITS` attribute, the α convention is recorded on the dataset, and the
-     per-row area normalisation is written into a root attribute so it cannot be
-     forgotten by whoever reads the file later. Verified round-tripping the real
-     129-dump OSIRIS spectrogram.
+- **`to_hdf5` / `from_hdf5`** round-trip the spectrogram. Every dataset carries
+  a `UNITS` attribute, the α convention is recorded on the dataset, and the
+  per-row area normalisation is written into a root attribute so it cannot be
+  forgotten by whoever reads the file later. Verified round-tripping the real
+  129-dump OSIRIS spectrogram.
 
-     Group names follow the `osiris2thomson` layout where the contents line up
-     (`SPECTRA/EPW/epws`, `SPECTRA/IAW/iaws`, `SPECTRA/SCATTERING_PARAMETERS`,
-     `DENSITY/dens`, `AXES`), but this is **not** a drop-in for that pipeline's
-     files: `load_spectra` requires `TEMPERATURE`, `FLOW_VELOCITY` and `VDF`
-     groups this module deliberately does not compute, and the axes here are SI
-     rather than simulation units. Population fractions are stored as 2-D arrays
-     plus a label dataset rather than as `ion_fraction_<name>` datasets, which
-     avoids mangling labels like `"Al 13+"`.
+  Group names follow the `osiris2thomson` layout where the contents line up
+  (`SPECTRA/EPW/epws`, `SPECTRA/IAW/iaws`, `SPECTRA/SCATTERING_PARAMETERS`,
+  `DENSITY/dens`, `AXES`), but this is **not** a drop-in for that pipeline's
+  files: `load_spectra` requires `TEMPERATURE`, `FLOW_VELOCITY` and `VDF`
+  groups this module deliberately does not compute, and the axes here are SI
+  rather than simulation units. Population fractions are stored as 2-D arrays
+  plus a label dataset rather than as `ion_fraction_<name>` datasets, which
+  avoids mangling labels like `"Al 13+"`.
 
-   - **`plot`** draws the spectrogram, density, α and population fractions.
-     Repeated species labels are numbered, since two populations of the same
-     element are legitimate but two identical legend entries are not.
+- **`plot`** draws the spectrogram, density, α and population fractions.
+  Repeated species labels are numbered, since two populations of the same
+  element are legitimate but two identical legend entries are not.
 
-   Both are wired into `tools/pic_thomson_osiris_comparison.py` via `--output`,
-   `--instrument-time-fwhm` and `--instrument-wavelength-fwhm`; the degraded
-   result is `media/10_osiris_instrument_response.png`.
+Both are wired into `tools/pic_thomson_osiris_comparison.py` via `--output`,
+`--instrument-time-fwhm` and `--instrument-wavelength-fwhm`; the degraded
+result is `media/10_osiris_instrument_response.png`.
 
 ### 7a. Decision: no width-relative taper bound
 
@@ -857,4 +862,60 @@ the ions of the OmegaShock run, 20 for WarpX), and the `pedestal_warning` catche
 a bad choice with a number that says how bad. A second, width-relative
 calibration path would add an API mode to document and test for a benefit that
 the measurements do not show.
-8. Changelog entry, docs stub, `uvx pre-commit`, `nox --session ty`.
+8\. ✅ **Done.** Docs, changelog, lint, types, full test suite.
+
+| check                      | result                                                |
+| -------------------------- | ----------------------------------------------------- |
+| full test suite (`tests/`) | **4626 passed**, 6 skipped, 6 xfailed, 1 xpassed      |
+| `pre-commit` (all hooks)   | clean                                                 |
+| `ty check src/plasmapy/`   | 18 diagnostics, **none** in `pic_thomson.py`          |
+| public API audit           | 13 names, all exported, all documented, nothing stray |
+
+- **Docs page** at `docs/ad/diagnostics/pic_thomson.rst`, registered in the
+  diagnostics toctree next to `thomson`. It follows that page's structure
+  (`currentmodule` + `automodapi`) and adds a worked example plus the four things
+  a user has to know that an API reference will not tell them: how each reader
+  undoes its code's units, why the taper has to be bounded, why the collective
+  regime needs more smoothing, and what the spectra do *not* carry (absolute
+  intensity, EPW-to-IAW ratio, the conventional α).
+- **Changelog** at `changelog/7.feature.rst`, maintained across every step.
+- `uv.lock` regenerated for the new `pic` extra.
+
+Two tooling snags worth recording, since they will recur:
+
+- `typos` silently rewrote `PNGs` to `ONGs` inside a Python docstring — it parses
+  identifiers in `.py` files differently from prose. `extend-words` does not
+  suppress it; the fix is `[default.extend-identifiers]` in `_typos.toml`.
+  **A hook that rewrites text needs its diff read, not just its exit code.**
+- `blacken-docs` fails on this plan's Python blocks, which are signature sketches
+  rather than runnable code. Those are retagged as plain text blocks.
+
+______________________________________________________________________
+
+## 9. Where this leaves the pipeline
+
+Complete and validated on both codes. What a reader should know before trusting a
+number out of it:
+
+**Validated.** Analytic Maxwellian vs `thomson.spectral_density` (L1 = 0.032);
+OSIRIS EPW satellite vs Bohm-Gross over 513 dumps (2.3%); WarpX non-collective
+limit over 51 frames (L1 = 0.0000); OSIRIS reader density against the deck
+(n/n₀ = 1.037); WarpX reader density against the deck (0.006%).
+
+**Still open, and both affect physical output.**
+
+1. **The `cham` and `targ` species (§4b).** The placeholder `"p+"` is wrong: the
+   deck implies A/Z ≈ 1.88, so these are a fully-stripped low-Z ion. The IAW
+   feature is currently ~41% too wide. The forward model takes `Z` and mass from
+   the label, so nothing else can be inferred until this is settled.
+1. **The WarpX velocity-scaling convention (§6a).** `mass_ratio = 100` against a
+   real 1836 suggests R = 18.36, while the paper's Table I reports
+   `c_sim/c_phys = 0.02`, a factor of 50. These disagree by 2.7×, and the WarpX
+   spectra are currently shown in simulation units because of it.
+
+**Recommendation.** Spectra produced by the `osiris2thomson` pipeline should be
+regenerated. Between the ion-normalisation bug (§5.2, a factor of 10 on `χ_i`),
+the unbounded taper (§3a, `vTe` inflated 67%, ion widths by up to 40×) and the
+missing Jacobian (§3), the differences are not refinements: on the OmegaShock run
+the legacy and corrected spectrograms differ by a median L1 of 0.90, against
+0.032 for the analytic-Maxwellian agreement.

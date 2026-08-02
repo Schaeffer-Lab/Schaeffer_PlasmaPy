@@ -13,3 +13,6 @@ rety = "rety"
 newshape = "newshape"
 texttt = "texttt"
 nbins = "nbins"
+
+[default.extend-identifiers]
+PNGs = "PNGs"

@@ -62,6 +62,20 @@ dependencies = [
   "wrapt>=1.15",
   "xarray>=2024.5",
 ]
+# Reading WarpX (AMReX plotfile) output in
+# ``plasmapy.diagnostics.pic_thomson``. The OSIRIS reader needs only h5py,
+# which is a required dependency, so this is not needed for that path.
+optional-dependencies.pic = [
+  "yt>=4.4",
+]
+# Heavy, optional runtime dependencies for the JIT (numba) and autodiff
+# (torch) Thomson scattering forward models in
+# ``plasmapy.diagnostics.thomson``. The rest of PlasmaPy imports and runs
+# without these installed.
+optional-dependencies.thomson = [
+  "numba>=0.59",
+  "torch>=2.2",
+]
 urls.Changelog = "https://docs.plasmapy.org/en/stable/whatsnew/index.html"
 urls.Chat = "https://plasmapy.org/chat"
 urls.Documentation = "https://docs.plasmapy.org/"
@@ -70,22 +84,6 @@ urls.Source = "https://github.com/PlasmaPy/plasmapy"
 urls.website = "https://www.plasmapy.org"
 # Remove references to plasma calculator after mid-2026
 scripts.plasma-calculator = "plasmapy.utils.calculator:main"
-
-[project.optional-dependencies]
-# Heavy, optional runtime dependencies for the JIT (numba) and autodiff
-# (torch) Thomson scattering forward models in
-# ``plasmapy.diagnostics.thomson``. The rest of PlasmaPy imports and runs
-# without these installed.
-thomson = [
-  "numba>=0.59",
-  "torch>=2.2",
-]
-# Reading WarpX (AMReX plotfile) output in
-# ``plasmapy.diagnostics.pic_thomson``. The OSIRIS reader needs only h5py,
-# which is a required dependency, so this is not needed for that path.
-pic = [
-  "yt>=4.4",
-]
 
 [dependency-groups]
 # Define development dependencies using dependency groups (see PEP 735).
@@ -371,10 +369,6 @@ lint.per-file-ignores."docs/notebooks/langmuir_samples/_generate_noisy.ipynb" = 
 lint.per-file-ignores."docs/notebooks/plasma/grids_cartesian.ipynb" = [ "NPY002", "PLW2901" ]
 lint.per-file-ignores."docs/notebooks/plasma/grids_nonuniform.ipynb" = [ "NPY002" ]
 lint.per-file-ignores."setup.py" = [ "D100" ]
-# Standalone visual/validation scripts; reporting on stdout is the point.
-lint.per-file-ignores."tools/pic_thomson_figures.py" = [ "T201" ]
-lint.per-file-ignores."tools/pic_thomson_osiris_comparison.py" = [ "T201" ]
-lint.per-file-ignores."tools/pic_thomson_warpx.py" = [ "T201" ]
 lint.per-file-ignores."src/plasmapy/analysis/fit_functions.py" = [ "D301" ]
 lint.per-file-ignores."src/plasmapy/analysis/swept_langmuir/__init__.py" = [ "E402" ]
 lint.per-file-ignores."src/plasmapy/formulary/braginskii.py" = [ "C901", "RET503", "RET504" ]
@@ -407,6 +401,10 @@ lint.per-file-ignores."tests/formulary/test_transport.py" = [ "PT031" ]
 lint.per-file-ignores."tests/particles/test_decorators.py" = [ "ARG001", "ARG002" ]
 lint.per-file-ignores."tests/utils/_pytest_helpers/test_pytest_helpers.py" = [ "BLE001", "TRY002" ]
 lint.per-file-ignores."tests/utils/decorators/test_converters.py" = [ "ARG001", "ARG005" ]
+# Standalone visual/validation scripts; reporting on stdout is the point.
+lint.per-file-ignores."tools/pic_thomson_figures.py" = [ "T201" ]
+lint.per-file-ignores."tools/pic_thomson_osiris_comparison.py" = [ "T201" ]
+lint.per-file-ignores."tools/pic_thomson_warpx.py" = [ "T201" ]
 # Allow potentially ambiguous Unicode characters with valid uses in plasma science
 lint.allowed-confusables = [
   "×",
