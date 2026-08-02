@@ -243,7 +243,7 @@ def figure_driver_vs_analytic() -> None:
 
 
 def read_osiris(
-    ms_path: Path, stride: int, reference_density
+    ms_path: Path, stride: int, reference_density, args
 ) -> tuple[pt.PICPhaseSpace, list[pt.PICPhaseSpace]]:
     """Read the electron and ion phase spaces from an OSIRIS run."""
     available = sorted((ms_path / "PHA" / "p1x1" / "e").glob("p1x1-e-*.h5"))
@@ -259,7 +259,7 @@ def read_osiris(
         timesteps=dumps,
     )
     ions = []
-    for species, label in (("cham", "Al 13+"), ("targ", "Al 13+")):
+    for species, label in (("cham", args.ion_label), ("targ", args.ion_label)):
         if (ms_path / "PHA" / "p1x1" / species).is_dir():
             ions.append(
                 pt.read_osiris_phase_space(
@@ -468,6 +468,11 @@ def main() -> None:
         "--stride", type=int, default=32, help="read every Nth dump (default: 32)"
     )
     parser.add_argument(
+        "--ion-label",
+        default="C 6+",
+        help="physical species the ion populations represent",
+    )
+    parser.add_argument(
         "--position",
         type=float,
         default=None,
@@ -486,7 +491,7 @@ def main() -> None:
 
     reference_density = args.reference_density * u.cm**-3
     print(f"\nOSIRIS run at {args.osiris}:")
-    electrons, ions = read_osiris(args.osiris, args.stride, reference_density)
+    electrons, ions = read_osiris(args.osiris, args.stride, reference_density, args)
     figure_osiris_phase_space(electrons, ions)
     figure_osiris_taper(electrons, ions)
 

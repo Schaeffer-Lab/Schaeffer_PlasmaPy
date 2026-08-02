@@ -621,25 +621,43 @@ driver now reduces to the sampled point *first*, via `PICPhaseSpace.at_position`
 A test asserts the two orderings give bit-identical results. The full run now
 completes comfortably.
 
-### 4b. Ion species — still open, and it matters
+### 4b. Ion species — resolved: fully stripped carbon
 
-The deck's `rqm` and `rqm_factor` pin down A/Z for each ion, and the placeholder
-`"p+"` is wrong:
+**Settled (user):** `cham` and `targ` are both **fully stripped carbon**, `C 6+`.
+That matches what the deck implied — every fully stripped low-Z ion sits at
+A/Z ≈ 1.99, and `"p+"` at 1.00 was never consistent with it:
 
 | species | deck rqm | implied A/Z (R = 50) | `"p+"` gives | fully-stripped low-Z gives                       |
 | ------- | -------- | -------------------- | ------------ | ------------------------------------------------ |
 | `cham`  | 69       | 1.88                 | 1.00         | ~1.99 (He²⁺, C⁶⁺, N⁷⁺, O⁸⁺, Si¹⁴⁺ all within 1%) |
 | `targ`  | 68       | 1.85                 | 1.00         | ~1.99                                            |
 
-So the ions are almost certainly a **fully-stripped low-Z species, not protons**.
-`"p+"` makes the ion mass a factor ~2 too light, widening the IAW feature by
-√2 ≈ 1.41 and shifting the ion-acoustic velocity by the same factor. The residual
-6% between the implied 1.88 and the ~1.99 of a real low-Z ion corresponds to
-`rqm_factor ≈ 53` rather than exactly 50, so that is worth checking too.
+Measured on the run at stride 32, `"p+"` against `C 6+`:
 
-`tools/pic_thomson_osiris_comparison.py --ion-rqm` prints this check and flags a
-mismatch, so it cannot be forgotten. **The actual `cham` and `targ` species are
-needed before the IAW output means anything.**
+| quantity         | change                       |
+| ---------------- | ---------------------------- |
+| IAW rms width    | **2.22× too wide** with `p+` |
+| IAW spectrum, L1 | **0.631**                    |
+| EPW spectrum, L1 | 0.070                        |
+| α                | unchanged (ratio 1.0000)     |
+
+Note the IAW width ratio is **2.22, not the naive √(A/Z) = 1.41**. The simple
+scaling assumes the feature follows the ion thermal speed at fixed temperature,
+but the ion VDF handed to the forward model does not change with the label at
+all — only `Z` and `m` do, and they enter through `χ_i`, whose coefficient
+carries `ω_pi² ∝ n_i q²/m` while `n_i = ifract·n/z̄` itself falls by `z̄ = 6`.
+The kinetic treatment therefore gives a larger effect than the fluid estimate.
+That α and the EPW are essentially untouched is the expected counterpart: both
+are set by the electrons.
+
+**One loose end.** `C 6+` has A/Z = 1.987, which needs `rqm_factor = 52.9` for
+`cham` and 53.6 for `targ`, while `run.yaml` says 50 — a 6% discrepancy, so
+either the deck's `rqm` values are rounded or the reduction factor is really
+~53. It propagates into `velocity_scale_factor` as a 3% shift in every velocity
+(`√53/√50`). Small, but worth resolving.
+
+`tools/pic_thomson_osiris_comparison.py --ion-rqm` prints this consistency check
+on every run, now reporting the `rqm_factor` the chosen label would require.
 5\. ✅ **Done.** WarpX reader + caching. 145 tests in the file, all passing; full
 `tests/diagnostics/` suite green (246 passed); `ruff` and `ty` clean.
 
@@ -902,12 +920,12 @@ OSIRIS EPW satellite vs Bohm-Gross over 513 dumps (2.3%); WarpX non-collective
 limit over 51 frames (L1 = 0.0000); OSIRIS reader density against the deck
 (n/n₀ = 1.037); WarpX reader density against the deck (0.006%).
 
-**Still open, and both affect physical output.**
+**Still open.**
 
-1. **The `cham` and `targ` species (§4b).** The placeholder `"p+"` is wrong: the
-   deck implies A/Z ≈ 1.88, so these are a fully-stripped low-Z ion. The IAW
-   feature is currently ~41% too wide. The forward model takes `Z` and mass from
-   the label, so nothing else can be inferred until this is settled.
+1. ~~The `cham` and `targ` species~~ — resolved (§4b): both are fully stripped
+   carbon, `C 6+`, and every figure and end-to-end run has been regenerated with
+   it. A minor loose end remains: `C 6+` implies `rqm_factor ≈ 53` where
+   `run.yaml` says 50, a 3% shift in `velocity_scale_factor`.
 1. **The WarpX velocity-scaling convention (§6a).** `mass_ratio = 100` against a
    real 1836 suggests R = 18.36, while the paper's Table I reports
    `c_sim/c_phys = 0.02`, a factor of 50. These disagree by 2.7×, and the WarpX

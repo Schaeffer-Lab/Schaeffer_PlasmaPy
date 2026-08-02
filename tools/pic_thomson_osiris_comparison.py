@@ -158,18 +158,26 @@ def describe_species(args) -> None:
     """
     if not args.ion_rqm:
         return
-    print("\nion species check (deck rqm x rqm_factor / 1836 = true A/Z):")
+    print("\nion species check:")
+    print(
+        "  deck rqm x rqm_factor / 1836 is the A/Z the simulation implies; the "
+        "label fixes\n  the A/Z the forward model uses. The IAW width scales as "
+        "sqrt(A/Z)."
+    )
     for name, label, rqm in zip(args.ions, args.ion_labels, args.ion_rqm, strict=True):
         implied = rqm * args.velocity_scale_factor / PROTON_RQM
         particle = Particle(label)
         assumed = float(
             (particle.mass / const.m_p).decompose().value / particle.charge_number
         )
+        # Inverting the relation says what rqm_factor the label would need,
+        # which is the more actionable number when the two disagree slightly.
+        needed = assumed * PROTON_RQM / rqm
         flag = "  <-- MISMATCH" if abs(implied / assumed - 1) > 0.1 else ""
         print(
-            f"  {name:<6} deck rqm {rqm:<5g} -> A/Z ~ {implied:5.2f}   "
-            f"label {label!r} gives A/Z = {assumed:5.2f}"
-            f"   (IAW width scales as sqrt(A/Z)){flag}"
+            f"  {name:<6} rqm {rqm:<5g} x {args.velocity_scale_factor:<5g} "
+            f"-> A/Z = {implied:5.2f}   |   label {label!r} has A/Z = {assumed:5.2f}, "
+            f"which needs rqm_factor = {needed:.1f}{flag}"
         )
 
 
