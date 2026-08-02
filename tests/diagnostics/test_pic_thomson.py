@@ -1481,3 +1481,59 @@ class TestDiagnosticFalseAlarms:
         f[0, :, 2] = 0.0
         with pytest.warns(RuntimeWarning, match="fabricating a pedestal"):
             pic_thomson.taper_vdf_edges(f, threshold_frac=0.005)
+
+
+# ---------------------------------------------------------------------------
+# 10. Reducing to the sampled point before conditioning
+# ---------------------------------------------------------------------------
+
+
+class TestAtPosition:
+    def test_reduces_to_one_cell(self):
+        phase_space = simple_phase_space(n_x=5)
+        reduced = phase_space.at_position(phase_space.x[3])
+        assert reduced.shape == (3, 64, 1)
+        assert reduced.meta["sampled_index"] == 3
+        np.testing.assert_array_equal(reduced.f[:, :, 0], phase_space.f[:, :, 3])
+
+    def test_conditioning_commutes_with_reduction(self):
+        """
+        Every conditioning step acts independently on each (time, position)
+        slice, so reducing first must give bit-identical results. The driver
+        relies on this: carrying unused spatial cells through a velocity
+        rescale that oversamples the velocity axis costs orders of magnitude
+        in memory.
+        """
+        v = np.linspace(-4e7, 4e7, 512)
+        rng = np.random.default_rng(11)
+        f = np.empty((3, v.size, 6))
+        for i in range(3):
+            for j in range(6):
+                f[i, :, j] = maxwellian(
+                    v, 4e6 * (1 + 0.3 * j), drift=1e6 * i
+                ) + 1e-4 * rng.random(v.size)
+        phase_space = pic_thomson.from_arrays(
+            f=f, v=v, x=np.linspace(0, 1e-3, 6), t=np.arange(3.0), label="e-"
+        )
+        settings = {
+            "smoothing_window": 9,
+            "smoothing_iterations": 2,
+            "max_taper_bins": 20,
+            "velocity_scale_factor": 9.0,
+            "pedestal_warning": None,
+        }
+        target = phase_space.x[4]
+
+        reduce_then_condition = pic_thomson.condition_phase_space(
+            phase_space.at_position(target), **settings
+        )
+        condition_then_reduce = pic_thomson.condition_phase_space(
+            phase_space, **settings
+        ).at_position(target)
+
+        np.testing.assert_array_equal(reduce_then_condition.f, condition_then_reduce.f)
+        np.testing.assert_array_equal(reduce_then_condition.v, condition_then_reduce.v)
+
+    def test_rejects_out_of_bounds(self):
+        with pytest.raises(ValueError, match="outside the spatial axis"):
+            simple_phase_space().at_position(1.0 * u.m)

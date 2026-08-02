@@ -171,6 +171,34 @@ class PICPhaseSpace:
         index = int(np.argmin(np.abs(self.x - position)))
         return index, self.f[:, :, index]
 
+    def at_position(self, position: float) -> "PICPhaseSpace":
+        """
+        Return a copy reduced to the single grid point nearest *position*.
+
+        Conditioning acts independently on each ``(time, position)`` slice, so
+        reducing before conditioning gives identical results to reducing after,
+        at a fraction of the memory. That matters: a velocity rescale oversamples
+        the velocity axis, and carrying every unused spatial cell through it can
+        turn a few gigabytes into a hundred.
+
+        Parameters
+        ----------
+        position : `float` or `~astropy.units.Quantity`
+            Position along `x`, in m if given as a bare float.
+
+        Returns
+        -------
+        `PICPhaseSpace`
+            A new phase space with ``n_x == 1``.
+        """
+        index, f_slice = self.slice_position(position)
+        return replace(
+            self,
+            f=np.ascontiguousarray(f_slice[:, :, np.newaxis]),
+            x=self.x[index : index + 1],
+            meta={**self.meta, "sampled_index": index, "sampled_position": position},
+        )
+
     def __repr__(self) -> str:
         """Summarise the species and the phase-space dimensions."""
         n_time, n_v, n_x = self.f.shape
@@ -1017,15 +1045,18 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
             f"reference_density must be positive; got {reference_density} m^-3."
         )
 
+    # Reduce every species to the sampled point first. Conditioning acts
+    # independently on each (time, position) slice, so this is equivalent to
+    # conditioning the whole block and slicing afterwards -- but it avoids
+    # carrying every unused spatial cell through a velocity rescale that
+    # oversamples the velocity axis.
+    sampled = {id(ps): ps.at_position(position) for ps in all_species}
+
     # --- population densities and fractions, from the RAW phase space ---
-    indices = {}
-    densities = {}
-    for phase_space in all_species:
-        index, _ = phase_space.slice_position(position)
-        indices[id(phase_space)] = index
-        densities[id(phase_space)] = (
-            number_density(phase_space.f, phase_space.v)[:, index] * reference_density
-        )
+    densities = {
+        key: number_density(ps.f, ps.v)[:, 0] * reference_density
+        for key, ps in sampled.items()
+    }
 
     e_densities = np.stack([densities[id(ps)] for ps in electrons])
     i_densities = np.stack([densities[id(ps)] for ps in ions])
@@ -1057,8 +1088,10 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
             for phase_space in phase_spaces
         ]
 
-    electrons_c = _condition(electrons, electron_conditioning)
-    ions_c = _condition(ions, ion_conditioning)
+    electrons_c = _condition(
+        [sampled[id(ps)] for ps in electrons], electron_conditioning
+    )
+    ions_c = _condition([sampled[id(ps)] for ps in ions], ion_conditioning)
 
     # --- wavelength windows ---
     epw_wavelengths = u.Quantity(epw_wavelengths, u.nm)
@@ -1098,14 +1131,8 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
 
         e_axes = [electrons_c[k].v for k in selected_e] * u.m / u.s
         i_axes = [ions_c[k].v for k in selected_i] * u.m / u.s
-        efn = (
-            [electrons_c[k].f[step, :, indices[id(electrons[k])]] for k in selected_e]
-            * u.s
-            / u.m
-        )
-        ifn = (
-            [ions_c[k].f[step, :, indices[id(ions[k])]] for k in selected_i] * u.s / u.m
-        )
+        efn = [electrons_c[k].f[step, :, 0] for k in selected_e] * u.s / u.m
+        ifn = [ions_c[k].f[step, :, 0] for k in selected_i] * u.s / u.m
         ion_labels_step = [ions[k].label for k in selected_i]
 
         common = {

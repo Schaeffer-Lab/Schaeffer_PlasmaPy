@@ -552,19 +552,90 @@ warnings), and the pedestal check ignores cells carrying under 1 % of the peak
 weight (an almost-empty vacuum cell has near-zero width, so any taper multiplies
 it enormously — it was reporting 14 575 093 %).
 
-4. End-to-end OSIRIS run vs. the existing `spectra.hdf5`.
+4. ✅ **Done.** End-to-end run on `omegashock_w3.5e11_exp`, all 513 dumps, at
+   x = 5.00 mm. Driven by `tools/pic_thomson_osiris_comparison.py`, which runs the
+   pipeline twice — `legacy` reproducing the old behaviour, `corrected` with the
+   taper bounded — and writes `media/07_osiris_end_to_end.png`.
 
-   **Open before this step:** the figures label both `cham` and `targ` as
-   `"Al 13+"` as a placeholder. The deck gives `cham` rqm 69 and `targ` rqm 68,
-   which are different species — the chamber gas and the target material. The real
-   labels are needed, since the forward model takes `Z` and mass from them, and
-   `ifract`/`zbar` depend on `Z`.
+   **No old-pipeline output exists for this run**, so the numerical regression
+   against a `spectra.hdf5` was not possible here. The only such file,
+   `osiris2thomson/spectra.hdf5`, came from a *different* run
+   (`omegashock_w3e12_rqm100_dx0`, n₀ = 1.83e18, 52 dumps at stride 10, sampled
+   3 mm into a 4.7 mm domain, `ion_rqms=[74, 68]`, both ions labelled `"p"`). The
+   script takes `--reference` and all of those as options, so that comparison can
+   still be run against `~/osiris2thomson/MS` whenever it is wanted.
 
-   Also worth investigating: at late times the sampled point reaches α ≈ 16, where
-   the EPW satellites become faint relative to the ion feature and the
-   per-window area normalisation lets the central line dominate the spectrogram.
-   That looks like correct physics for the collective regime rather than a defect,
-   but it should be confirmed against the old output.
+   **The physics validation that replaces it is stronger than the regression would
+   have been.** The EPW satellite must sit at the plasma frequency plus a
+   Bohm-Gross excess, and the size of that excess is fixed by α, which the forward
+   model reports independently:
+
+   | quantity | value |
+   |---|---|
+   | observed EPW shift / bare `ω_pe` shift, median over 513 steps | **1.291** |
+   | `√(1 + 3k²λ_De²)` from the reported α | **1.262** |
+
+   Agreement to 2.3%, over the whole run, validating the entire chain: reader unit
+   conversions, the `γ³/c` Jacobian, conditioning, and the forward model. Getting
+   this required excluding timesteps where the satellite falls inside the notch —
+   with the old config's wide `[525, 540]` notch the "peak" is just the notch edge
+   and the ratio reads a meaningless 1.579. At n₀ = 9e17 the satellites sit only
+   ±8 nm from the probe line, so the notch must be narrower; `[530, 534]` is used.
+
+   **What bounding the taper changes, on real data:**
+
+   | metric | legacy (unbounded) | corrected (bounded) |
+   |---|---|---|
+   | α, median | 1.685 | **3.182** |
+   | α, range | 1.61 – 10.28 | 1.89 – 15.38 |
+
+   The two configurations differ from each other by a median L1 of **0.900** in
+   the EPW window and **0.794** in the IAW window.
+
+   α is a factor **1.888** too small in the legacy configuration — the direct
+   consequence of the inflated `vTe` (§3a), since α ∝ 1/`vTe`. For scale, the
+   analytic-Maxwellian agreement in step 1 was L1 = 0.032; an L1 of 0.9 between
+   legacy and corrected means the two spectrograms are essentially unrelated. The
+   figure shows it plainly: the legacy panels are speckled, and after t = 0.5 ns
+   the legacy EPW smears into a noisy 480–580 nm band while the corrected
+   satellites stay coherent.
+
+   **Conclusion: spectra produced by the old pipeline should be regenerated.**
+   Between the ion-normalisation bug (§5.2, factor 10 on `χ_i`), the unbounded
+   taper (§3a, `vTe` inflated 67%, ion widths by up to 40×), and the missing
+   Jacobian, the differences are not refinements.
+
+### 4a. A performance fix the full run forced
+
+Conditioning the whole `(n_time, n_v, n_x)` block and slicing afterwards peaked at
+**88 GB** of RSS on this run and had to be killed: `velocity_scale_factor` oversamples
+the velocity axis eightfold, making each conditioned species
+513 × 8192 × 512 × 8 B ≈ 17 GB, of which only one spatial column is ever used.
+
+Every conditioning step acts independently on each `(time, position)` slice, so the
+driver now reduces to the sampled point *first*, via `PICPhaseSpace.at_position`.
+A test asserts the two orderings give bit-identical results. The full run now
+completes comfortably.
+
+### 4b. Ion species — still open, and it matters
+
+The deck's `rqm` and `rqm_factor` pin down A/Z for each ion, and the placeholder
+`"p+"` is wrong:
+
+| species | deck rqm | implied A/Z (R = 50) | `"p+"` gives | fully-stripped low-Z gives |
+|---|---|---|---|---|
+| `cham` | 69 | 1.88 | 1.00 | ~1.99 (He²⁺, C⁶⁺, N⁷⁺, O⁸⁺, Si¹⁴⁺ all within 1%) |
+| `targ` | 68 | 1.85 | 1.00 | ~1.99 |
+
+So the ions are almost certainly a **fully-stripped low-Z species, not protons**.
+`"p+"` makes the ion mass a factor ~2 too light, widening the IAW feature by
+√2 ≈ 1.41 and shifting the ion-acoustic velocity by the same factor. The residual
+6% between the implied 1.88 and the ~1.99 of a real low-Z ion corresponds to
+`rqm_factor ≈ 53` rather than exactly 50, so that is worth checking too.
+
+`tools/pic_thomson_osiris_comparison.py --ion-rqm` prints this check and flags a
+mismatch, so it cannot be forgotten. **The actual `cham` and `targ` species are
+needed before the IAW output means anything.**
 5. WarpX reader + caching.
 6. End-to-end WarpX run; cross-code comparison.
 7. HDF5 writer, plotting, instrument response.
