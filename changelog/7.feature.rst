@@ -30,3 +30,6 @@ path was validated against a 51-frame shock simulation whose low density puts it
 in the non-collective regime, where the spectrum reduces to the electron
 distribution read through the Doppler map and the pipeline reproduces that limit
 to a normalised L1 difference of 0.0000.
+`~plasmapy.diagnostics.pic_thomson.ThomsonSpectrogram` can degrade itself to an
+instrument's temporal and spectral resolution, write itself to a self-describing
+HDF5 file and read itself back, and plot itself.

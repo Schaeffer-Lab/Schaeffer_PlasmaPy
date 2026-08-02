@@ -4,12 +4,14 @@ Tests for the PIC -> Thomson scattering pipeline in
 """
 
 import warnings
+from dataclasses import replace
 
 import astropy.constants as const
 import astropy.units as u
 import h5py
 import numpy as np
 import pytest
+from scipy.ndimage import gaussian_filter
 
 from plasmapy.diagnostics import pic_thomson, thomson
 
@@ -1896,3 +1898,265 @@ class TestWarpxReader:
         np.testing.assert_allclose(
             spectrogram.electron_density, WARPX_DENSITY, rtol=0.05
         )
+
+
+# ---------------------------------------------------------------------------
+# 12. Instrument response, HDF5 output, plotting
+# ---------------------------------------------------------------------------
+
+
+def synthetic_spectrogram(n_time=41, n_epw=64, n_iaw=32, gap=None):
+    """A `ThomsonSpectrogram` with known structure, built without the driver."""
+    epw_wavelengths = np.linspace(480e-9, 590e-9, n_epw)
+    iaw_wavelengths = np.linspace(528e-9, 536e-9, n_iaw)
+    t = np.linspace(0.0, 4e-9, n_time)
+
+    epw = np.zeros((n_time, n_epw))
+    iaw = np.zeros((n_time, n_iaw))
+    for step in range(n_time):
+        centre = 532e-9 + 20e-9 * (step / (n_time - 1) - 0.5)
+        epw[step] = np.exp(-(((epw_wavelengths - centre) / 4e-9) ** 2))
+        epw[step] /= np.trapezoid(epw[step], epw_wavelengths)
+        iaw[step] = np.exp(-(((iaw_wavelengths - 532e-9) / 0.7e-9) ** 2))
+        iaw[step] /= np.trapezoid(iaw[step], iaw_wavelengths)
+
+    present_e = np.ones((1, n_time), dtype=bool)
+    present_i = np.ones((2, n_time), dtype=bool)
+    if gap is not None:
+        epw[gap] = np.nan
+        iaw[gap] = np.nan
+        present_e[:, gap] = False
+        present_i[:, gap] = False
+
+    return pic_thomson.ThomsonSpectrogram(
+        epw=epw,
+        epw_wavelengths=epw_wavelengths,
+        iaw=iaw,
+        iaw_wavelengths=iaw_wavelengths,
+        t=t,
+        alpha_epw=np.linspace(1.0, 3.0, n_time),
+        alpha_iaw=np.linspace(1.0, 3.0, n_time),
+        electron_density=np.full(n_time, 5e24),
+        efract=np.ones((1, n_time)),
+        ifract=np.vstack([np.full(n_time, 0.7), np.full(n_time, 0.3)]),
+        electron_present=present_e,
+        ion_present=present_i,
+        position=1.5e-3,
+        electron_labels=["e-"],
+        ion_labels=["p+", "Al 13+"],
+        meta={"reference_density": 5e24, "probe_vec": [1.0, 0.0, 0.0]},
+    )
+
+
+class TestInstrumentResponse:
+    def test_broadens_the_spectral_feature(self):
+        spectrogram = synthetic_spectrogram()
+
+        def width(row, axis):
+            total = np.trapezoid(row, axis)
+            mean = np.trapezoid(row * axis, axis) / total
+            return np.sqrt(np.trapezoid(row * (axis - mean) ** 2, axis) / total)
+
+        before = width(spectrogram.epw[20], spectrogram.epw_wavelengths)
+        degraded = spectrogram.apply_instrument_response(epw_wavelength_fwhm=6 * u.nm)
+        after = width(degraded.epw[20], degraded.epw_wavelengths)
+
+        # Gaussians add in quadrature: sqrt(before^2 + sigma_instrument^2).
+        sigma_instrument = (6e-9) / pic_thomson.FWHM_PER_SIGMA
+        np.testing.assert_allclose(after, np.hypot(before, sigma_instrument), rtol=0.02)
+
+    def test_time_smoothing_suppresses_a_moving_feature(self):
+        """A feature that sweeps in wavelength is blurred by a long gate."""
+        spectrogram = synthetic_spectrogram()
+        degraded = spectrogram.apply_instrument_response(time_fwhm=1 * u.ns)
+        assert degraded.epw[20].max() < spectrogram.epw[20].max()
+
+    def test_leaves_the_input_untouched(self):
+        spectrogram = synthetic_spectrogram()
+        before = spectrogram.epw.copy()
+        spectrogram.apply_instrument_response(time_fwhm=1 * u.ns)
+        np.testing.assert_array_equal(spectrogram.epw, before)
+
+    def test_a_gap_does_not_destroy_its_neighbours(self):
+        """
+        A vacuum timestep must not spread NaN over every row the kernel
+        touches, which is what a plain filter does.
+        """
+        spectrogram = synthetic_spectrogram(gap=slice(18, 23))
+        degraded = spectrogram.apply_instrument_response(time_fwhm=0.4 * u.ns)
+
+        naive = gaussian_filter(spectrogram.epw, sigma=(2.0, 0.0), mode="nearest")
+        assert np.isnan(naive).sum() > np.isnan(spectrogram.epw).sum()
+        assert np.isnan(degraded.epw).sum() <= np.isnan(spectrogram.epw).sum()
+
+        # Rows away from the gap stay finite and normalised.
+        assert np.all(np.isfinite(degraded.epw[0]))
+        np.testing.assert_allclose(
+            np.trapezoid(degraded.epw[0], degraded.epw_wavelengths), 1.0, rtol=0.05
+        )
+
+    def test_a_narrow_gap_is_filled_from_its_neighbours(self):
+        """
+        Within the kernel's reach a gap is filled, because that is what an
+        instrument integrating over a finite gate actually does.
+        """
+        spectrogram = synthetic_spectrogram(gap=slice(20, 21))
+        degraded = spectrogram.apply_instrument_response(time_fwhm=0.5 * u.ns)
+        assert np.all(np.isfinite(degraded.epw[20]))
+
+    def test_a_gap_wider_than_the_kernel_stays_empty(self):
+        spectrogram = synthetic_spectrogram(gap=slice(10, 31))
+        degraded = spectrogram.apply_instrument_response(time_fwhm=0.2 * u.ns)
+        assert np.all(np.isnan(degraded.epw[20]))
+        assert np.all(np.isfinite(degraded.epw[0]))
+
+    def test_boxcar_kernel(self):
+        spectrogram = synthetic_spectrogram()
+        degraded = spectrogram.apply_instrument_response(
+            epw_wavelength_fwhm=6 * u.nm, kernel="boxcar"
+        )
+        assert degraded.epw[20].max() < spectrogram.epw[20].max()
+
+    def test_rejects_an_unknown_kernel(self):
+        with pytest.raises(ValueError, match="must be 'gaussian' or 'boxcar'"):
+            synthetic_spectrogram().apply_instrument_response(
+                time_fwhm=1 * u.ns, kernel="triangle"
+            )
+
+    def test_records_the_settings(self):
+        degraded = synthetic_spectrogram().apply_instrument_response(
+            time_fwhm=100 * u.ps, epw_wavelength_fwhm=0.5 * u.nm
+        )
+        response = degraded.meta["instrument_response"]
+        assert response["time_fwhm_s"] == pytest.approx(1e-10)
+        assert response["epw_wavelength_fwhm_m"] == pytest.approx(0.5e-9)
+        assert response["iaw_wavelength_fwhm_m"] is None
+
+    def test_no_widths_is_a_no_op(self):
+        spectrogram = synthetic_spectrogram()
+        degraded = spectrogram.apply_instrument_response()
+        np.testing.assert_allclose(degraded.epw, spectrogram.epw, rtol=1e-12)
+
+    def test_handles_a_spectrogram_without_an_iaw_window(self):
+        spectrogram = replace(synthetic_spectrogram(), iaw=None, iaw_wavelengths=None)
+        degraded = spectrogram.apply_instrument_response(time_fwhm=1 * u.ns)
+        assert degraded.iaw is None
+
+
+class TestHDF5RoundTrip:
+    def test_round_trip(self, tmp_path):
+        spectrogram = synthetic_spectrogram(gap=slice(5, 8))
+        path = tmp_path / "spectra.h5"
+        spectrogram.to_hdf5(path)
+        restored = pic_thomson.ThomsonSpectrogram.from_hdf5(path)
+
+        for name in (
+            "epw",
+            "iaw",
+            "epw_wavelengths",
+            "iaw_wavelengths",
+            "t",
+            "alpha_epw",
+            "alpha_iaw",
+            "electron_density",
+            "efract",
+            "ifract",
+            "electron_present",
+            "ion_present",
+        ):
+            np.testing.assert_array_equal(
+                getattr(restored, name), getattr(spectrogram, name), err_msg=name
+            )
+        assert restored.position == pytest.approx(spectrogram.position)
+        assert restored.electron_labels == spectrogram.electron_labels
+        assert restored.ion_labels == spectrogram.ion_labels
+        assert restored.meta["reference_density"] == 5e24
+
+    def test_round_trip_without_an_iaw_window(self, tmp_path):
+        spectrogram = replace(
+            synthetic_spectrogram(), iaw=None, iaw_wavelengths=None, alpha_iaw=None
+        )
+        path = tmp_path / "spectra.h5"
+        spectrogram.to_hdf5(path)
+        restored = pic_thomson.ThomsonSpectrogram.from_hdf5(path)
+        assert restored.iaw is None
+        assert restored.iaw_wavelengths is None
+        assert restored.alpha_iaw is None
+        np.testing.assert_array_equal(restored.epw, spectrogram.epw)
+
+    def test_units_are_recorded(self, tmp_path):
+        path = tmp_path / "spectra.h5"
+        synthetic_spectrogram().to_hdf5(path)
+        with h5py.File(path, "r") as handle:
+            assert handle["DENSITY/dens"].attrs["UNITS"] == "m^-3"
+            assert handle["AXES/TIME_AXES/time"].attrs["UNITS"] == "s"
+            assert handle["AXES/WAVELENGTH_AXES/epw_wavelengths"].attrs["UNITS"] == "m"
+            assert handle.attrs["POSITION_UNITS"] == "m"
+            # The per-row normalisation is easy to forget; it is on the file.
+            assert "unit area" in handle.attrs["NORMALISATION"]
+            assert (
+                "lambda_De"
+                in (
+                    handle["SPECTRA/SCATTERING_PARAMETERS/alpha_epw"].attrs[
+                        "CONVENTION"
+                    ]
+                )
+            )
+
+    def test_species_labels_with_awkward_characters(self, tmp_path):
+        """Labels like 'Al 13+' must survive, spaces and plus signs included."""
+        path = tmp_path / "spectra.h5"
+        synthetic_spectrogram().to_hdf5(path)
+        restored = pic_thomson.ThomsonSpectrogram.from_hdf5(path)
+        assert restored.ion_labels == ["p+", "Al 13+"]
+
+    def test_overwrites_an_existing_file(self, tmp_path):
+        path = tmp_path / "spectra.h5"
+        synthetic_spectrogram(n_time=41).to_hdf5(path)
+        synthetic_spectrogram(n_time=11).to_hdf5(path)
+        assert pic_thomson.ThomsonSpectrogram.from_hdf5(path).n_time == 11
+
+
+class TestPlot:
+    def test_returns_a_figure(self):
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg")
+        figure, axes = synthetic_spectrogram().plot()
+        assert axes.shape == (2, 2)
+        matplotlib.pyplot.close(figure)
+
+    def test_writes_a_file(self, tmp_path):
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg")
+        path = tmp_path / "spectra.png"
+        figure, _ = synthetic_spectrogram().plot(save=path)
+        assert path.is_file()
+        matplotlib.pyplot.close(figure)
+
+    def test_copes_without_an_iaw_window(self):
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg")
+        spectrogram = replace(synthetic_spectrogram(), iaw=None, iaw_wavelengths=None)
+        figure, _ = spectrogram.plot()
+        matplotlib.pyplot.close(figure)
+
+    def test_copes_with_all_nan_rows(self):
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg")
+        figure, _ = synthetic_spectrogram(gap=slice(0, 10)).plot()
+        matplotlib.pyplot.close(figure)
+
+    def test_repeated_species_labels_are_numbered_in_the_legend(self):
+        """
+        Two populations of the same species are legitimate -- an ambient and a
+        piston plasma of the same element -- but two identically named legend
+        entries are not.
+        """
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg")
+        spectrogram = replace(synthetic_spectrogram(), ion_labels=["p+", "p+"])
+        figure, axes = spectrogram.plot()
+        labels = [text.get_text() for text in axes[1][1].get_legend().get_texts()]
+        assert "ifract p+ #1" in labels
+        assert "ifract p+ #2" in labels
+        matplotlib.pyplot.close(figure)

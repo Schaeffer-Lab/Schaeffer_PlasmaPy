@@ -52,6 +52,7 @@ __all__ = [
     "taper_vdf_edges",
 ]
 
+import json
 import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -60,9 +61,10 @@ from typing import Any
 import astropy.constants as const
 import astropy.units as u
 import h5py
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.interpolate import interp1d
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import gaussian_filter, uniform_filter, uniform_filter1d
 from tqdm import tqdm
 
 # Imported from the submodule rather than the package so that this module can be
@@ -771,6 +773,24 @@ def condition_phase_space(
 # ---------------------------------------------------------------------------
 
 
+def _distinct(labels: list[str]) -> list[str]:
+    """
+    Number repeated labels, for legends.
+
+    Two populations of the same species are perfectly legitimate -- an ambient
+    and a piston plasma of the same element, say -- but plotting two lines with
+    the same name is not.
+    """
+    if len(set(labels)) == len(labels):
+        return list(labels)
+    seen: dict[str, int] = {}
+    out = []
+    for label in labels:
+        seen[label] = seen.get(label, 0) + 1
+        out.append(f"{label} #{seen[label]}")
+    return out
+
+
 @dataclass(frozen=True)
 class ThomsonSpectrogram:
     r"""
@@ -847,6 +867,316 @@ class ThomsonSpectrogram:
     def n_time(self) -> int:
         """Number of timesteps."""
         return self.t.size
+
+    def apply_instrument_response(
+        self,
+        *,
+        time_fwhm=None,
+        epw_wavelength_fwhm=None,
+        iaw_wavelength_fwhm=None,
+        kernel: str = "gaussian",
+    ) -> "ThomsonSpectrogram":
+        r"""
+        Blur the spectrogram to the resolution of a real instrument.
+
+        A streak camera integrates over a finite gate and a spectrometer over a
+        finite slit width, so a synthetic spectrogram compared against measured
+        data has to be degraded to match. Widths are given as the full width at
+        half maximum of the instrument function, in physical units, and
+        converted to bins from the spectrogram's own axes.
+
+        Parameters
+        ----------
+        time_fwhm : `~astropy.units.Quantity`, optional
+            Temporal resolution, in s if given as a bare float. A streak camera
+            might be 100 ps.
+        epw_wavelength_fwhm, iaw_wavelength_fwhm : `~astropy.units.Quantity`, optional
+            Spectral resolution of each window, in m if given as a bare float.
+            The two windows usually have very different dispersion, so they take
+            separate values.
+        kernel : ``'gaussian'`` or ``'boxcar'``
+            Shape of the instrument function.
+
+        Returns
+        -------
+        `ThomsonSpectrogram`
+            A new spectrogram; the original is unchanged.
+
+        Notes
+        -----
+        Timesteps with no plasma are `~numpy.nan`. They are left out of the
+        average rather than spread over their neighbours, so a gap cannot
+        destroy the data around it. A gap narrower than the instrument function
+        is filled from the valid data either side, as a real instrument
+        integrating over a finite gate would; a gap wider than the kernel's
+        reach stays `~numpy.nan`.
+
+        Each row of the input was normalised to unit area over its own window by
+        the forward model. Smoothing in time mixes rows and does not preserve
+        that, which is correct -- a real instrument integrates counts, it does
+        not renormalise each gate.
+
+        Examples
+        --------
+        .. code-block:: python
+
+           degraded = spectra.apply_instrument_response(
+               time_fwhm=100 * u.ps,
+               epw_wavelength_fwhm=0.5 * u.nm,
+               iaw_wavelength_fwhm=0.05 * u.nm,
+           )
+        """
+        time_sigma = _sigma_in_bins(time_fwhm, self.t, u.s)
+
+        epw = _smooth_preserving_gaps(
+            self.epw,
+            (
+                time_sigma,
+                _sigma_in_bins(epw_wavelength_fwhm, self.epw_wavelengths, u.m),
+            ),
+            kernel,
+        )
+        iaw = self.iaw
+        if iaw is not None and self.iaw_wavelengths is not None:
+            iaw = _smooth_preserving_gaps(
+                iaw,
+                (
+                    time_sigma,
+                    _sigma_in_bins(iaw_wavelength_fwhm, self.iaw_wavelengths, u.m),
+                ),
+                kernel,
+            )
+
+        return replace(
+            self,
+            epw=epw,
+            iaw=iaw,
+            meta={
+                **self.meta,
+                "instrument_response": {
+                    "time_fwhm_s": None
+                    if time_fwhm is None
+                    else float(_si_values(time_fwhm, u.s)),
+                    "epw_wavelength_fwhm_m": None
+                    if epw_wavelength_fwhm is None
+                    else float(_si_values(epw_wavelength_fwhm, u.m)),
+                    "iaw_wavelength_fwhm_m": None
+                    if iaw_wavelength_fwhm is None
+                    else float(_si_values(iaw_wavelength_fwhm, u.m)),
+                    "kernel": kernel,
+                },
+            },
+        )
+
+    def to_hdf5(self, path) -> None:
+        r"""
+        Write the spectrogram to a self-describing HDF5 file.
+
+        Every dataset carries a ``UNITS`` attribute and everything is SI, so the
+        file can be read without knowing how it was produced. `from_hdf5` reads
+        it back.
+
+        Parameters
+        ----------
+        path : path-like
+            Destination file, overwritten if it exists.
+
+        Notes
+        -----
+        The group names follow the ``osiris2thomson`` layout where the contents
+        line up -- ``SPECTRA/EPW/epws``, ``SPECTRA/IAW/iaws``,
+        ``SPECTRA/SCATTERING_PARAMETERS``, ``DENSITY/dens``, ``AXES`` -- but this
+        is **not** a drop-in replacement for files that pipeline wrote. It has no
+        ``TEMPERATURE``, ``FLOW_VELOCITY``, ``PERPENDICULAR_MAGNETIC_FIELD`` or
+        ``VDF`` groups, since this module does not compute those, and its axes
+        are in SI rather than in simulation units.
+        """
+        path = Path(path)
+        with h5py.File(path, "w") as handle:
+            spectra = handle.create_group("SPECTRA")
+
+            epw = spectra.create_group("EPW")
+            epw.create_dataset("epws", data=self.epw)
+            axis = epw.create_dataset("wavelengths", data=self.epw_wavelengths)
+            axis.attrs["UNITS"] = "m"
+            if self.iaw is not None:
+                iaw = spectra.create_group("IAW")
+                iaw.create_dataset("iaws", data=self.iaw)
+                axis = iaw.create_dataset("wavelengths", data=self.iaw_wavelengths)
+                axis.attrs["UNITS"] = "m"
+
+            alpha = spectra.create_group("SCATTERING_PARAMETERS")
+            entry = alpha.create_dataset("alpha_epw", data=self.alpha_epw)
+            entry.attrs["CONVENTION"] = (
+                "sqrt(2) * wpe / (k * sigma), i.e. sqrt(2) times 1 / (k * lambda_De)"
+            )
+            if self.alpha_iaw is not None:
+                alpha.create_dataset("alpha_iaw", data=self.alpha_iaw)
+
+            density = handle.create_group("DENSITY")
+            entry = density.create_dataset("dens", data=self.electron_density)
+            entry.attrs["UNITS"] = "m^-3"
+
+            populations = handle.create_group("POPULATIONS")
+            populations.create_dataset("efract", data=self.efract)
+            populations.create_dataset("ifract", data=self.ifract)
+            populations.create_dataset("electron_present", data=self.electron_present)
+            populations.create_dataset("ion_present", data=self.ion_present)
+            populations.create_dataset(
+                "electron_labels",
+                data=np.array(self.electron_labels, dtype=h5py.string_dtype()),
+            )
+            populations.create_dataset(
+                "ion_labels",
+                data=np.array(self.ion_labels, dtype=h5py.string_dtype()),
+            )
+
+            axes = handle.create_group("AXES")
+            times = axes.create_group("TIME_AXES")
+            entry = times.create_dataset("time", data=self.t)
+            entry.attrs["UNITS"] = "s"
+            wavelengths = axes.create_group("WAVELENGTH_AXES")
+            entry = wavelengths.create_dataset(
+                "epw_wavelengths", data=self.epw_wavelengths
+            )
+            entry.attrs["UNITS"] = "m"
+            if self.iaw_wavelengths is not None:
+                entry = wavelengths.create_dataset(
+                    "iaw_wavelengths", data=self.iaw_wavelengths
+                )
+                entry.attrs["UNITS"] = "m"
+
+            handle.attrs["POSITION"] = self.position
+            handle.attrs["POSITION_UNITS"] = "m"
+            handle.attrs["NORMALISATION"] = (
+                "each row is normalised to unit area over its own window, so the "
+                "spectra carry shape only -- no absolute intensity and no "
+                "meaningful EPW-to-IAW ratio"
+            )
+            handle.attrs["META"] = json.dumps(self.meta, default=str)
+
+    @classmethod
+    def from_hdf5(cls, path) -> "ThomsonSpectrogram":
+        """
+        Read a spectrogram written by `to_hdf5`.
+
+        Parameters
+        ----------
+        path : path-like
+            File to read.
+
+        Returns
+        -------
+        `ThomsonSpectrogram`
+        """
+
+        def decode(values):
+            return [
+                value.decode() if isinstance(value, bytes) else str(value)
+                for value in values
+            ]
+
+        with h5py.File(Path(path), "r") as handle:
+            spectra = handle["SPECTRA"]
+            populations = handle["POPULATIONS"]
+            has_iaw = "IAW" in spectra
+            return cls(
+                epw=spectra["EPW/epws"][()],
+                epw_wavelengths=spectra["EPW/wavelengths"][()],
+                iaw=spectra["IAW/iaws"][()] if has_iaw else None,
+                iaw_wavelengths=spectra["IAW/wavelengths"][()] if has_iaw else None,
+                t=handle["AXES/TIME_AXES/time"][()],
+                alpha_epw=spectra["SCATTERING_PARAMETERS/alpha_epw"][()],
+                alpha_iaw=(
+                    spectra["SCATTERING_PARAMETERS/alpha_iaw"][()] if has_iaw else None
+                ),
+                electron_density=handle["DENSITY/dens"][()],
+                efract=populations["efract"][()],
+                ifract=populations["ifract"][()],
+                electron_present=populations["electron_present"][()],
+                ion_present=populations["ion_present"][()],
+                position=float(handle.attrs["POSITION"]),
+                electron_labels=decode(populations["electron_labels"][()]),
+                ion_labels=decode(populations["ion_labels"][()]),
+                meta=json.loads(handle.attrs.get("META", "{}")),
+            )
+
+    def plot(self, *, figsize=None, save=None):
+        """
+        Draw the spectrogram alongside the quantities needed to read it.
+
+        Parameters
+        ----------
+        figsize : pair of `float`, optional
+            Figure size in inches.
+        save : path-like, optional
+            Write the figure here as well as returning it.
+
+        Returns
+        -------
+        figure : `~matplotlib.figure.Figure`
+        axes : `~numpy.ndarray` of `~matplotlib.axes.Axes`
+
+        Notes
+        -----
+        The colour scale is clipped at the 99th percentile, because a single
+        timestep near an electron-plasma-wave resonance can otherwise dominate
+        the whole spectrogram.
+        """
+        windows = [("EPW", self.epw, self.epw_wavelengths)]
+        if self.iaw is not None and self.iaw_wavelengths is not None:
+            windows.append(("IAW", self.iaw, self.iaw_wavelengths))
+
+        columns = max(len(windows), 2)
+        figure, axes = plt.subplots(
+            2, columns, figsize=figsize or (5.6 * columns, 8), squeeze=False
+        )
+        time_ns = self.t * 1e9
+
+        for column, (name, data, axis) in enumerate(windows):
+            finite = data[np.isfinite(data).all(axis=1)]
+            image = axes[0][column].imshow(
+                data.T,
+                origin="lower",
+                aspect="auto",
+                extent=[time_ns[0], time_ns[-1], axis[0] * 1e9, axis[-1] * 1e9],
+                cmap="inferno",
+                vmax=np.percentile(finite, 99) if finite.size else None,
+            )
+            figure.colorbar(image, ax=axes[0][column], label="area-normalised")
+            axes[0][column].set_title(
+                f"{name} spectrogram at x = {self.position * 1e3:.2f} mm", fontsize=10
+            )
+            axes[0][column].set_xlabel("time (ns)")
+            axes[0][column].set_ylabel("wavelength (nm)")
+        for column in range(len(windows), columns):
+            axes[0][column].axis("off")
+
+        axes[1][0].semilogy(time_ns, self.electron_density * 1e-6, lw=1.3)
+        axes[1][0].set_xlabel("time (ns)")
+        axes[1][0].set_ylabel(r"$n_e$ (cm$^{-3}$)")
+        axes[1][0].set_title("electron density", fontsize=10)
+
+        axes[1][1].plot(time_ns, self.alpha_epw, lw=1.3, label=r"$\alpha$")
+        for row, label in enumerate(_distinct(self.ion_labels)):
+            axes[1][1].plot(
+                time_ns, self.ifract[row], lw=1.0, ls="--", label=f"ifract {label}"
+            )
+        if len(self.electron_labels) > 1:
+            for row, label in enumerate(_distinct(self.electron_labels)):
+                axes[1][1].plot(
+                    time_ns, self.efract[row], lw=1.0, ls=":", label=f"efract {label}"
+                )
+        axes[1][1].set_xlabel("time (ns)")
+        axes[1][1].set_title("scattering parameter and populations", fontsize=10)
+        axes[1][1].legend(fontsize=7)
+        for column in range(2, columns):
+            axes[1][column].axis("off")
+
+        figure.tight_layout()
+        if save is not None:
+            figure.savefig(save, dpi=140, bbox_inches="tight")
+        return figure, axes
 
     def __repr__(self) -> str:
         """Summarise the species, sampling point, and spectrogram dimensions."""
@@ -1763,3 +2093,61 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
             **settings,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Instrument response, output, and plotting
+# ---------------------------------------------------------------------------
+
+#: Ratio of a Gaussian's full width at half maximum to its standard deviation.
+FWHM_PER_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
+
+def _smooth_preserving_gaps(data, sigmas, kernel: str) -> np.ndarray:
+    """
+    Smooth *data* while leaving `~numpy.nan` gaps out of the average.
+
+    A spectrogram has all-`~numpy.nan` rows wherever no plasma was present, and
+    an ordinary filter would spread those over every point the kernel reaches,
+    destroying good data. Filtering the values and the validity mask separately
+    and then dividing gives the average over the valid samples alone.
+
+    A gap is still *filled* from whatever valid data lies within the kernel's
+    reach, which is what a real instrument integrating over a finite gate would
+    do. Only where the kernel reaches no valid sample at all does the result
+    stay `~numpy.nan`.
+    """
+    data = np.asarray(data, dtype=np.float64)
+    valid = np.isfinite(data)
+    filled = np.where(valid, data, 0.0)
+
+    if kernel == "gaussian":
+        numerator = gaussian_filter(filled, sigma=sigmas, mode="nearest")
+        denominator = gaussian_filter(
+            valid.astype(np.float64), sigma=sigmas, mode="nearest"
+        )
+    elif kernel == "boxcar":
+        sizes = [max(1, round(sigma * FWHM_PER_SIGMA)) for sigma in sigmas]
+        numerator = uniform_filter(filled, size=sizes, mode="nearest")
+        denominator = uniform_filter(
+            valid.astype(np.float64), size=sizes, mode="nearest"
+        )
+    else:
+        raise ValueError(f"kernel must be 'gaussian' or 'boxcar'; got {kernel!r}.")
+
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.full(data.shape, np.nan),
+        where=denominator > 1e-6,
+    )
+
+
+def _sigma_in_bins(fwhm, axis: np.ndarray, unit: u.UnitBase) -> float:
+    """Convert a full width at half maximum into Gaussian sigma, in bins."""
+    if fwhm is None or axis.size < 2:
+        return 0.0
+    spacing = float(np.median(np.abs(np.diff(axis))))
+    if spacing <= 0:
+        return 0.0
+    return float(_si_values(fwhm, unit)) / spacing / FWHM_PER_SIGMA

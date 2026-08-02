@@ -400,6 +400,24 @@ def main() -> None:
     parser.add_argument("--smoothing-iterations", type=int, default=4)
     parser.add_argument("--stride", type=int, default=1, help="read every Nth dump")
     parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="write the corrected spectrogram to this HDF5 file",
+    )
+    parser.add_argument(
+        "--instrument-time-fwhm",
+        type=float,
+        default=None,
+        help="streak-camera temporal resolution in ps; renders a second figure",
+    )
+    parser.add_argument(
+        "--instrument-wavelength-fwhm",
+        type=float,
+        default=None,
+        help="spectrometer resolution in nm",
+    )
+    parser.add_argument(
         "--notch",
         nargs=2,
         type=float,
@@ -441,6 +459,22 @@ def main() -> None:
         results[name] = report(name, spectrograms[name], reference)
 
     check_epw_tracks_density(spectrograms["corrected"], args.notch * u.nm)
+
+    if args.output is not None:
+        spectrograms["corrected"].to_hdf5(args.output)
+        print(f"\n  wrote {args.output}")
+
+    if args.instrument_time_fwhm or args.instrument_wavelength_fwhm:
+        degraded = spectrograms["corrected"].apply_instrument_response(
+            time_fwhm=(args.instrument_time_fwhm or 0.0) * u.ps,
+            epw_wavelength_fwhm=(args.instrument_wavelength_fwhm or 0.0) * u.nm,
+            iaw_wavelength_fwhm=(args.instrument_wavelength_fwhm or 0.0) * u.nm,
+        )
+        MEDIA.mkdir(exist_ok=True)
+        # Not named `figure`: that is the module-level plotting function.
+        rendered, _ = degraded.plot(save=MEDIA / "10_osiris_instrument_response.png")
+        plt.close(rendered)
+        print("  wrote media/10_osiris_instrument_response.png")
 
     epw_nm = EPW_WAVELENGTHS.to_value(u.nm)
     iaw_nm = IAW_WAVELENGTHS.to_value(u.nm)

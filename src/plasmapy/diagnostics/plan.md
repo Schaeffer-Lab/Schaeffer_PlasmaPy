@@ -802,5 +802,59 @@ distribution reaches 0.54 c in sim units, giving a 1σ Doppler width of 403 nm.
 See §5.1: the deck's `mass_ratio = 100` against a real 1836 suggests R = 18.36,
 while the paper's Table I reports `c_sim/c_phys = 0.02`, a factor of 50. These
 disagree and should be reconciled before the WarpX spectra are read as physical.
-7. HDF5 writer, plotting, instrument response.
+7. ✅ **Done.** Instrument response, HDF5 output, plotting. 27 new tests
+   (267 in `tests/diagnostics/` overall, all passing); `ruff` and `ty` clean.
+
+   - **`ThomsonSpectrogram.apply_instrument_response`** degrades a synthetic
+     spectrogram to a real instrument's resolution, taking FWHM values in
+     physical units — `time_fwhm=100*u.ps`, `epw_wavelength_fwhm=0.5*u.nm`,
+     `iaw_wavelength_fwhm=0.05*u.nm` — with a Gaussian or boxcar kernel. The two
+     wavelength windows take separate widths because their dispersions differ by
+     an order of magnitude.
+
+     Because `ThomsonSpectrogram` carries `t` in seconds and wavelengths in
+     metres, the conversion to bins is direct. The old `smooth_spectra` module
+     had to reconstruct it from `ω_p` and the simulation timestep, which is where
+     its hard-coded `dt_sim = 20` came from — a footgun the SI contract removes.
+
+     Gaps are handled properly. A vacuum timestep is `NaN`, and a plain filter
+     spreads that over every point the kernel reaches; filtering values and the
+     validity mask separately and dividing gives the average over valid samples
+     alone. A gap narrower than the instrument function is then *filled* from
+     either side — which is what an instrument integrating over a finite gate
+     really does — while a gap wider than the kernel's reach stays `NaN`. Both
+     branches are tested, as is the contrast with the naive filter.
+
+   - **`to_hdf5` / `from_hdf5`** round-trip the spectrogram. Every dataset carries
+     a `UNITS` attribute, the α convention is recorded on the dataset, and the
+     per-row area normalisation is written into a root attribute so it cannot be
+     forgotten by whoever reads the file later. Verified round-tripping the real
+     129-dump OSIRIS spectrogram.
+
+     Group names follow the `osiris2thomson` layout where the contents line up
+     (`SPECTRA/EPW/epws`, `SPECTRA/IAW/iaws`, `SPECTRA/SCATTERING_PARAMETERS`,
+     `DENSITY/dens`, `AXES`), but this is **not** a drop-in for that pipeline's
+     files: `load_spectra` requires `TEMPERATURE`, `FLOW_VELOCITY` and `VDF`
+     groups this module deliberately does not compute, and the axes here are SI
+     rather than simulation units. Population fractions are stored as 2-D arrays
+     plus a label dataset rather than as `ion_fraction_<name>` datasets, which
+     avoids mangling labels like `"Al 13+"`.
+
+   - **`plot`** draws the spectrogram, density, α and population fractions.
+     Repeated species labels are numbered, since two populations of the same
+     element are legitimate but two identical legend entries are not.
+
+   Both are wired into `tools/pic_thomson_osiris_comparison.py` via `--output`,
+   `--instrument-time-fwhm` and `--instrument-wavelength-fwhm`; the degraded
+   result is `media/10_osiris_instrument_response.png`.
+
+### 7a. Decision: no width-relative taper bound
+
+§3a suggested a taper bound expressed as a fraction of each slice's own width
+rather than a fixed bin count. Not implemented, deliberately. A fixed count
+proved perfectly workable once calibrated per species (20 for electrons, 3 for
+the ions of the OmegaShock run, 20 for WarpX), and the `pedestal_warning` catches
+a bad choice with a number that says how bad. A second, width-relative
+calibration path would add an API mode to document and test for a benefit that
+the measurements do not show.
 8. Changelog entry, docs stub, `uvx pre-commit`, `nox --session ty`.
