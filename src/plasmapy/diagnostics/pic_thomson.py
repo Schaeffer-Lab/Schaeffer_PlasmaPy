@@ -1566,6 +1566,67 @@ def _osiris_axis_layout(handle, ndim: int) -> list[dict[str, Any]]:
     return layout
 
 
+def _slab_indices(values: np.ndarray, centre: float, half_width) -> tuple[int, int]:
+    """
+    Index range of *values* lying within ``centre ± half_width``.
+
+    Falls back to the single nearest cell when *half_width* is `None`, is
+    non-positive, or is too narrow to contain any cell, so a slab always selects
+    something rather than silently emptying the data.
+    """
+    if half_width is not None and half_width > 0:
+        inside = np.nonzero(np.abs(values - centre) <= half_width)[0]
+        if inside.size:
+            return int(inside[0]), int(inside[-1]) + 1
+    index = int(np.argmin(np.abs(values - centre)))
+    return index, index + 1
+
+
+def _transverse_selection(
+    axes: list[dict[str, Any]],
+    positions,
+    reduction: str,
+    half_width,
+) -> dict[int, tuple[int, int]]:
+    r"""
+    Index range to keep along each transverse spatial axis.
+
+    ``"slab"`` keeps a localized region about the requested position, which is
+    what a Thomson scattering volume is. ``"chord"`` keeps the whole extent, for
+    a measurement integrated along that direction.
+
+    In both cases the caller *averages* over the selected cells rather than
+    summing. Summing would turn a density into a line integral and quietly
+    multiply the density handed to the forward model by the number of cells --
+    which is what the ``osiris2thomson`` pipeline did for its ``p1x1x2``
+    diagnostics.
+    """
+    if reduction not in {"slab", "chord"}:
+        raise ValueError(
+            f"transverse_reduction must be 'slab' or 'chord'; got {reduction!r}."
+        )
+
+    positions = dict(positions or {})
+    unknown = set(positions) - {axis["name"] for axis in axes}
+    if unknown:
+        raise ValueError(
+            f"transverse_position names {sorted(unknown)}, which are not "
+            f"transverse axes; available: {[a['name'] for a in axes]}."
+        )
+
+    selection = {}
+    for axis in axes:
+        values = axis["values"]
+        if reduction == "chord":
+            selection[axis["numpy_axis"]] = (0, values.size)
+            continue
+        centre = positions.get(axis["name"])
+        if centre is None:
+            centre = 0.5 * (float(values[0]) + float(values[-1]))
+        selection[axis["numpy_axis"]] = _slab_indices(values, float(centre), half_width)
+    return selection
+
+
 def _osiris_dump_index(filename: str) -> int:
     """Extract the six-digit dump index from an OSIRIS output filename."""
     return int(filename.rsplit("-", 1)[1].split(".", 1)[0])
@@ -1581,6 +1642,10 @@ def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
     is_electron: bool | None = None,
     timesteps=None,
     spatial_axis: str | None = None,
+    transverse_position=None,
+    transverse_reduction: str = "slab",
+    slab_halfwidth=None,
+    position=None,
     charge_weighted: bool = True,
     relativistic_jacobian: bool = True,
     progress: bool = True,
@@ -1614,9 +1679,25 @@ def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
     timesteps : iterable of `int`, optional
         Dump indices to read. The default reads every dump present, in order.
     spatial_axis : `str`, optional
-        Which spatial axis to keep, for example ``"x1"``. Any other spatial axes are
-        summed over -- this is how a ``p1x1x2`` diagnostic is collapsed onto the
-        shock normal. Defaults to the first spatial axis in the file.
+        Which spatial axis to keep, for example ``"x1"``. The others are reduced --
+        this is how a ``p1x1x2`` diagnostic is collapsed onto the shock normal.
+        Defaults to the first spatial axis in the file.
+    transverse_position : `dict`, optional
+        ``{axis_name: coordinate}`` in m, saying where along each *other* spatial
+        axis the probe sits. Defaults to the centre of each. Ignored when
+        *transverse_reduction* is ``"chord"``.
+    transverse_reduction : ``'slab'`` or ``'chord'``
+        How to reduce the other spatial axes. ``"slab"`` -- the default -- keeps a
+        localized region about *transverse_position*, which is what a scattering
+        volume is. ``"chord"`` keeps the whole extent, for a measurement integrated
+        along that direction. Both **average** over the cells kept; see the notes.
+    slab_halfwidth : `float` or `~astropy.units.Quantity`, optional
+        Half-thickness of the slab, in m. Defaults to the single nearest cell.
+    position : `float` or `~astropy.units.Quantity`, optional
+        Sample the diagnostic axis at this coordinate too, in m, so the reader
+        returns the single point the probe looks at rather than a profile. Omit to
+        keep the whole axis and choose the position later, which is what
+        `spectra_from_phase_spaces` expects.
     charge_weighted : `bool`
         Whether the diagnostic holds charge density, as OSIRIS's ``charge``-weighted
         phase space does. When `True`, the sign is dropped and the result divided by
@@ -1639,6 +1720,16 @@ def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
     normalised to each species' *own* mass despite the generic ``m_e c`` label its
     files carry, so :math:`v = u c / \sqrt{1 + u^2}` is correct for every species
     and no mass enters here.
+
+    Reducing the transverse axes **averages** over the cells kept, rather than
+    summing them. Summing would turn the density into a line integral and multiply
+    the density handed to the forward model by the number of cells combined, which
+    is what the ``osiris2thomson`` pipeline did for its 3-D phase spaces.
+
+    OSIRIS phase-space diagnostics are projections fixed when the run was written,
+    so the velocity component is whatever ``field`` holds -- ``p1x1x2`` gives
+    :math:`v_1`. There is no way to reproject onto the scattering vector after the
+    fact; that has to be arranged when choosing which diagnostic to dump.
 
     That map is nonlinear, so relabelling the axis is not enough: a distribution
     binned uniformly in :math:`u` is not uniformly binned in :math:`v`. With
@@ -1706,6 +1797,12 @@ def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
         layout = _osiris_axis_layout(handle, dataset.ndim)
         shape = dataset.shape
 
+    for axis in layout:
+        scale = skin_depth if axis["name"].startswith("x") else 1.0
+        axis["values"] = (
+            np.linspace(axis["min"], axis["max"], shape[axis["numpy_axis"]]) * scale
+        )
+
     momentum_axes = [a for a in layout if a["name"].startswith("p")]
     spatial_axes = [a for a in layout if a["name"].startswith("x")]
     if len(momentum_axes) != 1:
@@ -1728,21 +1825,33 @@ def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
         kept_space = matches[0]
 
     momentum = momentum_axes[0]
-    summed = tuple(
-        a["numpy_axis"]
-        for a in layout
-        if a["numpy_axis"] not in (momentum["numpy_axis"], kept_space["numpy_axis"])
+    transverse = [
+        a for a in spatial_axes if a["numpy_axis"] != kept_space["numpy_axis"]
+    ]
+    selection = _transverse_selection(
+        transverse, transverse_position, transverse_reduction, slab_halfwidth
     )
 
-    u_axis = np.linspace(
-        momentum["min"], momentum["max"], shape[momentum["numpy_axis"]]
-    )
-    x_axis = (
-        np.linspace(
-            kept_space["min"], kept_space["max"], shape[kept_space["numpy_axis"]]
+    u_axis = momentum["values"]
+    x_axis = kept_space["values"]
+
+    # An explicit sampling position reduces the diagnostic axis as well, so the
+    # reader returns just the point the probe looks at.
+    kept_range = None
+    if position is not None:
+        kept_range = _slab_indices(
+            x_axis, float(_si_values(position, u.m)), slab_halfwidth
         )
-        * skin_depth
-    )
+        x_axis = np.atleast_1d(x_axis[kept_range[0] : kept_range[1]].mean())
+
+    # Slicing preserves the axes, so the means below do not shift each other.
+    index = [slice(None)] * len(layout)
+    for numpy_axis, (low, high) in selection.items():
+        index[numpy_axis] = slice(low, high)
+    if kept_range is not None:
+        index[kept_space["numpy_axis"]] = slice(*kept_range)
+    index = tuple(index)
+    collapse = tuple(selection)
 
     # --- read every dump ---
     blocks = []
@@ -1752,8 +1861,14 @@ def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
         with h5py.File(file, "r") as handle:
             data = np.asarray(handle[field][()], dtype=np.float64)
             times.append(float(np.atleast_1d(handle.attrs["TIME"])[0]))
-        if summed:
-            data = data.sum(axis=summed)
+        data = data[index]
+        if kept_range is not None:
+            # keepdims so the transverse collapse below still finds its axes.
+            data = data.mean(axis=kept_space["numpy_axis"], keepdims=True)
+        if collapse:
+            # Average, not sum: summing turns a density into a line integral and
+            # scales it by however many cells were combined.
+            data = data.mean(axis=collapse)
         # Reduce to (momentum, space) regardless of the file's axis order.
         remaining = [
             a["numpy_axis"]
@@ -1797,7 +1912,10 @@ def read_osiris_phase_space(  # noqa: C901, PLR0912, PLR0915
             "plasma_frequency": omega_p,
             "skin_depth": skin_depth,
             "spatial_axis": kept_space["name"],
-            "summed_axes": [a["name"] for a in layout if a["numpy_axis"] in summed],
+            "transverse_axes": [a["name"] for a in transverse],
+            "transverse_reduction": transverse_reduction if transverse else None,
+            "slab_halfwidth": slab_halfwidth,
+            "sample_position": None if position is None else float(x_axis[0]),
             "charge_weighted": charge_weighted,
             "relativistic_jacobian": relativistic_jacobian,
         },
@@ -1833,25 +1951,67 @@ def _warpx_plotfiles(path: Path, prefix: str, timesteps) -> list[Path]:
         ) from error
 
 
+def _warpx_fields(dataset, species: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """
+    Which position and momentum components a plotfile actually carries.
+
+    A 1-D WarpX run stores its single coordinate as ``particle_position_x`` even
+    when the deck calls that direction ``z``, and a 2-D run stores ``x`` and
+    ``y``; momenta keep their physical names. Detecting what is present avoids
+    asking the caller to know that mapping.
+    """
+    available = {name for kind, name in dataset.field_list if kind == species}
+    positions = tuple(
+        f"particle_position_{c}" for c in "xyz" if f"particle_position_{c}" in available
+    )
+    momenta = tuple(
+        f"particle_momentum_{c}" for c in "xyz" if f"particle_momentum_{c}" in available
+    )
+    if not positions:
+        raise KeyError(
+            f"{species!r} carries no particle_position_* fields; the plotfile has "
+            f"particle types {dataset.particle_types}."
+        )
+    return positions, momenta
+
+
 def _warpx_frame(
-    yt, plotfile: Path, species: str, fields: tuple[str, str]
+    yt,
+    plotfile: Path,
+    species: str,
+    position_fields: tuple[str, ...] | None = None,
+    momentum_fields: tuple[str, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, tuple[np.ndarray, np.ndarray]]:
-    """Read (position, momentum, weight, time, domain) for one species."""
+    """
+    Read one species from one plotfile.
+
+    Returns ``(positions, momenta, weight, time, domain)`` with *positions*
+    shaped ``(n_spatial, n_particles)`` and *momenta* ``(n_momentum,
+    n_particles)``, so callers can work in whatever dimensionality the run has.
+    """
     dataset = yt.load(str(plotfile))
     data = dataset.all_data()
-    position_field, momentum_field = fields
+    if position_fields is None or momentum_fields is None:
+        detected = _warpx_fields(dataset, species)
+        position_fields = position_fields or detected[0]
+        momentum_fields = momentum_fields or detected[1]
     try:
-        position = np.asarray(data[species, position_field].to("m"))
-        momentum = np.asarray(data[species, momentum_field].to("kg*m/s"))
+        positions = np.stack(
+            [np.asarray(data[species, name].to("m")) for name in position_fields]
+        )
+        momenta = np.stack(
+            [np.asarray(data[species, name].to("kg*m/s")) for name in momentum_fields]
+        )
         weight = np.asarray(data[species, "particle_weight"])
     except Exception as error:
         raise KeyError(
-            f"could not read {species!r} fields {fields} from {plotfile}; "
-            f"the plotfile carries particle types {dataset.particle_types}."
+            f"could not read {species!r} fields {position_fields} / "
+            f"{momentum_fields} from {plotfile}; the plotfile carries particle "
+            f"types {dataset.particle_types}."
         ) from error
     left = np.asarray(dataset.domain_left_edge.to("m"))
     right = np.asarray(dataset.domain_right_edge.to("m"))
-    return position, momentum, weight, float(dataset.current_time), (left, right)
+    return positions, momenta, weight, float(dataset.current_time), (left, right)
 
 
 def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
@@ -1861,8 +2021,15 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     mass,
     label: str | None = None,
     is_electron: bool | None = None,
-    position_field: str = "particle_position_x",
-    momentum_field: str = "particle_momentum_z",
+    position_fields=None,
+    momentum_fields=None,
+    axis: int = 0,
+    momentum_field: str | None = "particle_momentum_z",
+    scatter_direction=None,
+    transverse_position=None,
+    transverse_reduction: str = "slab",
+    slab_halfwidth=None,
+    position=None,
     n_velocity_bins: int = 512,
     n_position_bins: int = 512,
     velocity_range=None,
@@ -1897,11 +2064,40 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
         required.
     is_electron : `bool`, optional
         Whether this is an electron population. Inferred from *label* if omitted.
-    position_field, momentum_field : `str`
-        Particle fields to read. The defaults suit a 1-D run: WarpX stores the
-        single spatial coordinate as ``particle_position_x`` even when the deck
-        calls that direction ``z``, while the momentum components keep their
-        physical names.
+    position_fields, momentum_fields : sequence of `str`, optional
+        Particle fields to read. Detected from the plotfile by default, which
+        handles WarpX storing a 1-D run's only coordinate as
+        ``particle_position_x`` even when the deck calls that direction ``z``, and
+        a 2-D run's as ``x`` and ``y``.
+    axis : `int`
+        Which entry of *position_fields* is the diagnostic axis -- the one the
+        spectrogram is resolved along. The rest are the transverse directions.
+    momentum_field : `str`, optional
+        Shorthand for pointing the scattering vector along a single momentum
+        component; equivalent to passing that unit vector as *scatter_direction*.
+        The default suits a 1-D run along the deck's ``z``. For 2-D or 3-D set
+        *scatter_direction* instead, since no single component is then correct.
+    scatter_direction : array_like, optional
+        The scattering vector :math:`\hat{k}` in *simulation* coordinates. The
+        binned velocity is the component of the particle velocity along it, which
+        is what the forward model assumes its distributions are resolved along.
+        For a run with more than one velocity component this is the physically
+        correct choice; naming a single component is only right when
+        :math:`\hat{k}` happens to lie along that axis.
+    transverse_position : array_like, optional
+        Where the scattering volume sits along each transverse axis, in m. One
+        value per transverse axis, in axis order. Defaults to the domain centre.
+    transverse_reduction : ``'slab'`` or ``'chord'``
+        ``"slab"`` -- the default -- keeps only particles within
+        *slab_halfwidth* of *transverse_position*, which is what a scattering
+        volume is. ``"chord"`` keeps every particle, for a measurement integrated
+        along the transverse directions.
+    slab_halfwidth : `float` or `~astropy.units.Quantity`, optional
+        Half-thickness of the slab, in m. Defaults to half a simulation cell.
+    position : `float` or `~astropy.units.Quantity`, optional
+        Sample the diagnostic axis here too, in m, returning the single point the
+        probe looks at rather than a profile. Omit to keep the whole axis and
+        choose the position later.
     n_velocity_bins, n_position_bins : `int`
         Histogram resolution.
     velocity_range, position_range : pair of `float`, optional
@@ -1932,9 +2128,16 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     Notes
     -----
     Macroparticle **weights** are included in the histogram, so ``f`` is a
-    distribution rather than a count. It is scaled by the bin volume such that
-    :math:`\int f \, dv` is the number density in m\ :sup:`-3` -- so pass
-    ``reference_density=1 * u.m**-3`` to `spectra_from_phase_spaces`.
+    distribution rather than a count. It is scaled by the volume the histogram
+    actually covers -- the spatial bin, times each transverse extent kept, times
+    the extents of any dimension the run does not resolve -- so that
+    :math:`\int f \, dv` is the number density in m\ :sup:`-3` regardless of
+    dimensionality or slab thickness. Pass ``reference_density=1 * u.m**-3`` to
+    `spectra_from_phase_spaces`.
+
+    The Lorentz factor is computed from the **full** momentum, then the velocity
+    is projected onto :math:`\hat{k}`. Using a single component for both would
+    understate :math:`\gamma` whenever the transverse momentum is appreciable.
 
     In a reduced-mass-ratio run, *mass* and *label* describe different things and
     both are needed. *mass* is the simulation's value, which converts the stored
@@ -1972,8 +2175,19 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     settings = {
         "species": species,
         "mass": mass,
-        "position_field": position_field,
+        "position_fields": None if position_fields is None else list(position_fields),
+        "momentum_fields": None if momentum_fields is None else list(momentum_fields),
+        "axis": axis,
         "momentum_field": momentum_field,
+        "scatter_direction": (
+            None if scatter_direction is None else list(np.ravel(scatter_direction))
+        ),
+        "transverse_position": (
+            None if transverse_position is None else list(np.ravel(transverse_position))
+        ),
+        "transverse_reduction": transverse_reduction,
+        "slab_halfwidth": slab_halfwidth,
+        "position": position,
         "n_velocity_bins": n_velocity_bins,
         "n_position_bins": n_position_bins,
         "velocity_range": None if velocity_range is None else list(velocity_range),
@@ -1986,6 +2200,9 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     if cache is not None and cache.is_file():
         stored = np.load(cache, allow_pickle=False)
         if str(stored["signature"]) == signature:
+            resolved = (
+                json.loads(str(stored["resolved"])) if "resolved" in stored else {}
+            )
             return from_arrays(
                 f=stored["f"],
                 v=stored["v"],
@@ -1993,38 +2210,121 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
                 t=stored["t"],
                 label=label,
                 is_electron=is_electron,
-                meta={"code": "WarpX", "cache": str(cache), **settings},
+                meta={"code": "WarpX", "cache": str(cache), **settings, **resolved},
             )
 
     yt = _load_yt()
     plotfiles = _warpx_plotfiles(path, prefix, timesteps)
 
-    def velocities(momentum):
-        proper = momentum / (mass * const.c.si.value)
-        return proper * const.c.si.value / np.sqrt(1.0 + proper**2)
+    # Detect what the run actually stores, so the caller need not know that a
+    # 1-D WarpX run calls its only coordinate "x".
+    probe_dataset = yt.load(str(plotfiles[0]))
+    detected_positions, detected_momenta = _warpx_fields(probe_dataset, species)
+    position_fields = tuple(position_fields or detected_positions)
+    momentum_fields = tuple(momentum_fields or detected_momenta)
+    n_spatial = len(position_fields)
+    if not 0 <= axis < n_spatial:
+        raise ValueError(
+            f"axis must index one of the {n_spatial} position field(s) "
+            f"{position_fields}; got {axis}."
+        )
+
+    # The velocity the diagnostic sees is the component along the scattering
+    # vector. Naming a single momentum component is the same as pointing k at
+    # that axis, so both routes go through one projection.
+    if scatter_direction is None:
+        if momentum_field in momentum_fields:
+            component = momentum_fields.index(momentum_field)
+        elif momentum_field is None:
+            component = min(axis, len(momentum_fields) - 1)
+        else:
+            raise KeyError(
+                f"{species!r} has no {momentum_field!r}; it carries "
+                f"{list(momentum_fields)}. Pass momentum_field or "
+                "scatter_direction explicitly."
+            )
+        direction = np.zeros(len(momentum_fields))
+        direction[component] = 1.0
+    else:
+        direction = np.asarray(scatter_direction, dtype=np.float64).ravel()
+        if direction.size < len(momentum_fields):
+            direction = np.pad(direction, (0, len(momentum_fields) - direction.size))
+        direction = direction[: len(momentum_fields)]
+        norm = np.linalg.norm(direction)
+        if norm == 0:
+            raise ValueError("scatter_direction must not be the zero vector.")
+        direction = direction / norm
+
+    def velocities(momenta):
+        """Lab-frame velocity along the scattering vector, in m/s."""
+        proper = momenta / (mass * const.c.si.value)
+        # gamma comes from the full momentum, not just the projected part.
+        gamma = np.sqrt(1.0 + np.sum(proper**2, axis=0))
+        return (direction @ proper) * const.c.si.value / gamma
 
     # --- fix the histogram grid, so every frame shares one axis ---
-    fields = (position_field, momentum_field)
-    probes = [_warpx_frame(yt, plotfiles[0], species, fields)]
+    read = (position_fields, momentum_fields)
+    probes = [_warpx_frame(yt, plotfiles[0], species, *read)]
     if len(plotfiles) > 1:
-        probes.append(_warpx_frame(yt, plotfiles[-1], species, fields))
+        probes.append(_warpx_frame(yt, plotfiles[-1], species, *read))
+    left, right = probes[0][4]
+
+    # --- which particles the scattering volume contains ---
+    transverse_axes = [k for k in range(n_spatial) if k != axis]
+    if transverse_reduction not in {"slab", "chord"}:
+        raise ValueError(
+            f"transverse_reduction must be 'slab' or 'chord'; got "
+            f"{transverse_reduction!r}."
+        )
+    centres = np.array(
+        [0.5 * (left[k] + right[k]) for k in range(n_spatial)], dtype=np.float64
+    )
+    if transverse_position is not None:
+        supplied = np.asarray(transverse_position, dtype=np.float64).ravel()
+        if supplied.size != len(transverse_axes):
+            raise ValueError(
+                f"transverse_position needs one coordinate per transverse axis "
+                f"({len(transverse_axes)}); got {supplied.size}."
+            )
+        for value, k in zip(supplied, transverse_axes, strict=True):
+            centres[k] = value
+    half_width = (
+        None if slab_halfwidth is None else float(_si_values(slab_halfwidth, u.m))
+    )
+
+    def select(positions):
+        """Mask of particles inside the scattering volume."""
+        keep = np.ones(positions.shape[1], dtype=bool)
+        if transverse_reduction == "chord":
+            return keep
+        for k in transverse_axes:
+            width = half_width
+            if width is None:
+                # Default to one cell of the simulation grid.
+                width = (
+                    0.5
+                    * abs(right[k] - left[k])
+                    / max(int(probe_dataset.domain_dimensions[k]), 1)
+                )
+            keep &= np.abs(positions[k] - centres[k]) <= width
+        return keep
 
     extreme = max(
         (
-            float(np.max(np.abs(velocities(momentum))))
-            for _, momentum, _, _, _ in probes
-            if momentum.size
+            float(np.max(np.abs(velocities(momenta[:, select(positions)]))))
+            for positions, momenta, _, _, _ in probes
+            if momenta.size and select(positions).any()
         ),
         default=0.0,
     )
-    left, right = probes[0][4]
 
     if velocity_range is None:
         if extreme <= 0:
             raise ValueError(
-                f"species {species!r} has no particles in the first or last "
-                "plotfile, so no velocity range could be inferred; pass "
-                "velocity_range explicitly."
+                f"species {species!r} has no particles in the scattering volume "
+                "in the first or last plotfile, so no velocity range could be "
+                "inferred; pass velocity_range explicitly, widen slab_halfwidth, "
+                "or check transverse_position."
             )
         # Headroom, but never past the speed of light: no particle can live
         # there, and the empty bins would only give the taper more room to
@@ -2034,14 +2334,41 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     else:
         v_lo, v_hi = float(velocity_range[0]), float(velocity_range[1])
 
-    if position_range is None:
-        x_lo, x_hi = float(left[0]), float(right[0])
-    else:
+    if position_range is not None:
         x_lo, x_hi = float(position_range[0]), float(position_range[1])
+    elif position is not None:
+        centre = float(_si_values(position, u.m))
+        width = half_width
+        if width is None:
+            width = (
+                0.5
+                * abs(right[axis] - left[axis])
+                / max(int(probe_dataset.domain_dimensions[axis]), 1)
+            )
+        x_lo, x_hi = centre - width, centre + width
+        n_position_bins = 1
+    else:
+        x_lo, x_hi = float(left[axis]), float(right[axis])
 
+    # The bin volume has to match the region the histogram actually covers:
+    # the spatial bin, times each transverse extent kept, times the extents of
+    # any dimension the simulation does not resolve (1 m apiece in WarpX).
     if transverse_area is None:
-        widths = (right - left)[1:]
-        transverse_area = float(np.prod(widths)) if widths.size else 1.0
+        transverse_area = 1.0
+        for k in transverse_axes:
+            if transverse_reduction == "chord":
+                transverse_area *= abs(right[k] - left[k])
+            else:
+                width = half_width
+                if width is None:
+                    width = (
+                        0.5
+                        * abs(right[k] - left[k])
+                        / max(int(probe_dataset.domain_dimensions[k]), 1)
+                    )
+                transverse_area *= 2.0 * width
+        for k in range(n_spatial, len(left)):
+            transverse_area *= abs(right[k] - left[k])
 
     v_edges = np.linspace(v_lo, v_hi, n_velocity_bins + 1)
     x_edges = np.linspace(x_lo, x_hi, n_position_bins + 1)
@@ -2057,14 +2384,13 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
         else plotfiles
     )
     for plotfile in iterator:
-        position, momentum, weight, time, _ = _warpx_frame(
-            yt, plotfile, species, fields
-        )
+        positions, momenta, weight, time, _ = _warpx_frame(yt, plotfile, species, *read)
+        keep = select(positions)
         histogram, _, _ = np.histogram2d(
-            velocities(momentum),
-            position,
+            velocities(momenta[:, keep]),
+            positions[axis][keep],
             bins=[v_edges, x_edges],
-            weights=weight,
+            weights=weight[keep],
         )
         blocks.append(histogram / bin_volume)
         times.append(time)
@@ -2072,10 +2398,25 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     f = np.stack(blocks)
     t = np.asarray(times, dtype=np.float64)
 
+    resolved = {
+        "transverse_area": transverse_area,
+        "position_fields": list(position_fields),
+        "momentum_fields": list(momentum_fields),
+        "scatter_direction": direction.tolist(),
+        "n_spatial": n_spatial,
+        "transverse_axes": [position_fields[k] for k in transverse_axes],
+    }
+
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
-            cache, f=f, v=v_axis, x=x_axis, t=t, signature=np.str_(signature)
+            cache,
+            f=f,
+            v=v_axis,
+            x=x_axis,
+            t=t,
+            signature=np.str_(signature),
+            resolved=np.str_(json.dumps(resolved)),
         )
 
     return from_arrays(
@@ -2089,8 +2430,8 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
             "code": "WarpX",
             "path": str(path),
             "plotfiles": [p.name for p in plotfiles],
-            "transverse_area": transverse_area,
             **settings,
+            **resolved,
         },
     )
 

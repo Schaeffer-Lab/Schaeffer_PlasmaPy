@@ -1307,7 +1307,7 @@ class TestOsirisReader:
             progress=False,
         )
         assert phase_space.shape == (3, 32, 8)
-        assert phase_space.meta["summed_axes"] == ["x2"]
+        assert phase_space.meta["transverse_axes"] == ["x2"]
 
     def test_can_keep_the_other_spatial_axis(self, tmp_path):
         ms, _, _ = make_osiris_run(
@@ -1323,7 +1323,7 @@ class TestOsirisReader:
             progress=False,
         )
         assert phase_space.shape == (3, 32, 4)
-        assert phase_space.meta["summed_axes"] == ["x1"]
+        assert phase_space.meta["transverse_axes"] == ["x1"]
 
     def test_selects_requested_dumps(self, tmp_path):
         ms, _, _ = make_osiris_run(tmp_path, n_dumps=5)
@@ -1546,9 +1546,41 @@ class TestAtPosition:
 # ---------------------------------------------------------------------------
 
 
+class FakeDataset:
+    """Just enough of a yt dataset for the reader to introspect."""
+
+    def __init__(self, species, position_fields, momentum_fields, dimensions):
+        if isinstance(species, str):
+            species = (species,)
+        self.field_list = [
+            (kind, name)
+            for kind in species
+            for name in (*position_fields, *momentum_fields, "particle_weight")
+        ]
+        self.particle_types = tuple(species)
+        self.domain_dimensions = np.asarray(dimensions)
+
+
+class FakeYt:
+    """Stand-in for the yt module; `load` ignores the path."""
+
+    def __init__(self, dataset):
+        self._dataset = dataset
+
+    def load(self, _path):
+        return self._dataset
+
+
 def _no_yt_needed():
-    """Stand-in for the yt module, which the fake frame reader never uses."""
-    return object()
+    """The default fake yt: a 1-D run with all three momentum components."""
+    return FakeYt(
+        FakeDataset(
+            TEST_SPECIES,
+            ("particle_position_x",),
+            ("particle_momentum_x", "particle_momentum_y", "particle_momentum_z"),
+            (64, 1, 1),
+        )
+    )
 
 
 def _yt_must_not_be_used():
@@ -1556,12 +1588,15 @@ def _yt_must_not_be_used():
     pytest.fail("the cache was not used")
 
 
+TEST_SPECIES = ("amb_ions", "piston_ions", "electrons", "ions")
 WARPX_DENSITY = 1e16  # m^-3
 WARPX_DOMAIN = 10.0  # m
 WARPX_SIGMA = 1e6  # m/s
 
 
-def fake_warpx_frames(monkeypatch, mass, *, drift=0.0, n_particles=400_000):
+def fake_warpx_frames(
+    monkeypatch, mass, *, drift=0.0, n_particles=400_000, n_spatial=1
+):
     """
     Stand in for the yt layer with macroparticles drawn from a known
     Maxwellian, so the reader's binning and normalisation can be checked
@@ -1569,19 +1604,39 @@ def fake_warpx_frames(monkeypatch, mass, *, drift=0.0, n_particles=400_000):
     """
     speed_of_light = const.c.si.value
 
-    def frame(_yt, plotfile, _species, _fields):
+    def frame(_yt, plotfile, _species, _positions=None, _momenta=None):
         index = int(str(plotfile).rsplit("diag1", 1)[1])
         rng = np.random.default_rng(index)
-        velocity = rng.normal(drift, WARPX_SIGMA, n_particles)
-        gamma = 1.0 / np.sqrt(1.0 - (velocity / speed_of_light) ** 2)
-        momentum = mass * gamma * velocity
-        position = rng.uniform(0.0, WARPX_DOMAIN, n_particles)
+        # The drifting Maxwellian is along z; x and y carry only a little
+        # thermal spread, so a projection onto z recovers the input while a
+        # projection onto x does not.
+        velocity = np.stack(
+            [
+                rng.normal(0.0, 0.1 * WARPX_SIGMA, n_particles),
+                rng.normal(0.0, 0.1 * WARPX_SIGMA, n_particles),
+                rng.normal(drift, WARPX_SIGMA, n_particles),
+            ]
+        )
+        speed = np.sqrt(np.sum(velocity**2, axis=0))
+        gamma = 1.0 / np.sqrt(1.0 - (speed / speed_of_light) ** 2)
+        momenta = mass * gamma * velocity
+        positions = rng.uniform(0.0, WARPX_DOMAIN, (n_spatial, n_particles))
         # Weights chosen so the domain holds exactly WARPX_DENSITY per m^3.
-        weight = np.full(n_particles, WARPX_DENSITY * WARPX_DOMAIN / n_particles)
-        domain = (np.zeros(3), np.array([WARPX_DOMAIN, 1.0, 1.0]))
-        return position, momentum, weight, index * 1e-9, domain
+        cell_volume = WARPX_DOMAIN**n_spatial
+        weight = np.full(n_particles, WARPX_DENSITY * cell_volume / n_particles)
+        domain = (
+            np.zeros(3),
+            np.array([WARPX_DOMAIN] * n_spatial + [1.0] * (3 - n_spatial)),
+        )
+        return positions, momenta, weight, index * 1e-9, domain
 
-    monkeypatch.setattr(pic_thomson, "_load_yt", _no_yt_needed)
+    dataset = FakeDataset(
+        TEST_SPECIES,
+        tuple(f"particle_position_{c}" for c in "xyz"[:n_spatial]),
+        ("particle_momentum_x", "particle_momentum_y", "particle_momentum_z"),
+        (64,) * n_spatial + (1,) * (3 - n_spatial),
+    )
+    monkeypatch.setattr(pic_thomson, "_load_yt", lambda: FakeYt(dataset))
     monkeypatch.setattr(pic_thomson, "_warpx_frame", frame)
 
 
@@ -1668,11 +1723,11 @@ class TestWarpxReader:
         mass = const.m_e.si.value
         speed_of_light = const.c.si.value
 
-        def frame(_yt, _plotfile, _species, _fields):
-            # A single particle at u = 3, i.e. v = 0.949 c.
-            momentum = np.array([3.0 * mass * speed_of_light])
+        def frame(_yt, _plotfile, _species, _positions=None, _momenta=None):
+            # A single particle at u = 3 along z, i.e. v = 0.949 c.
+            momentum = np.array([[0.0], [0.0], [3.0 * mass * speed_of_light]])
             return (
-                np.array([5.0]),
+                np.array([[5.0]]),
                 momentum,
                 np.array([1.0]),
                 0.0,
@@ -2160,3 +2215,394 @@ class TestPlot:
         assert "ifract p+ #1" in labels
         assert "ifract p+ #2" in labels
         matplotlib.pyplot.close(figure)
+
+
+# ---------------------------------------------------------------------------
+# 13. Multi-dimensional simulations
+# ---------------------------------------------------------------------------
+
+
+class TestOsirisNDim:
+    """
+    OSIRIS phase spaces can carry more than one spatial axis, as ``p1x1x2``
+    does. The extra axes have to be reduced to the volume the probe looks at.
+    """
+
+    def test_slab_and_chord_give_the_same_density(self, tmp_path):
+        """
+        The reduction averages rather than sums, so the zeroth moment stays a
+        density however many cells it combines. Summing -- what the
+        osiris2thomson pipeline did -- would scale it by the cell count.
+        """
+        ms, _, _ = make_osiris_run(
+            tmp_path, field="p1x1x2", n_p=64, n_x=8, transverse=16
+        )
+        read = {
+            "reference_density": OSIRIS_REFERENCE_DENSITY,
+            "is_electron": True,
+            "progress": False,
+        }
+        slab = pic_thomson.read_osiris_phase_space(ms, "p1x1x2", "e", **read)
+        chord = pic_thomson.read_osiris_phase_space(
+            ms, "p1x1x2", "e", transverse_reduction="chord", **read
+        )
+        np.testing.assert_allclose(
+            pic_thomson.number_density(slab.f, slab.v),
+            pic_thomson.number_density(chord.f, chord.v),
+            rtol=1e-12,
+        )
+        assert slab.meta["transverse_axes"] == ["x2"]
+        assert slab.meta["transverse_reduction"] == "slab"
+
+    def test_a_wider_slab_still_gives_a_density(self, tmp_path):
+        ms, _, _ = make_osiris_run(
+            tmp_path, field="p1x1x2", n_p=64, n_x=8, transverse=16
+        )
+        read = {
+            "reference_density": OSIRIS_REFERENCE_DENSITY,
+            "is_electron": True,
+            "progress": False,
+        }
+        narrow = pic_thomson.read_osiris_phase_space(ms, "p1x1x2", "e", **read)
+        wide = pic_thomson.read_osiris_phase_space(
+            ms, "p1x1x2", "e", slab_halfwidth=1.0, **read
+        )
+        np.testing.assert_allclose(
+            pic_thomson.number_density(wide.f, wide.v),
+            pic_thomson.number_density(narrow.f, narrow.v),
+            rtol=1e-12,
+        )
+
+    def test_transverse_position_selects_a_different_slab(self, tmp_path):
+        ms, _, _ = make_osiris_run(
+            tmp_path, field="p1x1x2", n_p=32, n_x=8, transverse=16
+        )
+        phase_space = pic_thomson.read_osiris_phase_space(
+            ms,
+            "p1x1x2",
+            "e",
+            reference_density=OSIRIS_REFERENCE_DENSITY,
+            is_electron=True,
+            transverse_position={"x2": 0.0},
+            progress=False,
+        )
+        assert phase_space.shape == (3, 32, 8)
+
+    def test_rejects_an_unknown_transverse_axis(self, tmp_path):
+        ms, _, _ = make_osiris_run(
+            tmp_path, field="p1x1x2", n_p=32, n_x=8, transverse=4
+        )
+        with pytest.raises(ValueError, match=r"not.*transverse axes"):
+            pic_thomson.read_osiris_phase_space(
+                ms,
+                "p1x1x2",
+                "e",
+                reference_density=OSIRIS_REFERENCE_DENSITY,
+                is_electron=True,
+                transverse_position={"x7": 0.0},
+                progress=False,
+            )
+
+    def test_rejects_an_unknown_reduction(self, tmp_path):
+        ms, _, _ = make_osiris_run(
+            tmp_path, field="p1x1x2", n_p=32, n_x=8, transverse=4
+        )
+        with pytest.raises(ValueError, match=r"'slab' or 'chord'"):
+            pic_thomson.read_osiris_phase_space(
+                ms,
+                "p1x1x2",
+                "e",
+                reference_density=OSIRIS_REFERENCE_DENSITY,
+                is_electron=True,
+                transverse_reduction="average",
+                progress=False,
+            )
+
+    def test_position_reduces_to_a_point(self, tmp_path):
+        ms, _, _ = make_osiris_run(tmp_path, n_p=64, n_x=16)
+        read = {
+            "reference_density": OSIRIS_REFERENCE_DENSITY,
+            "is_electron": True,
+            "progress": False,
+        }
+        profile = pic_thomson.read_osiris_phase_space(ms, "p1x1", "e", **read)
+        target = float(profile.x[5])
+        point = pic_thomson.read_osiris_phase_space(
+            ms, "p1x1", "e", position=target, **read
+        )
+        assert point.shape == (3, 64, 1)
+        np.testing.assert_allclose(point.x, [target], rtol=1e-12)
+        np.testing.assert_allclose(point.f[:, :, 0], profile.f[:, :, 5], rtol=1e-12)
+
+    def test_a_point_read_still_feeds_the_driver(self, tmp_path):
+        pytest.importorskip("numba")
+        ms, _, _ = make_osiris_run(tmp_path, n_p=256, n_x=8, n_dumps=2)
+        make_osiris_run(tmp_path, species="al", n_p=256, n_x=8, n_dumps=2, sign=1.0)
+        read = {
+            "reference_density": OSIRIS_REFERENCE_DENSITY,
+            "progress": False,
+            "position": 50.0 * 5.6e-6,
+        }
+        electrons = pic_thomson.read_osiris_phase_space(
+            ms, "p1x1", "e", is_electron=True, **read
+        )
+        ions = pic_thomson.read_osiris_phase_space(
+            ms, "p1x1", "al", label="Al 13+", **read
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            spectrogram = pic_thomson.spectra_from_phase_spaces(
+                electrons,
+                [ions],
+                position=electrons.x[0],
+                reference_density=OSIRIS_REFERENCE_DENSITY,
+                probe_wavelength=PROBE_WAVELENGTH,
+                epw_wavelengths=EPW_WINDOW,
+                electron_conditioning={"max_taper_bins": 20},
+                ion_conditioning={"max_taper_bins": 20},
+                progress=False,
+            )
+        assert np.all(np.isfinite(spectrogram.epw))
+
+
+class TestWarpxNDim:
+    def test_detects_the_dimensionality(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass, n_spatial=2)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=64,
+            n_position_bins=8,
+            progress=False,
+        )
+        assert phase_space.meta["n_spatial"] == 2
+        assert phase_space.meta["position_fields"] == [
+            "particle_position_x",
+            "particle_position_y",
+        ]
+        assert phase_space.meta["transverse_axes"] == ["particle_position_y"]
+
+    def test_slab_and_chord_give_the_same_density(self, tmp_path, monkeypatch):
+        """
+        The scattering volume changes, so the number of particles binned
+        changes, but the density they represent must not.
+        """
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass, n_spatial=2)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        settings = {
+            "mass": mass,
+            "label": "p+",
+            "n_velocity_bins": 256,
+            "n_position_bins": 8,
+            "velocity_range": (-5e6, 5e6),
+            "progress": False,
+        }
+        slab = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", slab_halfwidth=WARPX_DOMAIN / 8, **settings
+        )
+        chord = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", transverse_reduction="chord", **settings
+        )
+        assert slab.meta["transverse_area"] < chord.meta["transverse_area"]
+        np.testing.assert_allclose(
+            pic_thomson.number_density(slab.f, slab.v).mean(),
+            pic_thomson.number_density(chord.f, chord.v).mean(),
+            rtol=0.05,
+        )
+        np.testing.assert_allclose(
+            pic_thomson.number_density(chord.f, chord.v).mean(),
+            WARPX_DENSITY,
+            rtol=0.05,
+        )
+
+    def test_scatter_direction_selects_the_velocity_component(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        The fake distribution drifts along z with a much narrower spread in x,
+        so projecting onto each axis must give visibly different widths. This
+        is what a run with more than one velocity component needs, and what a
+        single momentum component cannot express.
+        """
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass, drift=3e5)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        settings = {
+            "mass": mass,
+            "label": "p+",
+            "n_velocity_bins": 512,
+            "n_position_bins": 4,
+            "progress": False,
+        }
+
+        def moments(phase_space):
+            f = phase_space.f[0, :, 2]
+            v = phase_space.v
+            total = np.trapezoid(f, v)
+            mean = np.trapezoid(f * v, v) / total
+            width = np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / total)
+            return mean, width
+
+        along_z = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", scatter_direction=(0, 0, 1), **settings
+        )
+        along_x = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", scatter_direction=(1, 0, 0), **settings
+        )
+        mean_z, width_z = moments(along_z)
+        mean_x, width_x = moments(along_x)
+
+        np.testing.assert_allclose(mean_z, 3e5, rtol=0.05)
+        np.testing.assert_allclose(width_z, WARPX_SIGMA, rtol=0.05)
+        assert abs(mean_x) < 0.1 * abs(mean_z)
+        np.testing.assert_allclose(width_x, 0.1 * WARPX_SIGMA, rtol=0.05)
+
+    def test_naming_a_momentum_component_matches_that_direction(
+        self, tmp_path, monkeypatch
+    ):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass, drift=3e5)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        settings = {
+            "mass": mass,
+            "label": "p+",
+            "n_velocity_bins": 256,
+            "n_position_bins": 4,
+            "velocity_range": (-4e6, 4e6),
+            "progress": False,
+        }
+        named = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", momentum_field="particle_momentum_x", **settings
+        )
+        vector = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", scatter_direction=(1, 0, 0), **settings
+        )
+        np.testing.assert_array_equal(named.f, vector.f)
+
+    def test_gamma_uses_the_full_momentum(self, tmp_path, monkeypatch):
+        r"""
+        For a particle with momentum in more than one direction, the velocity
+        along :math:`\hat{k}` is :math:`p_k / (m\gamma)` with :math:`\gamma`
+        from the *total* momentum. Taking gamma from the projected component
+        alone would overstate the velocity.
+        """
+        mass = const.m_e.si.value
+        speed_of_light = const.c.si.value
+
+        def frame(_yt, _plotfile, _species, _positions=None, _momenta=None):
+            # u = (3, 0, 4): |u| = 5, so gamma = sqrt(26), and the velocity
+            # along z is 4 c / sqrt(26), not 4 c / sqrt(17).
+            momentum = mass * speed_of_light * np.array([[3.0], [0.0], [4.0]])
+            return (
+                np.array([[5.0]]),
+                momentum,
+                np.array([1.0]),
+                0.0,
+                (np.zeros(3), np.array([WARPX_DOMAIN, 1.0, 1.0])),
+            )
+
+        monkeypatch.setattr(pic_thomson, "_load_yt", _no_yt_needed)
+        monkeypatch.setattr(pic_thomson, "_warpx_frame", frame)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            scatter_direction=(0, 0, 1),
+            n_velocity_bins=2048,
+            progress=False,
+        )
+        expected = 4.0 * speed_of_light / np.sqrt(26.0)
+        naive = 4.0 * speed_of_light / np.sqrt(17.0)
+        occupied = phase_space.v[phase_space.f[0].sum(axis=1) > 0]
+        spacing = float(np.diff(phase_space.v)[0])
+        assert abs(occupied[0] - expected) < spacing
+        assert abs(occupied[0] - naive) > spacing
+
+    def test_position_reduces_to_a_point(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass, n_spatial=2)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            position=WARPX_DOMAIN / 2,
+            transverse_position=[WARPX_DOMAIN / 2],
+            slab_halfwidth=WARPX_DOMAIN / 8,
+            velocity_range=(-5e6, 5e6),
+            n_velocity_bins=256,
+            progress=False,
+        )
+        assert phase_space.shape[2] == 1
+        np.testing.assert_allclose(phase_space.x, [WARPX_DOMAIN / 2], rtol=1e-12)
+        np.testing.assert_allclose(
+            pic_thomson.number_density(phase_space.f, phase_space.v)[0, 0],
+            WARPX_DENSITY,
+            rtol=0.05,
+        )
+
+    def test_rejects_a_bad_axis(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass, n_spatial=2)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        with pytest.raises(ValueError, match="axis must index"):
+            pic_thomson.read_warpx_phase_space(
+                diags, "amb_ions", mass=mass, label="p+", axis=5, progress=False
+            )
+
+    def test_rejects_a_zero_scatter_direction(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        with pytest.raises(ValueError, match="zero vector"):
+            pic_thomson.read_warpx_phase_space(
+                diags,
+                "amb_ions",
+                mass=mass,
+                label="p+",
+                scatter_direction=(0, 0, 0),
+                progress=False,
+            )
+
+    def test_rejects_the_wrong_number_of_transverse_positions(
+        self, tmp_path, monkeypatch
+    ):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass, n_spatial=2)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        with pytest.raises(ValueError, match="one coordinate per transverse axis"):
+            pic_thomson.read_warpx_phase_space(
+                diags,
+                "amb_ions",
+                mass=mass,
+                label="p+",
+                transverse_position=[0.0, 1.0],
+                progress=False,
+            )
+
+    def test_reports_a_missing_momentum_component(self, tmp_path, monkeypatch):
+        """A 2-D run may not carry every momentum component."""
+        mass = const.m_e.si.value
+        dataset = FakeDataset(
+            "electrons",
+            ("particle_position_x", "particle_position_y"),
+            ("particle_momentum_x",),
+            (64, 64, 1),
+        )
+        monkeypatch.setattr(pic_thomson, "_load_yt", lambda: FakeYt(dataset))
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        with pytest.raises(KeyError, match="particle_momentum_z"):
+            pic_thomson.read_warpx_phase_space(
+                diags, "electrons", mass=mass, is_electron=True, progress=False
+            )

@@ -4,15 +4,18 @@ End-to-end run of `plasmapy.diagnostics.pic_thomson` on a WarpX simulation.
 Reads every particle plotfile of a run, forward-models Thomson spectra at one
 point, and writes figures into ``media/``.
 
-The companion OSIRIS script drives a plasma dense enough to scatter
-collectively. A scaled WarpX shock run is usually not: at
-``KinShock2020/runs/R1_paper`` the density is around 1e17 m^-3, giving
-``alpha ~ 1e-5`` at 532 nm. There are then no electron-plasma-wave or
-ion-acoustic features at all, and ``S(k, omega)`` reduces to the electron
-distribution read through the Doppler map. That makes a clean validation
-available in place of the collective one, and this script performs it: the
-computed spectrum is compared against the conditioned electron VDF mapped
-through ``lambda = lambda_0 (1 - 2 v sin(theta/2) / c)``.
+Whether the run scatters collectively depends entirely on its density, which
+for a scaled shock simulation can sit anywhere: the same deck run at
+``n0 = 1e18`` m^-3 gives ``alpha ~ 1e-5`` at 532 nm, and at ``n0 = 6e26`` gives
+``alpha ~ 0.2``. The script reports alpha rather than assuming a regime, and
+sizes its wavelength window from the electron distribution it actually finds.
+
+Where ``alpha << 1`` the electron susceptibility vanishes, the ion feature
+disappears, and ``S(k, omega)`` reduces to ``(2 pi / k) f_e(omega / k)``. That
+gives a validation the collective case cannot: the computed spectrum is
+compared against the conditioned electron VDF read through the Doppler map. The
+check is reported at any alpha, and is expected to *stop* holding once
+collective effects appear -- which is itself informative.
 
 Usage::
 
@@ -385,7 +388,11 @@ def main() -> None:
         help="WarpX diagnostics directory holding diag1* plotfiles",
     )
     parser.add_argument(
-        "--position", type=float, default=30.0, help="sampling position in m"
+        "--position",
+        type=float,
+        default=None,
+        help="sampling position in m; defaults to the centre of the domain, "
+        "since a hard-coded value goes stale the moment a run is resized",
     )
     parser.add_argument(
         "--electron-species", nargs="+", default=["amb_electrons", "piston_electrons"]
@@ -451,10 +458,17 @@ def main() -> None:
 
     print(f"reading {args.diags} ...")
     electrons, ions = read_species(args)
+    if args.position is None:
+        args.position = float(np.mean(electrons[0].x))
+        print(
+            f"  no --position given; sampling the domain centre, {args.position:.5g} m"
+        )
+    # Scale-agnostic formatting: these runs span metres to millimetres and
+    # microseconds to picoseconds depending on how the deck is normalised.
     print(
         f"  {electrons[0].shape[0]} timesteps, "
-        f"{electrons[0].t[-1] * 1e9:.0f} ns, "
-        f"domain {electrons[0].x[-1]:.1f} m"
+        f"{electrons[0].t[-1]:.3g} s, "
+        f"domain {electrons[0].x[-1]:.4g} m"
     )
 
     wavelengths = choose_window(electrons, args)

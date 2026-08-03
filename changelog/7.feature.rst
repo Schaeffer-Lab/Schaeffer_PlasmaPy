@@ -32,4 +32,8 @@ distribution read through the Doppler map and the pipeline reproduces that limit
 to a normalised L1 difference of 0.0000.
 `~plasmapy.diagnostics.pic_thomson.ThomsonSpectrogram` can degrade itself to an
 instrument's temporal and spectral resolution, write itself to a self-describing
-HDF5 file and read itself back, and plot itself.
+HDF5 file and read itself back, and plot itself. Both readers handle simulations
+of any dimensionality, reducing the directions that are not the diagnostic axis
+to the volume the probe looks at, and the WarpX reader can project particle
+velocities onto the scattering vector rather than onto a single momentum
+component.

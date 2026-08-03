@@ -931,6 +931,65 @@ limit over 51 frames (L1 = 0.0000); OSIRIS reader density against the deck
    `c_sim/c_phys = 0.02`, a factor of 50. These disagree by 2.7×, and the WarpX
    spectra are currently shown in simulation units because of it.
 
+## 10. Multi-dimensional simulations
+
+Added after the 1-D pipeline was validated. The chosen design was **reduce to the
+sampling point at read time**, with a **slab** default for the other directions.
+
+A useful discovery made the change far cheaper than expected: the whole
+conditioning core was *already* dimension-agnostic. `smooth_vdf`,
+`taper_vdf_edges`, `normalize_vdf`, `number_density` and `rescale_velocity_axis`
+all handle `(n_time, n_v, n_x, n_y)` today, because each was written to act along
+the velocity axis and treat everything else as columns. Only `from_arrays`
+validation and the readers needed work.
+
+**Both readers** gained `transverse_reduction` (`"slab"` or `"chord"`),
+`transverse_position`, `slab_halfwidth` and `position`. The transverse directions
+are always reduced; `position` additionally reduces the diagnostic axis, so the
+reader returns the single point the probe looks at.
+
+- **Reduction averages, it does not sum.** Summing turns a density into a line
+  integral and scales it by the number of cells combined — which is what
+  `osiris2thomson` did for its 3-D phase spaces, quietly multiplying the density
+  handed to the forward model. Verified on both readers: slab and chord give
+  *identical* densities despite transverse areas differing by 64×.
+- **`read_warpx_phase_space` gained `scatter_direction`.** The quantity a Thomson
+  diagnostic measures is the velocity along `k̂`, and a run resolving more than
+  one velocity component can now be projected onto it properly, with the Lorentz
+  factor taken from the **full** momentum. Naming a single momentum component
+  only happens to be right when `k̂` lies along that axis. Position and momentum
+  fields are auto-detected, which also removes the need for the caller to know
+  that a 1-D WarpX run stores its only coordinate as `particle_position_x`.
+- OSIRIS phase spaces are projections fixed at write time, so no reprojection is
+  possible there; the module says so rather than pretending otherwise.
+
+Regression-checked: the OSIRIS reader returns **bit-identical** output to the
+committed version on the 1-D production run, and the Bohm-Gross validation is
+unchanged at 1.292 against 1.262.
+
+### 10a. The WarpX reference run was replaced mid-project
+
+`KinShock2020/runs/R1_paper` was re-run on 2026-08-02 at 11:55 with
+`n0 = 6e26` m⁻³ in place of `1e18`, shrinking the domain from 47.8 m to
+0.00195 m. **Every WarpX number recorded in §5 and §6 above describes the
+previous version of that run.** The reader still validates against the new deck —
+measured `4.7997e24` m⁻³ against `namb = 0.008 × 6e26 = 4.8e24`, 0.006% — but the
+regime is entirely different:
+
+|                      | old R1_paper | current R1_paper |
+| -------------------- | ------------ | ---------------- |
+| `n0`                 | 1e18 m⁻³     | 6e26 m⁻³         |
+| domain               | 47.8 m       | 0.00195 m        |
+| α at 532 nm          | ~1e-5        | **0.21 – 0.42**  |
+| non-collective check | L1 = 0.0000  | L1 = 0.0305      |
+
+That the check degrades smoothly with α — 0.0000 at 1e-5, 0.031 at ~0.3, 0.148 at
+~1.1, 0.417 at ~1.6 — is a good sign: it is measuring the strength of collective
+effects, not passing vacuously. The hard-coded `--position 30.0` in the WarpX tool
+went stale with the resize and now defaults to the domain centre.
+
+______________________________________________________________________
+
 **Recommendation.** Spectra produced by the `osiris2thomson` pipeline should be
 regenerated. Between the ion-normalisation bug (§5.2, a factor of 10 on `χ_i`),
 the unbounded taper (§3a, `vTe` inflated 67%, ion widths by up to 40×) and the

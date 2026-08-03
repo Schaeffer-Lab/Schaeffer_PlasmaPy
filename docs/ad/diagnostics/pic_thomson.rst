@@ -96,6 +96,30 @@ In a reduced-mass-ratio run the mass that converts momentum to velocity is the
 *simulation's* mass, not that of the physical species the population represents.
 `read_warpx_phase_space` therefore takes ``mass`` and ``label`` separately.
 
+Simulations with more than one dimension
+----------------------------------------
+
+A Thomson diagnostic looks at a small volume, not a whole domain, so the readers
+reduce every spatial direction that is not the diagnostic axis. The default,
+``transverse_reduction="slab"``, keeps a localized region about
+``transverse_position``; ``"chord"`` keeps the whole extent, for a measurement
+integrated along that direction. Both **average** over the cells kept rather than
+summing them, so the zeroth moment stays a number density whatever volume is
+selected -- summing would silently scale the density handed to the forward model
+by the number of cells combined.
+
+Passing ``position`` reduces the diagnostic axis too, so a reader returns the
+single point the probe looks at rather than a profile.
+
+For a run that resolves more than one velocity component, the quantity the
+diagnostic measures is the velocity along the scattering vector. Pass
+``scatter_direction`` to `read_warpx_phase_space` and it projects onto that
+vector, taking the Lorentz factor from the full momentum. Naming a single
+momentum component is only right when :math:`\hat{k}` happens to lie along that
+axis. OSIRIS phase spaces are projections fixed when the run was written, so
+there the component is whatever ``field`` holds and the choice has to be made
+when deciding which diagnostic to dump.
+
 Sizing the taper
 ----------------
 
