@@ -66,6 +66,15 @@ def conditioning(args) -> dict:
     }
 
 
+def _time_unit(times) -> tuple[float, str]:
+    """Pick a readable time unit for an axis spanning *times*."""
+    span = float(np.max(times)) if np.size(times) else 0.0
+    for scale, unit in ((1e9, "ns"), (1e12, "ps"), (1e15, "fs")):
+        if span * scale >= 1.0:
+            return scale, unit
+    return 1.0, "s"
+
+
 def save(fig, name: str) -> None:
     """Write a figure into the media directory and report where it went."""
     MEDIA.mkdir(exist_ok=True)
@@ -298,7 +307,10 @@ def figure_phase_space(electrons, ions, args) -> None:
 def figure_spectra(spectrogram, wavelengths, comparison, args) -> None:
     """The spectrogram, the scalar tracks, and the non-collective check."""
     nm = wavelengths.to_value(u.nm)
-    time_ns = spectrogram.t * 1e9
+    # These runs span microseconds to picoseconds, so pick the time unit from
+    # the data rather than assuming nanoseconds.
+    scale, unit = _time_unit(spectrogram.t)
+    time_ns = spectrogram.t * scale
 
     fig = plt.figure(figsize=(15, 9))
     grid = fig.add_gridspec(2, 3, hspace=0.32, wspace=0.28)
@@ -316,18 +328,18 @@ def figure_spectra(spectrogram, wavelengths, comparison, args) -> None:
     )
     fig.colorbar(image, ax=ax, label="S(k, w), area-normalised")
     ax.axhline(args.probe_wavelength, color="cyan", lw=0.7, ls="--")
-    ax.set_xlabel("time (ns)")
+    ax.set_xlabel(f"time ({unit})")
     ax.set_ylabel("wavelength (nm)")
     alpha = np.nanmedian(spectrogram.alpha_epw)
     regime = "non-collective" if alpha < 0.3 else "collective"
     ax.set_title(
-        f"Thomson spectrogram at x = {args.position:.1f} m "
+        f"Thomson spectrogram at x = {args.position:.4g} m "
         f"({regime}, median alpha = {alpha:.2f})"
     )
 
     ax = fig.add_subplot(grid[0, 2])
     ax.semilogy(time_ns, spectrogram.electron_density, lw=1.3)
-    ax.set_xlabel("time (ns)")
+    ax.set_xlabel(f"time ({unit})")
     ax.set_ylabel(r"$n_e$ (m$^{-3}$)")
     ax.set_title("electron density", fontsize=10)
 
@@ -336,7 +348,7 @@ def figure_spectra(spectrogram, wavelengths, comparison, args) -> None:
         ax.plot(time_ns, spectrogram.efract[row], lw=1.2, label=f"e: {label}")
     for row, label in enumerate(args.ion_species):
         ax.plot(time_ns, spectrogram.ifract[row], lw=1.0, ls="--", label=f"i: {label}")
-    ax.set_xlabel("time (ns)")
+    ax.set_xlabel(f"time ({unit})")
     ax.set_ylabel("population fraction")
     ax.set_title("piston arrival", fontsize=10)
     ax.legend(fontsize=7)
@@ -344,7 +356,7 @@ def figure_spectra(spectrogram, wavelengths, comparison, args) -> None:
     ax = fig.add_subplot(grid[1, 1])
     ax.semilogy(time_ns, spectrogram.alpha_epw, lw=1.3)
     ax.axhline(1.0, color="k", lw=0.6, ls=":")
-    ax.set_xlabel("time (ns)")
+    ax.set_xlabel(f"time ({unit})")
     ax.set_ylabel(r"$\alpha$")
     ax.set_title(r"scattering parameter $\alpha$", fontsize=10)
 
@@ -356,7 +368,7 @@ def figure_spectra(spectrogram, wavelengths, comparison, args) -> None:
             comparison["measured"][step],
             lw=1.4,
             alpha=0.7,
-            label=f"spectrum, t = {time_ns[step]:.0f} ns",
+            label=f"spectrum, t = {spectrogram.t[step]:.3g} s",
         )[0]
         ax.plot(
             nm,

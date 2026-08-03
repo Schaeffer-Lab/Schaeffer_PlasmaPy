@@ -988,6 +988,38 @@ That the check degrades smoothly with α — 0.0000 at 1e-5, 0.031 at ~0.3, 0.14
 effects, not passing vacuously. The hard-coded `--position 30.0` in the WarpX tool
 went stale with the resize and now defaults to the domain centre.
 
+### 10b. Results on the current WarpX runs
+
+Run at the piston's path rather than the domain centre, which at these densities
+and times is still undisturbed ambient and shows nothing.
+
+**`R1_paper`** (still running, 29 of an eventual ~58 frames), probe at x = 0.75 mm:
+the piston front sweeps 0.006 → 1.043 mm over 29.4 ps and crosses the probe at
+about 20 ps. The spectrogram shows the whole sequence — quiet ambient, an abrupt
+broadening at ~15 ps as the compression arrives ahead of the material, **piston
+ions arriving ~1.5 ps before piston electrons**, then a distinct blue-shifted
+feature near 450 nm from the flowing piston plasma. Density climbs 4.8e24 →
+1.05e26 m⁻³ (22×) and α from 0.24 to 0.76.
+
+**`R1_paper_dial` vs `R1_paper_phys`** — a matched pair differing *only* in the
+Coulomb logarithm (1.22e5 vs 10.84), so collisionality is the single variable.
+Sampled at x = 0.111 mm, last frame:
+
+|                            | dial (collisional) | phys (collisionless) |
+| -------------------------- | ------------------ | -------------------- |
+| `n_e`                      | 3.49e25 m⁻³        | 1.09e25 m⁻³          |
+| α                          | 0.317              | 0.142                |
+| piston electron fraction   | **0.74**           | **0.00**             |
+| spectrum centroid          | 540.4 nm           | 571.0 nm             |
+| spectrum rms width         | 159.7 nm           | 181.0 nm             |
+| L1 between the two spectra | **0.239**          |                      |
+
+The synthetic diagnostic separates them clearly. The physical difference it is
+seeing: with strong collisions the ablated electrons and ions arrive together as
+a coupled fluid, while collisionlessly the piston *ions* run ahead and the piston
+electrons have not reached the probe at all. A real Thomson measurement would
+distinguish these, which is the point of building the diagnostic.
+
 ______________________________________________________________________
 
 **Recommendation.** Spectra produced by the `osiris2thomson` pipeline should be
