@@ -1,0 +1,11 @@
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` gained
+``ion_velocity_scale_factor``, which overrides ``velocity_scale_factor`` for the
+ions alone. One factor for every species is right for an explicit
+reduced-mass-ratio run, where both populations share a convention, and wrong for
+a hybrid one: there the electrons come from
+`~plasmapy.diagnostics.pic_thomson.from_moments` at the real electron mass and
+are already physical, while the ions carry whatever reduced mass the simulation
+gave them. Dividing the ion velocities by :math:`\sqrt{R}` with :math:`R` the
+ratio of physical to simulated ion mass leaves the ion temperature unchanged --
+:math:`m_\mathrm{phys} (v/\sqrt{R})^2 = m_\mathrm{sim} v^2` -- so it maps the
+distribution onto the physical species without touching :math:`T_i/T_e`.

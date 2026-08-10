@@ -1,0 +1,15 @@
+Three fixes to `plasmapy.diagnostics.pic_thomson` found by running it on 1-D and
+2-D hybrid WarpX runs.
+`~plasmapy.diagnostics.pic_thomson.read_warpx_hybrid_electrons` indexed the
+domain edges by physical direction where it should have used the grid axis, so
+a 2-D XZ run -- stored on grid axes 0 and 1 while its physical directions are x
+and z -- took the extent of the *unresolved* third axis, which WarpX gives 1 m.
+It also built the whole ``(n_time, n_v, n_x)`` block before reducing to the
+probe position, over a gigabyte for a hundred frames of a few thousand cells;
+the moments are now reduced first, which is equivalent and allocates one
+column. And `~plasmapy.diagnostics.pic_thomson.PICPhaseSpace.slice_position` now
+accepts any position when the phase space already holds a single point, since
+there is nothing to choose between -- without which a reader that reduced to the
+probe position itself could not be handed back to
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` with the position
+the caller asked for, because each reader snaps to its own grid.

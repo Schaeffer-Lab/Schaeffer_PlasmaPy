@@ -932,7 +932,7 @@ class TestDriverValidation:
             run_driver(reference_density=None)
 
     def test_rejects_velocity_scale_factor_in_conditioning(self):
-        with pytest.raises(ValueError, match="must be the same for every species"):
+        with pytest.raises(ValueError, match="not through the per-species"):
             run_driver(
                 electron_conditioning={"velocity_scale_factor": 50},
             )
@@ -3840,3 +3840,276 @@ class TestHistogram2DDeckBlock:
             self.SETTINGS["position_range"][1],
             rtol=1e-9,
         )
+
+
+class TestHybridTwoDimensional:
+    """
+    A 2-D XZ run is stored on grid axes 0 and 1 while its physical directions
+    are x and z, so the domain edges cannot be indexed by physical direction --
+    that returns the unresolved third axis, which WarpX gives an extent of 1 m.
+    """
+
+    def read(self, tmp_path, monkeypatch, **kwargs):
+        fake_hybrid_fields(monkeypatch, n_spatial=2)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        return pic_thomson.read_warpx_hybrid_electrons(
+            diags,
+            scatter_direction=(0, 0, 1),
+            axis=1,
+            progress=False,
+            **kwargs,
+        )
+
+    def test_spatial_axis_spans_the_resolved_direction(self, tmp_path, monkeypatch):
+        phase_space = self.read(tmp_path, monkeypatch)
+        assert phase_space.x.size == HYBRID_CELLS
+        step = HYBRID_LENGTH / HYBRID_CELLS
+        # The diagnostic axis must span the deck's z extent, not the 1 m that
+        # WarpX gives the direction the run does not resolve.
+        np.testing.assert_allclose(phase_space.x[0], step / 2, rtol=1e-9)
+        np.testing.assert_allclose(
+            phase_space.x[-1], HYBRID_LENGTH - step / 2, rtol=1e-9
+        )
+
+    def test_moments_survive_the_transverse_slab(self, tmp_path, monkeypatch):
+        phase_space = self.read(tmp_path, monkeypatch)
+        density = pic_thomson.number_density(phase_space.f, phase_space.v)
+        np.testing.assert_allclose(density, HYBRID_DENSITY, rtol=1e-6)
+
+    def test_slab_and_chord_agree_on_a_uniform_field(self, tmp_path, monkeypatch):
+        """Averaging, not summing: the density must not depend on cells kept."""
+        slab = self.read(tmp_path, monkeypatch, transverse_reduction="slab")
+        chord = self.read(tmp_path, monkeypatch, transverse_reduction="chord")
+        np.testing.assert_allclose(
+            pic_thomson.number_density(slab.f, slab.v),
+            pic_thomson.number_density(chord.f, chord.v),
+            rtol=1e-9,
+        )
+
+    def test_transverse_position_selects_a_slab(self, tmp_path, monkeypatch):
+        phase_space = self.read(
+            tmp_path,
+            monkeypatch,
+            transverse_position=[HYBRID_LENGTH / 4],
+            slab_halfwidth=HYBRID_LENGTH / 16,
+        )
+        assert phase_space.meta["transverse_reduction"] == "slab"
+        assert phase_space.x.size == HYBRID_CELLS
+
+
+class TestPerSpeciesVelocityScaling:
+    r"""
+    A hybrid run's electrons come from `from_moments` at the real electron mass
+    and are already physical; its ions carry whatever reduced mass the
+    simulation gave them. One factor for both would be wrong.
+    """
+
+    R = 18.36  # m_p / (100 m_e)
+
+    def build(self):
+        times = np.linspace(0.0, 1e-9, 2)
+        positions = np.linspace(0.0, 1e-3, 3)
+        shape = (times.size, positions.size)
+        electrons = pic_thomson.from_moments(
+            np.full(shape, 1e25),
+            np.full(shape, 200.0) * u.eV,
+            t=times,
+            x=positions,
+            label="e-",
+        )
+        ions = pic_thomson.from_moments(
+            np.full(shape, 1e25),
+            np.full(shape, 20.0) * u.eV,
+            t=times,
+            x=positions,
+            label="p+",
+            mass=100 * const.m_e,
+        )
+        return electrons, ions, positions
+
+    def run(self, **kwargs):
+        electrons, ions, positions = self.build()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            return pic_thomson.spectra_from_phase_spaces(
+                electrons=electrons,
+                ions=[ions],
+                position=positions[1],
+                probe_wavelength=532 * u.nm,
+                epw_wavelengths=np.linspace(480, 580, 100) * u.nm,
+                iaw_wavelengths=np.linspace(528, 536, 100) * u.nm,
+                electron_conditioning={"taper_threshold": None},
+                ion_conditioning={"taper_threshold": None},
+                progress=False,
+                **kwargs,
+            )
+
+    def test_scaling_the_ions_leaves_the_satellites_alone(self):
+        """
+        The electron-plasma-wave resonance is set by n_e and the electron
+        distribution, neither of which an ion mass convention touches. Only the
+        centre of the window moves, because the ion feature lives there.
+        """
+        pytest.importorskip("numba")
+        plain = self.run()
+        scaled = self.run(ion_velocity_scale_factor=self.R)
+        # The spectrogram stores its axis in metres.
+        wavelengths = plain.epw_wavelengths * 1e9
+        wings = np.abs(wavelengths - 532.0) > 10.0
+        for spectra in (plain, scaled):
+            assert np.any(spectra.epw[0][wings] > 0)
+
+        def renormalised(spectra):
+            wing = spectra.epw[0][wings]
+            return wing / np.trapezoid(wing, wavelengths[wings])
+
+        # Not bit-identical, and should not be: the ions enter the satellites
+        # through their susceptibility in epsilon = 1 + chi_e + chi_i, which is
+        # near zero at the resonance and so amplifies even a small term. The
+        # residual is a few parts in 1e5, against the factor-of-4 change the
+        # same rescaling makes to the ion feature.
+        np.testing.assert_allclose(
+            renormalised(scaled), renormalised(plain), rtol=1e-3
+        )
+        # ...and the satellite sits in the same bin.
+        assert np.argmax(scaled.epw[0][wings]) == np.argmax(plain.epw[0][wings])
+
+    def test_scaling_the_ions_narrows_the_ion_feature(self):
+        r"""
+        The ion-acoustic width goes as :math:`\sqrt{Z k T_e / m_i}`, so mapping
+        a 100 m_e ion onto a proton must narrow it by about :math:`\sqrt{R}`.
+        """
+        pytest.importorskip("numba")
+        plain = self.run()
+        scaled = self.run(ion_velocity_scale_factor=self.R)
+
+        def width(spectrogram):
+            f = spectrogram.iaw[0]
+            lam = spectrogram.iaw_wavelengths * 1e9
+            total = np.trapezoid(f, lam)
+            mean = np.trapezoid(f * lam, lam) / total
+            return np.sqrt(np.trapezoid(f * (lam - mean) ** 2, lam) / total)
+
+        assert width(scaled) < width(plain)
+
+    def test_a_global_factor_still_applies_to_both(self):
+        pytest.importorskip("numba")
+        both = self.run(velocity_scale_factor=self.R)
+        assert both.meta["velocity_scale_factor"] == self.R
+        assert both.meta["ion_velocity_scale_factor"] == self.R
+        ions_only = self.run(ion_velocity_scale_factor=self.R)
+        # Scaling the electrons too must move the electron feature.
+        assert not np.allclose(both.epw, ions_only.epw)
+
+    def test_ion_factor_is_recorded(self):
+        pytest.importorskip("numba")
+        spectra = self.run(ion_velocity_scale_factor=self.R)
+        assert spectra.meta["velocity_scale_factor"] is None
+        assert spectra.meta["ion_velocity_scale_factor"] == self.R
+
+
+class TestHybridPositionReduction:
+    """
+    Reducing the moments before building the distribution has to give the same
+    answer as reducing after -- the point is only that it does not allocate the
+    whole (n_time, n_v, n_x) block on the way.
+    """
+
+    def test_matches_reducing_after(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=2)
+        target = HYBRID_LENGTH / 3
+
+        whole = pic_thomson.read_warpx_hybrid_electrons(diags, progress=False)
+        after = whole.at_position(target)
+        before = pic_thomson.read_warpx_hybrid_electrons(
+            diags, position=target, v=whole.v, progress=False
+        )
+
+        assert before.shape[2] == 1
+        np.testing.assert_array_equal(before.x, after.x)
+        np.testing.assert_allclose(before.f, after.f, rtol=1e-12)
+        assert before.meta["sampled_index"] == after.meta["sampled_index"]
+
+    def test_reports_a_position_off_the_axis(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        with pytest.raises(ValueError, match="outside the diagnostic axis"):
+            pic_thomson.read_warpx_hybrid_electrons(
+                diags, position=10 * HYBRID_LENGTH, progress=False
+            )
+
+
+class TestAlreadyReducedPhaseSpace:
+    """
+    Readers reduce to the probe position themselves -- they have to, or they
+    build the whole block first -- and each snaps to its own grid. Handing those
+    single-point phase spaces back to the driver with the position the caller
+    asked for must work.
+    """
+
+    def make(self, x):
+        return pic_thomson.from_arrays(
+            f=np.ones((2, 8, 1)),
+            v=np.linspace(-1e6, 1e6, 8),
+            x=[x],
+            t=[0.0, 1e-9],
+            label="e-",
+        )
+
+    def test_any_position_selects_the_only_point(self):
+        phase_space = self.make(1.234e-3)
+        index, sliced = phase_space.slice_position(9.9e-3)
+        assert index == 0
+        assert sliced.shape == (2, 8)
+
+    def test_at_position_is_the_identity(self):
+        phase_space = self.make(1.234e-3)
+        again = phase_space.at_position(5.0e-3)
+        np.testing.assert_array_equal(again.f, phase_space.f)
+        np.testing.assert_array_equal(again.x, phase_space.x)
+
+    def test_a_profile_still_rejects_a_position_off_the_grid(self):
+        profile = pic_thomson.from_arrays(
+            f=np.ones((2, 8, 4)),
+            v=np.linspace(-1e6, 1e6, 8),
+            x=np.linspace(0.0, 1e-3, 4),
+            t=[0.0, 1e-9],
+            label="e-",
+        )
+        with pytest.raises(ValueError, match="outside the spatial axis"):
+            profile.slice_position(5.0e-3)
+
+    def test_species_reduced_to_slightly_different_points_still_run(self):
+        """The whole point: two readers snap to grids that differ by a cell."""
+        pytest.importorskip("numba")
+        times = np.array([0.0, 1e-9])
+        shape = (2, 1)
+        electrons = pic_thomson.from_moments(
+            np.full(shape, 1e25),
+            np.full(shape, 200.0) * u.eV,
+            t=times,
+            x=[9.6991e-4],
+            label="e-",
+        )
+        ions = pic_thomson.from_moments(
+            np.full(shape, 1e25),
+            np.full(shape, 20.0) * u.eV,
+            t=times,
+            x=[9.7100e-4],  # a different reader, a different grid
+            label="p+",
+            mass=100 * const.m_e,
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            spectra = pic_thomson.spectra_from_phase_spaces(
+                electrons=electrons,
+                ions=[ions],
+                position=9.7022e-4,
+                probe_wavelength=532 * u.nm,
+                epw_wavelengths=np.linspace(480, 580, 80) * u.nm,
+                electron_conditioning={"taper_threshold": None},
+                ion_conditioning={"taper_threshold": None},
+                progress=False,
+            )
+        assert np.all(np.isfinite(spectra.epw))

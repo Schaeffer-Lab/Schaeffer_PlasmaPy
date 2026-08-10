@@ -181,8 +181,21 @@ class PICPhaseSpace:
             Index of the selected grid point.
         f_slice : `~numpy.ndarray`
             Phase space at that point, shape ``(n_time, n_v)``.
+
+        Notes
+        -----
+        A phase space that already holds a single point has nothing to choose
+        between, so any *position* selects it. That is what lets readers reduce
+        to the probe position themselves -- which they must, to avoid building
+        the whole block first -- and still be handed to
+        `spectra_from_phase_spaces` with the same position the caller asked for.
+        Each reader snaps to its own grid, so those points differ by up to a
+        cell between species, and an exact-match requirement would reject every
+        one of them.
         """
         position = float(_si_values(position, u.m))
+        if self.x.size == 1:
+            return 0, self.f[:, :, 0]
         if position < self.x.min() or position > self.x.max():
             raise ValueError(
                 f"position {position} m is outside the spatial axis "
@@ -1555,6 +1568,7 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
     electron_conditioning: dict[str, Any] | None = None,
     ion_conditioning: dict[str, Any] | None = None,
     velocity_scale_factor: float | None = None,
+    ion_velocity_scale_factor: float | None = None,
     presence_threshold: float = 1e-2,
     scattered_power: bool = True,
     progress: bool = True,
@@ -1612,6 +1626,16 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
     velocity_scale_factor : `float`, optional
         Mass-ratio reduction factor :math:`R`, applied to every species. See
         `condition_phase_space`.
+    ion_velocity_scale_factor : `float`, optional
+        Overrides *velocity_scale_factor* for the ions alone. Needed whenever
+        the two populations do **not** share a mass convention: a hybrid run's
+        electrons come from `from_moments` at the real electron mass and so are
+        already physical, while its ions carry whatever reduced mass the
+        simulation gave them. Dividing the ion velocities by :math:`\sqrt{R}`
+        with :math:`R` the ratio of physical to simulated ion mass leaves the
+        ion *temperature* unchanged -- :math:`m_\mathrm{phys} (v/\sqrt{R})^2 =
+        m_\mathrm{sim} v^2` -- so it maps the distribution onto the physical
+        species without touching :math:`T_i/T_e`.
     presence_threshold : `float`
         A population contributes at a given timestep only if its fractional density
         exceeds this. Timesteps where the total electron density falls below
@@ -1696,29 +1720,37 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
     ion_present = (ifract > presence_threshold) & plasma_present
 
     # --- conditioning ---
-    def _condition(phase_spaces, settings):
+    def _condition(phase_spaces, settings, scale):
         settings = dict(settings or {})
         if settings.pop("skip", False):
             return list(phase_spaces)
         if "velocity_scale_factor" in settings:
             raise ValueError(
-                "pass velocity_scale_factor to spectra_from_phase_spaces, not "
-                "through the per-species conditioning settings; it must be the "
-                "same for every species."
+                "pass velocity_scale_factor (or ion_velocity_scale_factor) to "
+                "spectra_from_phase_spaces, not through the per-species "
+                "conditioning settings."
             )
         return [
             condition_phase_space(
                 phase_space,
-                velocity_scale_factor=velocity_scale_factor,
+                velocity_scale_factor=scale,
                 **settings,
             )
             for phase_space in phase_spaces
         ]
 
+    if ion_velocity_scale_factor is None:
+        ion_velocity_scale_factor = velocity_scale_factor
     electrons_c = _condition(
-        [sampled[id(ps)] for ps in electrons], electron_conditioning
+        [sampled[id(ps)] for ps in electrons],
+        electron_conditioning,
+        velocity_scale_factor,
     )
-    ions_c = _condition([sampled[id(ps)] for ps in ions], ion_conditioning)
+    ions_c = _condition(
+        [sampled[id(ps)] for ps in ions],
+        ion_conditioning,
+        ion_velocity_scale_factor,
+    )
 
     # --- wavelength windows ---
     epw_wavelengths = u.Quantity(epw_wavelengths, u.nm)
@@ -1812,6 +1844,7 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
             "scatter_vec": scatter_vec.tolist(),
             "presence_threshold": presence_threshold,
             "velocity_scale_factor": velocity_scale_factor,
+            "ion_velocity_scale_factor": ion_velocity_scale_factor,
             "scattered_power": scattered_power,
             "species_meta": {ps.label: ps.meta for ps in [*electrons_c, *ions_c]},
         },
@@ -3508,10 +3541,17 @@ def _warpx_field_frame(
 
     Returns ``(fields, time, (left, right), spacing, resolved)`` where *fields*
     maps each name to an array over the run's resolved directions only,
-    *spacing* is the cell size along each of those, and *resolved* lists the
-    physical direction index (0, 1, 2 for x, y, z) each grid axis corresponds
-    to. Squeezing the unresolved directions is what lets one code path serve
-    1-D, 2-D, and 3-D runs.
+    *spacing* is the cell size along each physical direction, and *resolved*
+    lists the physical direction index (0, 1, 2 for x, y, z) each grid axis
+    corresponds to. Squeezing the unresolved directions is what lets one code
+    path serve 1-D, 2-D, and 3-D runs.
+
+    ``left`` and ``right`` are reduced to the resolved axes too, and are indexed
+    the same way ``fields`` is -- **not** by physical direction. The distinction
+    is not academic: a 2-D XZ run is stored on grid axes 0 and 1 while its
+    physical directions are x and z, so indexing the domain edges by the
+    physical index would return the *unresolved* third axis, which WarpX gives
+    an extent of 1 m.
     """
     dataset = yt.load(str(plotfile))
     dimensions = np.asarray(dataset.domain_dimensions, dtype=int)
@@ -3545,7 +3585,8 @@ def _warpx_field_frame(
         physical: float(abs(right[k] - left[k]) / max(int(dimensions[k]), 1))
         for physical, k in zip(resolved, grid_axes, strict=True)
     }
-    return fields, float(dataset.current_time), (left, right), spacing, resolved
+    edges = (left[grid_axes], right[grid_axes])
+    return fields, float(dataset.current_time), edges, spacing, resolved
 
 
 def _curl_along(direction, magnetic, spacing, resolved) -> np.ndarray | float:
@@ -3828,8 +3869,10 @@ def read_warpx_hybrid_electrons(  # noqa: C901, PLR0912, PLR0915
     # --- the scattering volume, in the transverse directions ---
     transverse_axes = [k for k in range(n_spatial) if k != axis]
     grid_shape = probe[density_field].shape
+    # left/right are already reduced to the resolved axes, so they index the
+    # same way the field arrays do.
     centres = np.array(
-        [0.5 * (left[resolved[k]] + right[resolved[k]]) for k in range(n_spatial)],
+        [0.5 * (left[k] + right[k]) for k in range(n_spatial)],
         dtype=np.float64,
     )
     if transverse_position is not None:
@@ -3846,9 +3889,8 @@ def read_warpx_hybrid_electrons(  # noqa: C901, PLR0912, PLR0915
     )
 
     def cell_centres(k: int) -> np.ndarray:
-        physical = resolved[k]
-        step = spacing[physical]
-        return left[physical] + step * (np.arange(grid_shape[k]) + 0.5)
+        step = spacing[resolved[k]]
+        return left[k] + step * (np.arange(grid_shape[k]) + 0.5)
 
     keep_slices: list[slice] = []
     for k in range(n_spatial):
@@ -3949,10 +3991,32 @@ def read_warpx_hybrid_electrons(  # noqa: C901, PLR0912, PLR0915
             "with read_warpx_phase_space instead."
         )
 
-    phase_space = from_moments(
+    temperature_block = np.stack(temperatures)
+    drift_block = np.stack(drifts)
+    sampled_index = None
+    if position is not None:
+        # Reduce the *moments* to the sampled point, not the distribution built
+        # from them. Building it first and slicing afterwards gives the same
+        # answer, but allocates (n_time, n_v, n_x) on the way -- over a
+        # gigabyte for a hundred frames of a few thousand cells, all but one
+        # column of which is discarded immediately.
+        target = float(_si_values(position, u.m))
+        if target < x_axis.min() or target > x_axis.max():
+            raise ValueError(
+                f"position {target} m is outside the diagnostic axis "
+                f"[{x_axis.min()}, {x_axis.max()}] m of {path}."
+            )
+        sampled_index = int(np.argmin(np.abs(x_axis - target)))
+        cut = slice(sampled_index, sampled_index + 1)
+        density_block = density_block[:, cut]
+        temperature_block = temperature_block[:, cut]
+        drift_block = drift_block[:, cut]
+        x_axis = x_axis[cut]
+
+    return from_moments(
         density_block,
-        np.stack(temperatures) * u.J,
-        np.stack(drifts),
+        temperature_block * u.J,
+        drift_block,
         t=np.asarray(times, dtype=np.float64),
         x=x_axis,
         label=label,
@@ -3980,9 +4044,10 @@ def read_warpx_hybrid_electrons(  # noqa: C901, PLR0912, PLR0915
             "magnetic_fields": sorted(magnetic_components.values()),
             "transverse_reduction": transverse_reduction if transverse_axes else None,
             "slab_halfwidth": half_width,
+            "sampled_index": sampled_index,
+            "sampled_position": None if sampled_index is None else float(x_axis[0]),
         },
     )
-    return phase_space if position is None else phase_space.at_position(position)
 
 
 # ---------------------------------------------------------------------------
