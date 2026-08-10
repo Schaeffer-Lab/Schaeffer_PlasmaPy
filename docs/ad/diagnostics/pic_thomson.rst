@@ -23,17 +23,27 @@ code-agnostic, so supporting another code means writing one reader.
 
 .. code-block:: text
 
-    OSIRIS  ->  read_osiris_phase_space  --.
-                                            >--  PICPhaseSpace
-    WarpX   ->  read_warpx_phase_space   --'          |
-                                                      v
-                                        condition_phase_space
-                                                      |
-                                                      v
-                                        spectra_from_phase_spaces
-                                                      |
-                                                      v
-                                            ThomsonSpectrogram
+    OSIRIS binned phase space  ->  read_osiris_phase_space     --.
+    WarpX macroparticles       ->  read_warpx_phase_space      --|
+    openPMD 2-D histogram      ->  read_openpmd_phase_space    --+->  PICPhaseSpace
+    hybrid electron moments    ->  read_warpx_hybrid_electrons --|          |
+    anything, from moments     ->  from_moments                --'          v
+                                                          condition_phase_space
+                                                                            |
+                                                                            v
+                                                      spectra_from_phase_spaces
+                                                                            |
+                                                                            v
+                                                            ThomsonSpectrogram
+
+Which reader to use for a WarpX run depends on what the run wrote. A plotfile
+with particles goes through `read_warpx_phase_space`, which histograms the
+macroparticles itself. A run that declares a ``ParticleHistogram2D`` reduced
+diagnostic has already done that binning, and `read_openpmd_phase_space` just
+reads it — cheaper, ``yt``-free, and available at every timestep rather than at
+the cadence full plotfiles can afford. A hybrid run has no electron
+macroparticles at all, and its electrons come from
+`read_warpx_hybrid_electrons`.
 
 Getting started
 ===============
@@ -120,6 +130,85 @@ axis. OSIRIS phase spaces are projections fixed when the run was written, so
 there the component is whatever ``field`` holds and the choice has to be made
 when deciding which diagnostic to dump.
 
+Letting the code bin its own phase space
+----------------------------------------
+
+WarpX's ``ParticleHistogram2D`` reduced diagnostic bins both axes from arbitrary
+parser expressions of the particle state. That makes it strictly better than
+anything a reader can reconstruct afterwards, because the projection onto the
+scattering vector can be evaluated per particle, inside the code, with the
+Lorentz factor taken from the full momentum:
+
+.. code-block:: text
+
+   (kx*ux + ky*uy + kz*uz) / sqrt(1 + ux*ux + uy*uy + uz*uz)
+
+WarpX hands the parser ``ux`` as :math:`\gamma v_x / c`, so this is
+:math:`\vec{v} \cdot \hat{k} / c` exactly. `histogram2d_deck_block` writes the
+deck block, and returns the transverse area to hand back to
+`read_openpmd_phase_space` so the densities come out right:
+
+.. code-block:: python
+
+   block, area = pic_thomson.histogram2d_deck_block(
+       "eps_electrons",
+       "electrons",
+       position_range=(0, 2e-3) * u.m,
+       velocity_range=(-2e8, 2e8) * u.m / u.s,
+       scatter_direction=(0, 0, 1),
+       transverse_slab={"y": (0.0, 50e-6)},
+   )
+   print(block)  # paste into the deck
+
+.. warning::
+
+   The generated block states ``value_function = w`` explicitly even though the
+   macroparticle weight is the documented default. WarpX reads that option into
+   ``m_do_parser_value`` and then never checks it, so with the option absent the
+   histogram kernel calls a default-constructed — null — ``ParserExecutor``. The
+   result is not an error: the histogram fills with uninitialised memory, ``NaN``
+   and ``DBL_MAX`` in some bins and zero in the rest. Stating the default avoids
+   it, and is harmless once the bug is fixed upstream.
+
+Two other things about that diagnostic. Its bin edges are fixed in the deck and
+particles outside them are discarded before anything is written, with no record
+of how many — so unlike `read_warpx_phase_space`, the reader cannot warn about a
+clipped tail. And WarpX defaults to the ``bp5`` backend wherever ADIOS2 is
+compiled in; the generated block asks for ``h5`` so the output stays readable by
+`h5py` alone.
+
+Codes that carry a species as a fluid
+-------------------------------------
+
+A kinetic-ion / fluid-electron (hybrid) run has no electron macroparticles.
+Its electrons are an inertialess, quasineutral fluid, and everything the run
+knows about them is three mesh fields. `read_warpx_hybrid_electrons` reads them
+and reconstructs the drifting Maxwellian they imply:
+
+* :math:`n_e = \rho / (\bar{Z} e)`. Quasineutrality is how the solver *defines*
+  the electron density, so with only ions carried as particles the deposited
+  charge density is the electron density — exact, not an estimate.
+* :math:`T_e` from the ``Te`` field when the run solves an electron energy
+  equation, otherwise from the barotropic closure
+  :math:`T_e = T_{e0} (n_e/n_0)^{\gamma-1}`.
+* :math:`\vec{u}_e = -\vec{J}_e / (e n_e)` with
+  :math:`\vec{J}_e = \nabla \times \vec{B} / \mu_0 - \vec{J}_i`, where
+  :math:`\vec{J}_i` is what the ``j`` fields hold — the electrons deposit
+  nothing.
+
+In one dimension that last step is exact and free: :math:`(\nabla \times
+\vec{B})_z` vanishes identically, so the total axial current is zero, the
+electrons exactly counterstream the ions, and no magnetic field is read at all.
+
+The ions are still macroparticles, so read them as usual and pass both to the
+driver. `from_moments` does the reconstruction itself and is not WarpX-specific.
+
+A Maxwellian here is inherited rather than assumed — a fluid closure carries one
+scalar temperature and no higher moments, so there is nothing to build any other
+shape from. Condition these phase spaces with ``taper_threshold=None``: the taper
+exists to replace the discontinuity where shot noise meets the grid edge, and a
+reconstructed distribution has neither.
+
 Sizing the taper
 ----------------
 
@@ -158,17 +247,37 @@ The scattering parameter it reports is
 conventional :math:`1/(k \lambda_{De})` that
 :func:`~plasmapy.diagnostics.thomson.spectral_density` returns.
 
+Checks the readers make for you
+-------------------------------
+
+`read_warpx_phase_space` compares the macroparticles it read against
+``rho_<species>``, the charge density the code itself deposited, and warns when
+the two disagree. This is what catches a diagnostic written with
+``random_fraction``, which subsamples the particle output *without* reweighting
+— so every density built from it is low by exactly that factor, with nothing in
+the file to say so. Particles and fields routinely live in separate diagnostics,
+one with ``write_species = 0`` and the other with ``fields_to_plot = none``, so
+point ``density_reference`` at the one carrying the fields and they are matched
+up by step number.
+
+It also counts the particles the histogram discarded for falling off the
+velocity axis, and sizes that axis from every frame by default rather than from
+the first and last — for a shock, what happens in between is the measurement.
+Set ``velocity_scan="ends"`` to trade that second read pass for speed.
+
 Optional dependencies
 =====================
 
-Reading WarpX output needs `yt <https://yt-project.org>`__, available as the
+Reading WarpX plotfiles needs `yt <https://yt-project.org>`__, available as the
 ``pic`` extra:
 
 .. code-block:: bash
 
    pip install plasmapy[pic]
 
-The OSIRIS reader needs only `h5py`, which PlasmaPy requires anyway.
+The OSIRIS and openPMD readers need only `h5py`, which PlasmaPy requires anyway.
+`read_warpx_hybrid_electrons` reads mesh fields from plotfiles, so it needs
+``yt`` as well.
 
 API
 ---

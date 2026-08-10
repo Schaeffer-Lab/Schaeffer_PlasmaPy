@@ -1028,3 +1028,192 @@ the unbounded taper (§3a, `vTe` inflated 67%, ion widths by up to 40×) and the
 missing Jacobian (§3), the differences are not refinements: on the OmegaShock run
 the legacy and corrected spectrograms differ by a median L1 of 0.90, against
 0.032 for the analytic-Maxwellian agreement.
+
+______________________________________________________________________
+
+## 11. Reading phase space a code binned itself, and species carried as moments
+
+Two gaps the first ten sections left open, resolved here. Both were researched
+before any code was written; the findings are recorded because several of them
+contradict what the documentation says.
+
+### 11.1 WarpX does have a phase-space diagnostic
+
+`ParticleHistogram2D` (`Source/Diagnostics/ReducedDiags/ParticleHistogram2D.cpp`)
+is a genuine analogue of OSIRIS `p1x1`, and in one respect it is better than
+either existing reader: **both axes are arbitrary parser expressions** of
+`(t, x, y, z, ux, uy, uz, w)`, with an optional `filter_function` and
+`value_function`. So the projection this pipeline needs,
+
+```text
+histogram_function_ord = (kx*ux + ky*uy + kz*uz) / sqrt(1 + ux*ux + uy*uy + uz*uz)
+```
+
+is evaluated **per particle, inside the code**. `ux` is `PIdx::ux / PhysConst::c`
+= γv_x/c (`ParticleHistogram2D.cpp:217`), so dividing by γ gives v·k̂/c exactly,
+with γ from the *full* momentum. That is strictly better than
+`read_warpx_phase_space`'s post-hoc projection and far better than the OSIRIS
+reader, which can only invert `v = uc/√(1+u²)` on a single stored component — an
+approximation valid only when the other components vanish.
+
+Output is openPMD, one file per iteration, mesh `"data"`, shape `(n_ord, n_abs)`,
+with `axisLabels`, `gridGlobalOffset` = bin minima, `gridSpacing` = bin sizes,
+`position = [0.5, 0.5]`, and `setTime`. Every one of those was read back off a
+file produced by a real run, and the test fixture reproduces that layout exactly.
+
+Four practical limits:
+
+1. **It cannot be applied retroactively.** No run in `KinShock2020`,
+   `H-PICShock`, `LaserProdShock`, or `MagShockZ` declares one.
+1. **Bins are frozen at deck time.** Particles outside are discarded before
+   anything is written and nothing records how many, so unlike
+   `read_warpx_phase_space` the reader cannot warn about a clipped tail.
+1. **The default backend is `bp5`** wherever ADIOS2 is compiled in.
+   `histogram2d_deck_block` asks for `h5`, which keeps the output readable by
+   `h5py` alone — the property that makes the OSIRIS path dependency-light.
+   Note that the `warpx-cda/build` tree has openPMD compiled with *neither*
+   HDF5 nor ADIOS2, so only `json` works there; that is a build-configuration
+   issue, not a code one.
+1. **It does not know its own volume.** The bins hold Σw over whatever the
+   filter kept, so the conversion to a density is post-processing.
+   `histogram2d_deck_block` returns the transverse area it selected so the two
+   sides cannot drift apart.
+
+### 11.1a A WarpX bug: `ParticleHistogram2D` needs `value_function` spelled out
+
+Found while validating the generated deck block against a real run.
+
+The constructor reads `value_function` into `m_do_parser_value`
+(`ParticleHistogram2D.cpp:121`) and **never uses that flag again** — `grep` finds
+it only at its declaration and its assignment. The kernel calls
+`fun_valueparser(...)` unconditionally (`:231`), and `compileParser` returns a
+default-constructed `amrex::ParserExecutor<N>{}` when the parser is null
+(`ParserUtils.H:80-87`). Compare the filter, which *is* guarded by
+`if (do_parser_filter)`.
+
+The consequence is not an error. Measured on a 64×128 histogram of 12 800
+macroparticles:
+
+| `value_function`             | bad bins            | Σ over finite bins | expected  |
+| ---------------------------- | ------------------- | ------------------ | --------- |
+| absent                       | 2 758 / 8 192 (34%) | 0                  | 1.0000e21 |
+| `w` (the documented default) | 0                   | **1.0000e21**      | 1.0000e21 |
+
+Absent, a third of the bins hold `NaN` and `DBL_MAX` and every finite bin is
+zero. A 1-D `ParticleHistogram` on the same run returns 1.0000e21 exactly, so the
+particles are there and it is the 2-D path that is broken. Not a threading
+artifact — `OMP_NUM_THREADS=1` reproduces it — and not a layout artifact, since a
+square histogram reproduces it too.
+
+`histogram2d_deck_block` therefore always emits `value_function = w`, with the
+reason in a comment. **Worth reporting upstream**; the fix is to guard the call
+the way the filter is guarded.
+
+### 11.1b Validation of `read_openpmd_phase_space`
+
+A 1-D WarpX run of 12 800 electrons, drifting Maxwellian at `uz_m = 0.05`,
+`uz_th = 0.02`, uniform at 1e24 m⁻³, read through the generated block:
+
+| quantity   | recovered     | expected  | error  |
+| ---------- | ------------- | --------- | ------ |
+| density    | 9.9997e23 m⁻³ | 1e24      | 0.003% |
+| drift      | 1.49492e7 m/s | 1.49694e7 | 0.13%  |
+| rms spread | 5.9507e6 m/s  | 5.9959e6  | 0.75%  |
+
+The spread error is one bin width (6.25e5 m/s) of discretisation. Later frames
+drift because an electron-only plasma with no neutralising background decelerates
+in its own space charge — physics, not the reader.
+
+### 11.2 Hybrid PIC: the electrons exist only as moments
+
+WarpX's kinetic-ion / fluid-electron solver has **no electron macroparticles**.
+Quasineutrality and the absence of displacement current collapse the electron
+momentum equation into Ohm's law, and the electron state is three mesh fields.
+The `H-PICShock` decks already dump all of them at 102 frames
+(`diag_fields.fields_to_plot = Ez Ey By Bx jz rho rho_piston_ions rho_amb_ions Te Pe`):
+
+| moment | source                                     | exactness                                                     |
+| ------ | ------------------------------------------ | ------------------------------------------------------------- |
+| `n_e`  | `rho / (Z̄ e)`                              | **exact** — quasineutrality is how the solver defines it      |
+| `T_e`  | the `Te` field [eV]                        | solved, since this fork has `electron_energy_mode = advected` |
+| `u_e`  | `J_e = ∇×B/μ₀ − J_i`, `u_e = −J_e/(e n_e)` | exact                                                         |
+
+`jz` is `current_fp`, the **ion** current — in hybrid the electrons deposit
+nothing (`HybridPICModel.cpp:180`), and the total plasma current lives separately
+in `hybrid_current_fp_plasma = ∇×B/μ₀`.
+
+The 1-D case is worth stating because it is both exact and free: with only
+`∂/∂z` surviving, `(∇×B)_z ≡ 0`, so the total axial current vanishes, the
+electrons exactly counterstream the ions, and
+
+```text
+u_ez = j_z / (e n_e)
+```
+
+with **no magnetic field read at all**. `_curl_needs` works this out from the
+resolved directions, so the reader asks for `Bx`/`By` only when the geometry can
+actually make a current along k̂.
+
+Measured on `H3_470eV_eheat_coll` at frame 440: `n_e` 1.36e24–1.29e27 m⁻³,
+`T_e` 9.3–1175 eV, `u_e` up to 2.2e6 m/s = **0.155 v_th,e** — a real but
+subthermal Doppler shift, which is exactly the regime Thomson resolves. End to
+end over 11 frames at x = 0.6 L, α ran from **0.30 to 5.14** as the shock crossed
+the probe: the diagnostic passes from non-collective to strongly collective
+within one run.
+
+A drifting Maxwellian is **inherited, not assumed**. The closure carries one
+scalar temperature and no higher moments, so there is nothing in the data from
+which to build any other shape. What that costs is a question about the model,
+answerable by reconstructing the moments of the `KinShock2020` kinetic twin and
+comparing spectra — not attempted here.
+
+One trap worth recording: these reconstructed distributions must be conditioned
+with `taper_threshold=None`. The taper exists to replace the discontinuity where
+macroparticle shot noise meets the grid edge; an analytic Maxwellian has neither,
+so tapering it only fabricates a pedestal and widens the feature (measured: 11%
+on the second moment, enough to trip the §3a pedestal warning).
+
+### 11.3 Robustness
+
+Two outright bugs, both fixed:
+
+- **The WarpX cache signature omitted `transverse_area` and `timesteps`.** Both
+  change `f` — area scales it linearly — so a cache built from a five-frame test
+  read was handed back, silently, for the full series.
+- **`momentum_field` defaulted to `particle_momentum_z` in any dimension.** In
+  1-D and 2-D the field is missing and the reader raised; in 3-D it exists and
+  the projection was quietly onto ẑ regardless of where k̂ pointed. `"auto"` now
+  resolves only in 1-D, where there is nothing to guess, and refuses otherwise.
+
+Two hardening measures, both of which found something real:
+
+- **Cross-check against the code's own `rho`.** Reading `diag_phase` from
+  `H3_470eV_eheat_coll` gives a **ratio of 0.200092** against the deposited
+  charge — the deck's `diag_phase.amb_ions.random_fraction = 0.2`, which
+  subsamples the particle output *without* reweighting. Every density built from
+  that diagnostic is 5× low and nothing in the file says so; α would have been
+  wrong by √5. Because particles and fields live in different diagnostics here
+  (`write_species = 0` on one, `fields_to_plot = none` on the other), the check
+  takes a `density_reference` prefix and matches by step number.
+- **Velocity axis sized from every frame**, not the first and last, plus a count
+  of what the histogram discarded. For a shock, what happens between the first
+  and last frames *is* the measurement. `velocity_scan="ends"` restores the old
+  behaviour where the second read pass is too expensive.
+
+And one ergonomic fix: every reader now records its density scale in
+`PICPhaseSpace.meta`, so the driver's `reference_density` defaults correctly per
+reader rather than the caller having to remember that OSIRIS means `n₀` and
+WarpX means 1 m⁻³. Species that disagree are an error, since one scale multiplies
+all of them.
+
+### 11.4 Still open
+
+- The velocity-scaling convention of §6a/§9 is unchanged: `mass_ratio = 100`
+  against a real 1836 implies R = 18.36, while the paper's Table I reports
+  `c_sim/c_phys = 0.02`, a factor of 50.
+- `ParticleHistogram2D`'s `value_function` bug (§11.1a) should go upstream.
+- No run yet declares a `ParticleHistogram2D` block, so
+  `read_openpmd_phase_space` has been validated only against a purpose-built test
+  run, not against a production shock.
+- The hybrid-vs-kinetic comparison the moment reconstruction makes possible
+  (§11.2) has not been done.

@@ -1,0 +1,27 @@
+Extended `plasmapy.diagnostics.pic_thomson` to read phase space a code binned
+itself, and to reconstruct a species a code carries only as moments.
+`~plasmapy.diagnostics.pic_thomson.read_openpmd_phase_space` reads a 2-D openPMD
+histogram through `h5py` alone -- WarpX's ``ParticleHistogram2D`` reduced
+diagnostic, and anything else writing the same layout -- which is cheaper than
+histogramming macroparticles, needs no ``yt``, and can be written at every
+timestep rather than at the cadence full plotfiles allow. Because both axes of
+that diagnostic are arbitrary expressions of the particle state, the projection
+onto the scattering vector can be evaluated per particle inside the code with the
+Lorentz factor from the full momentum, which no reader working from a single
+stored component can reproduce;
+`~plasmapy.diagnostics.pic_thomson.histogram2d_deck_block` generates the matching
+deck block and reports the transverse area to read it back with. That block
+states ``value_function = w`` explicitly, working around a WarpX bug in which
+``ParticleHistogram2D`` reads the option into ``m_do_parser_value`` and never
+checks it, so that with the option absent the kernel calls a null
+``ParserExecutor`` and the histogram fills with uninitialised memory rather than
+failing. Validated against a WarpX run: density, drift and thermal spread
+recovered to 0.1%, 0.13% and 0.75%.
+`~plasmapy.diagnostics.pic_thomson.from_moments` builds a phase space from a
+density, a temperature, and a drift, and
+`~plasmapy.diagnostics.pic_thomson.read_warpx_hybrid_electrons` supplies those
+from a kinetic-ion / fluid-electron run -- which has no electron macroparticles
+at all -- taking the density from the deposited charge by quasineutrality, the
+temperature from the solved ``Te`` field or from the barotropic closure, and the
+drift from :math:`\nabla \times \vec{B} / \mu_0 - \vec{J}_i`, which in one
+dimension reduces exactly to the ion current and needs no magnetic field.

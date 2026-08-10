@@ -1,0 +1,19 @@
+Hardened `plasmapy.diagnostics.pic_thomson.read_warpx_phase_space`. Its cache
+signature now includes ``transverse_area`` and ``timesteps``, both of which
+change the result -- previously a cache built from a short test read was handed
+back, silently, for the full series. It no longer defaults the velocity
+projection to ``particle_momentum_z`` for a run with more than one dimension,
+where momenta are stored for all three directions and any default is a silently
+wrong answer rather than an error; pass ``scatter_direction``. The default
+velocity axis is now sized from every frame rather than from the first and last,
+which for a shock is where the measurement is, and the reader counts and reports
+the particles the histogram discarded for falling outside it. It also
+cross-checks the macroparticles it read against ``rho_<species>``, the charge
+density the code deposited, which catches a diagnostic written with
+``random_fraction`` -- that option subsamples the particle output without
+reweighting, so every density built from it is low by exactly that factor with
+nothing in the file to say so. Finally, every reader records its density scale in
+`~plasmapy.diagnostics.pic_thomson.PICPhaseSpace` ``meta``, so
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` takes
+``reference_density`` from there by default instead of the caller having to
+remember that OSIRIS means :math:`n_0` and WarpX means 1 m\ :sup:`-3`.

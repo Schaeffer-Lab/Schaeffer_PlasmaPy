@@ -41,9 +41,13 @@ __all__ = [
     "ThomsonSpectrogram",
     "condition_phase_space",
     "from_arrays",
+    "from_moments",
+    "histogram2d_deck_block",
     "normalize_vdf",
     "number_density",
+    "read_openpmd_phase_space",
     "read_osiris_phase_space",
+    "read_warpx_hybrid_electrons",
     "read_warpx_phase_space",
     "rescale_velocity_axis",
     "smooth_vdf",
@@ -79,6 +83,19 @@ VELOCITY_AXIS = 1
 #: Default positive floor applied after normalisation. Small enough not to perturb
 #: the distribution, large enough to keep the forward model's divisions finite.
 DEFAULT_FLOOR = 1e-30
+
+#: Fraction of the in-volume weight that may fall outside the histogram bounds
+#: before a reader complains. A handful of runaway particles is normal; a
+#: percent of the distribution is a clipped tail.
+_CLIP_WARNING_FRACTION = 1e-3
+
+#: How far a reader's zeroth moment may drift from the density the PIC code
+#: itself deposited before the reader complains.
+_DENSITY_CHECK_TOLERANCE = 0.05
+
+#: How much of a reconstructed distribution may fall off its velocity grid
+#: before `from_moments` complains.
+_MOMENT_RECOVERY_TOLERANCE = 0.01
 
 
 def _si_values(quantity, unit: u.UnitBase) -> np.ndarray:
@@ -290,6 +307,241 @@ def from_arrays(
         label=label,
         is_electron=bool(is_electron),
         meta=dict(meta or {}),
+    )
+
+
+def _thermal_energy(temperature) -> np.ndarray:
+    r"""
+    Return :math:`k_B T` in joules, from a temperature in K, J, or eV.
+
+    Bare arrays are read as kelvin, following the rest of PlasmaPy; the fluid
+    temperatures that hybrid codes write are usually in eV, so pass those as a
+    `~astropy.units.Quantity` and let the units carry the conversion.
+    """
+    if isinstance(temperature, u.Quantity):
+        if temperature.unit.is_equivalent(u.K):
+            return np.asarray((const.k_B * temperature).to(u.J).value, dtype=np.float64)
+        if temperature.unit.is_equivalent(u.J):
+            return np.asarray(temperature.to(u.J).value, dtype=np.float64)
+        raise u.UnitConversionError(
+            f"temperature must be in K or in energy units; got {temperature.unit}."
+        )
+    return const.k_B.si.value * np.asarray(temperature, dtype=np.float64)
+
+
+def from_moments(
+    density,
+    temperature,
+    drift=None,
+    *,
+    t,
+    x,
+    label: str,
+    v=None,
+    mass=None,
+    is_electron: bool | None = None,
+    n_velocity_bins: int = 512,
+    velocity_headroom: float = 6.0,
+    meta: dict[str, Any] | None = None,
+) -> PICPhaseSpace:
+    r"""
+    Build a `PICPhaseSpace` from a drifting Maxwellian's moments.
+
+    Not every code carries every species as macroparticles. A kinetic-ion /
+    fluid-electron (hybrid) code has no electron macroparticles at all: its
+    electrons are a quasineutral, inertialess fluid described entirely by a
+    density, a temperature, and a drift. This reconstructs the distribution
+    those moments imply,
+
+    .. math::
+
+       f(v) = n \left(\frac{m}{2 \pi k_B T}\right)^{1/2}
+              \exp\!\left[-\frac{m (v - u)^2}{2 k_B T}\right],
+
+    so that a fluid species can be fed to the same forward model as a kinetic
+    one.
+
+    Parameters
+    ----------
+    density : array_like or `~astropy.units.Quantity`
+        Number density, shape ``(n_time, n_x)``, in m\ :sup:`-3` if bare.
+    temperature : array_like or `~astropy.units.Quantity`
+        Temperature, shape ``(n_time, n_x)``, in K if bare. Quantities may be in
+        K or in energy units, so an eV field can be passed straight through.
+    drift : array_like or `~astropy.units.Quantity`, optional
+        Fluid velocity **along the diagnostic axis**, shape ``(n_time, n_x)``, in
+        m/s if bare. Defaults to zero. Project a vector drift onto
+        :math:`\hat{k}` before passing it.
+    t, x : array_like or `~astropy.units.Quantity`
+        Time and position axes, shapes ``(n_time,)`` and ``(n_x,)``.
+    label : `str`
+        Species identifier, for example ``"e-"``.
+    v : array_like or `~astropy.units.Quantity`, optional
+        Velocity axis. The default builds one spanning the drift plus
+        *velocity_headroom* thermal speeds either side, which is what the
+        moments themselves imply; pass one explicitly to share a grid between
+        species.
+    mass : `float` or `~astropy.units.Quantity`, optional
+        Mass setting the thermal width, in kg if bare. Defaults to the physical
+        mass of *label*. For a fluid electron population this is the **real**
+        electron mass even though the solver treats the fluid as inertialess:
+        the inertia that is dropped is the electrons' response to the fields,
+        not the mass that sets their thermal spread at a given temperature.
+    is_electron : `bool`, optional
+        Whether this is an electron population. Inferred from *label* if omitted.
+    n_velocity_bins : `int`
+        Resolution of the default velocity axis.
+    velocity_headroom : `float`
+        How many thermal speeds past the extreme drift the default axis reaches.
+    meta : `dict`, optional
+        Extra provenance to attach.
+
+    Returns
+    -------
+    `PICPhaseSpace`
+        With ``f`` in SI, so `spectra_from_phase_spaces` needs no density scale.
+
+    Raises
+    ------
+    `ValueError`
+        If the moment arrays disagree in shape, or a temperature is not positive
+        where the density is.
+
+    Notes
+    -----
+    A Maxwellian is not an assumption imposed here so much as one inherited: a
+    fluid closure carries a single scalar temperature and no higher moments, so
+    there is nothing in the data from which to build any other shape. What that
+    costs is a real question about the model, not about this function --
+    reconstruct the moments of an equivalent kinetic run and compare the two
+    spectra to answer it.
+
+    Condition the result with ``taper_threshold=None``. The taper exists to
+    replace the discontinuity where macroparticle shot noise meets the edge of
+    the velocity grid; a reconstructed distribution has neither, so tapering it
+    only fabricates a pedestal in the wings and widens the feature.
+
+    Examples
+    --------
+    .. code-block:: python
+
+       electrons = from_moments(
+           density=n_e,  # (n_time, n_x), m^-3
+           temperature=T_e * u.eV,
+           drift=u_e,  # m/s along k-hat
+           t=times,
+           x=positions,
+           label="e-",
+       )
+    """
+    density = np.atleast_2d(_si_values(density, u.m**-3))
+    thermal_energy = np.atleast_2d(_thermal_energy(temperature))
+    if drift is None:
+        drift = np.zeros_like(density)
+    drift = np.atleast_2d(_si_values(drift, u.m / u.s))
+
+    shapes = {
+        "density": density.shape,
+        "temperature": thermal_energy.shape,
+        "drift": drift.shape,
+    }
+    if len(set(shapes.values())) != 1:
+        raise ValueError(f"the moments must share a shape (n_time, n_x); got {shapes}.")
+    if density.ndim != 2:
+        raise ValueError(
+            f"the moments must be 2-D with shape (n_time, n_x); got ndim="
+            f"{density.ndim}."
+        )
+
+    present = density > 0
+    if np.any(present & ~(thermal_energy > 0)):
+        raise ValueError(
+            "temperature must be positive wherever the density is: a Maxwellian "
+            "has no zero-temperature limit on a finite velocity grid. Floor the "
+            "temperature, or zero the density where the species is absent."
+        )
+
+    mass_si = (
+        float(Particle(label).mass.to(u.kg).value)
+        if mass is None
+        else float(_si_values(mass, u.kg))
+    )
+    if mass_si <= 0:
+        raise ValueError(f"mass must be positive; got {mass_si} kg.")
+
+    # sqrt(kT/m), the width of the Maxwellian in this one velocity component.
+    thermal_speed = np.sqrt(np.where(present, thermal_energy, 0.0) / mass_si)
+
+    if v is None:
+        if not np.any(present):
+            raise ValueError(
+                f"species {label!r} has zero density everywhere, so no velocity "
+                "axis could be inferred; pass v explicitly."
+            )
+        reach = float(
+            np.max(np.abs(drift[present]) + velocity_headroom * thermal_speed[present])
+        )
+        reach = min(reach, 0.999 * const.c.si.value)
+        v_axis = np.linspace(-reach, reach, n_velocity_bins)
+    else:
+        v_axis = _si_values(v, u.m / u.s)
+
+    # (n_time, n_v, n_x): the velocity axis is inserted between the two the
+    # moments already have.
+    offset = v_axis[np.newaxis, :, np.newaxis] - drift[:, np.newaxis, :]
+    width = thermal_speed[:, np.newaxis, :]
+    amplitude = np.divide(
+        density[:, np.newaxis, :],
+        width * np.sqrt(2.0 * np.pi),
+        out=np.zeros_like(offset + density[:, np.newaxis, :]),
+        where=width > 0,
+    )
+    exponent = np.divide(
+        -0.5 * offset**2,
+        np.where(width > 0, width, 1.0) ** 2,
+        out=np.zeros_like(offset),
+        where=width > 0,
+    )
+    f = amplitude * np.exp(exponent)
+
+    # A Maxwellian integrates to the density analytically; on a finite grid it
+    # only does so if the grid actually contains it. Say so when it does not,
+    # rather than handing back a distribution that quietly holds less plasma
+    # than the moments describe.
+    recovered = number_density(f, v_axis)
+    shortfall = np.divide(
+        np.abs(recovered - density),
+        density,
+        out=np.zeros_like(density),
+        where=present,
+    )
+    worst = float(np.max(shortfall)) if shortfall.size else 0.0
+    if worst > _MOMENT_RECOVERY_TOLERANCE:
+        warnings.warn(
+            f"the velocity axis [{v_axis[0]:.3e}, {v_axis[-1]:.3e}] m/s does not "
+            f"contain the reconstructed {label!r} distribution: its zeroth moment "
+            f"is off by up to {100 * worst:.2f}% of the density it was built "
+            "from. Widen v, or leave it unset so it is sized from the moments.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return from_arrays(
+        f=f,
+        v=v_axis,
+        x=x,
+        t=t,
+        label=label,
+        is_electron=is_electron,
+        meta={
+            "source": "moments",
+            "distribution": "drifting Maxwellian",
+            "mass": mass_si,
+            # f is already a density in m^-3.
+            "reference_density": 1.0,
+            "moment_recovery_error": worst,
+            **dict(meta or {}),
+        },
     )
 
 
@@ -1222,6 +1474,50 @@ def _check_shared_time_axis(phase_spaces: list[PICPhaseSpace]) -> np.ndarray:
     return reference.t
 
 
+def _resolve_reference_density(phase_spaces: list[PICPhaseSpace], supplied) -> float:
+    r"""
+    Settle the density scale of the supplied phase spaces.
+
+    An explicit *supplied* value always wins. Otherwise it comes from the
+    ``reference_density`` every reader records in `PICPhaseSpace.meta`, which is
+    :math:`n_0` for a code that normalises to a reference density and
+    ``1`` m\ :sup:`-3` for a reader that already produces SI. Species must agree,
+    since one scale multiplies all of them.
+    """
+    if supplied is None:
+        recorded = [ps.meta.get("reference_density") for ps in phase_spaces]
+        if any(value is None for value in recorded):
+            missing = [
+                ps.label
+                for ps, value in zip(phase_spaces, recorded, strict=True)
+                if value is None
+            ]
+            raise ValueError(
+                "reference_density was not given and could not be taken from "
+                f"the phase spaces: {missing} carry no 'reference_density' in "
+                "their meta. Every reader in this module records one; pass it "
+                "explicitly for phase spaces built by hand."
+            )
+        values = [float(_si_values(value, u.m**-3)) for value in recorded]
+        if not np.allclose(values, values[0], rtol=1e-9):
+            pairs = {
+                ps.label: value for ps, value in zip(phase_spaces, values, strict=True)
+            }
+            raise ValueError(
+                "the supplied phase spaces disagree about the density scale: "
+                f"{pairs} m^-3. One scale multiplies all of them, so they must "
+                "match; pass reference_density explicitly to override."
+            )
+        supplied = values[0]
+
+    reference_density = float(_si_values(supplied, u.m**-3))
+    if reference_density <= 0:
+        raise ValueError(
+            f"reference_density must be positive; got {reference_density} m^-3."
+        )
+    return reference_density
+
+
 def _fractions(densities: np.ndarray) -> np.ndarray:
     """Row-wise fractions of a ``(n_population, n_time)`` density array."""
     total = densities.sum(axis=0)
@@ -1248,7 +1544,7 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
     ions,
     *,
     position,
-    reference_density,
+    reference_density=None,
     probe_wavelength,
     epw_wavelengths,
     iaw_wavelengths=None,
@@ -1283,11 +1579,15 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
         Where along the spatial axis to sample, in m if given as a bare float. Each
         species independently uses its own nearest grid point, so the species need
         not share a spatial grid.
-    reference_density : `float` or `~astropy.units.Quantity`
+    reference_density : `float` or `~astropy.units.Quantity`, optional
         The physical density corresponding to a unit zeroth moment of the supplied
         phase space, in m\ :sup:`-3` if given as a bare float. For a PIC code that
-        normalises density to a reference :math:`n_0`, this is :math:`n_0`. A reader
-        that already produces ``f`` in SI should pass ``1 * u.m**-3``.
+        normalises density to a reference :math:`n_0`, this is :math:`n_0`; for a
+        reader that already produces ``f`` in SI it is ``1 * u.m**-3``. Every
+        reader in this module records the right value in
+        `PICPhaseSpace.meta`, so the default -- `None` -- takes it from there and
+        raises if the species disagree. Pass it explicitly to override, or for
+        phase spaces built by hand.
     probe_wavelength : `~astropy.units.Quantity`
         Probe laser wavelength.
     epw_wavelengths : `~astropy.units.Quantity`
@@ -1370,11 +1670,7 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
             )
 
     position = float(_si_values(position, u.m))
-    reference_density = float(_si_values(reference_density, u.m**-3))
-    if reference_density <= 0:
-        raise ValueError(
-            f"reference_density must be positive; got {reference_density} m^-3."
-        )
+    reference_density = _resolve_reference_density(all_species, reference_density)
 
     # Reduce every species to the sampled point first. Conditioning acts
     # independently on each (time, position) slice, so this is equivalent to
@@ -1975,6 +2271,163 @@ def _warpx_fields(dataset, species: str) -> tuple[tuple[str, ...], tuple[str, ..
     return positions, momenta
 
 
+#: Which physical directions a WarpX run of each dimensionality spans. A 1-D run
+#: is along ``z`` and a 2-D run spans ``x``-``z``, even though the plotfile stores
+#: their coordinates as ``particle_position_x`` and ``particle_position_{x,y}``.
+_WARPX_DECK_AXES = {1: ("z",), 2: ("x", "z"), 3: ("x", "y", "z")}
+
+
+def _warpx_auto_momentum_field(species: str, n_spatial: int, axis: int) -> str:
+    r"""
+    The momentum component to project onto when the caller named none.
+
+    Only unambiguous in one dimension, where the single resolved direction is the
+    only thing :math:`\\hat{k}` can sensibly lie along. Momenta are stored for all
+    three directions whatever the geometry, so in 2-D and 3-D a default would be a
+    silently wrong answer rather than an error -- refuse instead.
+    """
+    if n_spatial == 1:
+        return "particle_momentum_z"
+    deck = _WARPX_DECK_AXES.get(n_spatial, ())
+    likely = (
+        f"particle_momentum_{deck[axis]}" if axis < len(deck) else "particle_momentum_z"
+    )
+    raise ValueError(
+        f"{species!r} comes from a {n_spatial}-D run, where no single momentum "
+        "component is the scattering direction in general: the Thomson k vector "
+        "is set by the probe and detector geometry, not by the grid. Pass "
+        "scatter_direction as the unit vector k in simulation coordinates "
+        "(the physically correct choice), or momentum_field explicitly to "
+        f"project onto one axis -- {likely!r} is the run's own axis {axis}."
+    )
+
+
+def _warpx_step_number(plotfile: Path, prefix: str) -> int | None:
+    """The timestep a plotfile directory name encodes, or `None`."""
+    tail = plotfile.name[len(prefix) :]
+    return int(tail) if tail.isdigit() else None
+
+
+def _warpx_matching_plotfile(reference, prefix: str, step: int | None) -> Path | None:
+    """
+    The plotfile of another diagnostic written at the same step.
+
+    Particles and fields routinely live in separate diagnostics -- one written
+    with ``write_species = 0``, the other with ``fields_to_plot = none`` -- so a
+    cross-check between them has to match them up by step number rather than
+    expecting both in one directory.
+    """
+    if step is None:
+        return None
+    candidate = Path(reference) / f"{prefix}{step:06d}"
+    if candidate.is_dir():
+        return candidate
+    for other in sorted(Path(reference).glob(f"{prefix}*")):
+        if other.is_dir() and _warpx_step_number(other, prefix) == step:
+            return other
+    return None
+
+
+def _warpx_rho_field(dataset, species: str) -> tuple[str, str] | None:
+    """The per-species charge-density field in a plotfile, or `None`."""
+    wanted = f"rho_{species}"
+    for kind, mesh_name in dataset.field_list:
+        if mesh_name == wanted:
+            return (kind, mesh_name)
+    return None
+
+
+def _warpx_deposited_weight(dataset, species: str, charge: float) -> float | None:
+    r"""
+    Total physical particles of *species*, from the charge the code deposited.
+
+    Integrating ``rho_<species>`` over the domain and dividing by the charge
+    gives the same number as summing macroparticle weights -- unless the
+    particles being read are not the particles the code deposited. The common
+    way for that to happen is ``<diag>.<species>.random_fraction``, which
+    subsamples the particle output *without* reweighting, so every density built
+    from it is low by that factor with nothing in the file to say so.
+
+    Returns `None` when the plotfile carries no charge density for *species*.
+    """
+    field = _warpx_rho_field(dataset, species)
+    if field is None or charge == 0:
+        return None
+    try:
+        left = np.asarray(dataset.domain_left_edge.to("m"), dtype=np.float64)
+        right = np.asarray(dataset.domain_right_edge.to("m"), dtype=np.float64)
+        dimensions = np.asarray(dataset.domain_dimensions, dtype=int)
+        # yt hands boxlib fields over as dimensionless, and cell_volume in code
+        # units, so take the cell volume from the domain instead -- exact for
+        # the uniform level-0 grid a WarpX plotfile holds. Directions the run
+        # does not resolve span 1 m in WarpX, which is already in the edges.
+        cell_volume = float(np.prod(np.abs(right - left) / np.maximum(dimensions, 1)))
+        grid = dataset.covering_grid(
+            level=0,
+            left_edge=dataset.domain_left_edge,
+            dims=dataset.domain_dimensions,
+        )
+        total_charge = float(np.sum(np.asarray(grid[field], dtype=np.float64)))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        # yt's frontends differ in how they name and unit-tag mesh fields; a
+        # cross-check that cannot be made is not a failure, it is just absent.
+        return None
+    return total_charge * cell_volume / charge
+
+
+def _check_against_deposited_charge(
+    dataset,
+    *,
+    species: str,
+    label: str,
+    charge,
+    particle_weight: float,
+    source: str,
+) -> dict[str, Any] | None:
+    """
+    Compare the macroparticles being read against the charge the code deposited.
+
+    Returns the comparison for the caller to record, or `None` when the plotfile
+    carries no per-species charge density to compare against. Warns when the two
+    disagree by more than `_DENSITY_CHECK_TOLERANCE`.
+    """
+    if charge is None:
+        charge_si = float(Particle(label).charge.to(u.C).value)
+    else:
+        charge_si = float(_si_values(charge, u.C))
+    deposited = _warpx_deposited_weight(dataset, species, charge_si)
+    if deposited is None or deposited == 0:
+        return None
+
+    ratio = particle_weight / deposited
+    if abs(ratio - 1.0) > _DENSITY_CHECK_TOLERANCE:
+        hint = ""
+        if 0 < ratio < 1:
+            hint = (
+                f" A ratio near {ratio:.3g} is what "
+                f"`<diag>.{species}.random_fraction = {ratio:.3g}` produces: that "
+                "option subsamples the particle output without reweighting, so "
+                "every density built from it is low by exactly that factor. Read "
+                "a diagnostic that writes all particles instead."
+            )
+        warnings.warn(
+            f"the macroparticles read for {species!r} carry "
+            f"{particle_weight:.6g} physical particles, but the charge density "
+            f"{f'rho_{species}'!r} in {source} implies {deposited:.6g} -- a "
+            f"ratio of {ratio:.6g}. Densities from this read will be wrong by "
+            f"that factor.{hint}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return {
+        "particle_weight": particle_weight,
+        "deposited_weight": deposited,
+        "ratio": ratio,
+        "charge": charge_si,
+        "source": source,
+    }
+
+
 def _warpx_frame(
     yt,
     plotfile: Path,
@@ -2024,7 +2477,7 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     position_fields=None,
     momentum_fields=None,
     axis: int = 0,
-    momentum_field: str | None = "particle_momentum_z",
+    momentum_field: str | None = "auto",
     scatter_direction=None,
     transverse_position=None,
     transverse_reduction: str = "slab",
@@ -2033,11 +2486,16 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     n_velocity_bins: int = 512,
     n_position_bins: int = 512,
     velocity_range=None,
+    velocity_scan: str = "all",
     position_range=None,
     transverse_area: float | None = None,
     timesteps=None,
     prefix: str = "diag1",
     cache=None,
+    validate_density: bool = True,
+    density_reference: str | None = None,
+    density_reference_path=None,
+    charge=None,
     progress: bool = True,
 ) -> PICPhaseSpace:
     r"""
@@ -2075,8 +2533,11 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     momentum_field : `str`, optional
         Shorthand for pointing the scattering vector along a single momentum
         component; equivalent to passing that unit vector as *scatter_direction*.
-        The default suits a 1-D run along the deck's ``z``. For 2-D or 3-D set
-        *scatter_direction* instead, since no single component is then correct.
+        The default, ``"auto"``, resolves to ``"particle_momentum_z"`` for a 1-D
+        run -- the only direction such a run resolves -- and **raises** for 2-D
+        and 3-D, where momenta are stored for all three directions and any
+        default would be a silently wrong projection. Set *scatter_direction*
+        there instead.
     scatter_direction : array_like, optional
         The scattering vector :math:`\hat{k}` in *simulation* coordinates. The
         binned velocity is the component of the particle velocity along it, which
@@ -2103,8 +2564,17 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     velocity_range, position_range : pair of `float`, optional
         Histogram bounds, in m/s and m. *position_range* defaults to the
         simulation domain. *velocity_range* defaults to a symmetric range around
-        zero covering the first and last frames with 20% headroom -- pass it
-        explicitly for a reproducible grid.
+        zero with 20% headroom over the fastest particle found by the scan below
+        -- pass it explicitly for a grid that does not depend on the frames read.
+        Particles falling outside either range are discarded by the histogram; the
+        reader counts them and warns if they carry an appreciable share of the
+        weight.
+    velocity_scan : ``'all'`` or ``'ends'``
+        Which frames size the default *velocity_range*. ``"all"`` -- the default
+        -- reads every frame first, costing a second pass but sizing the axis to
+        what the run actually does. ``"ends"`` uses only the first and last
+        frames, which is faster but clips whatever happens in between; for a
+        shock, that is the measurement. Ignored when *velocity_range* is given.
     transverse_area : `float`, optional
         Cross-sectional area in m\ :sup:`2` used to turn macroparticle weights
         into a density. Defaults to the product of the domain's transverse
@@ -2118,6 +2588,26 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
         ``.npz`` file to memoise the binned result in. Reading and histogramming
         millions of macroparticles across a long series is slow, and the result
         only depends on the settings recorded alongside it.
+    validate_density : `bool`
+        Cross-check the macroparticles being read against ``rho_<species>``, the
+        charge density the code itself deposited, and warn if the two disagree.
+        This is what catches a diagnostic written with ``random_fraction``, which
+        subsamples particles without reweighting and so makes every density built
+        from it low by that factor, with nothing in the file to say so. Skipped
+        silently when no plotfile carries a charge density for *species*.
+    density_reference : `str`, optional
+        Prefix of another diagnostic whose plotfiles carry ``rho_<species>``,
+        matched to the particle plotfiles by step number. Particles and fields
+        routinely live in separate diagnostics -- one written with
+        ``write_species = 0``, the other with ``fields_to_plot = none`` -- and
+        the check is only possible across them. The default looks in the
+        particle plotfile itself.
+    density_reference_path : path-like, optional
+        Directory holding the *density_reference* plotfiles, if not *path*.
+    charge : `float` or `~astropy.units.Quantity`, optional
+        Charge the *simulation* gave this species, for *validate_density*, in C
+        if a bare float. Defaults to the physical charge of *label*, which is
+        right unless the deck changed it.
     progress : `bool`
         Show a progress bar while reading.
 
@@ -2192,7 +2682,15 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
         "n_position_bins": n_position_bins,
         "velocity_range": None if velocity_range is None else list(velocity_range),
         "position_range": None if position_range is None else list(position_range),
+        # Both of the following change ``f`` -- transverse_area scales it
+        # linearly, and timesteps changes which frames it holds -- so both have
+        # to key the cache. Leaving them out let a cache built from a five-frame
+        # test read be reused, silently, for the full series.
+        "transverse_area": transverse_area,
+        "timesteps": None if timesteps is None else [int(s) for s in timesteps],
+        "velocity_scan": velocity_scan,
         "prefix": prefix,
+        "density_reference": density_reference,
     }
     signature = repr(sorted(settings.items()))
 
@@ -2233,16 +2731,15 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     # vector. Naming a single momentum component is the same as pointing k at
     # that axis, so both routes go through one projection.
     if scatter_direction is None:
-        if momentum_field in momentum_fields:
-            component = momentum_fields.index(momentum_field)
-        elif momentum_field is None:
-            component = min(axis, len(momentum_fields) - 1)
-        else:
+        if momentum_field in (None, "auto"):
+            momentum_field = _warpx_auto_momentum_field(species, n_spatial, axis)
+        if momentum_field not in momentum_fields:
             raise KeyError(
                 f"{species!r} has no {momentum_field!r}; it carries "
                 f"{list(momentum_fields)}. Pass momentum_field or "
                 "scatter_direction explicitly."
             )
+        component = momentum_fields.index(momentum_field)
         direction = np.zeros(len(momentum_fields))
         direction[component] = 1.0
     else:
@@ -2264,10 +2761,39 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
 
     # --- fix the histogram grid, so every frame shares one axis ---
     read = (position_fields, momentum_fields)
-    probes = [_warpx_frame(yt, plotfiles[0], species, *read)]
-    if len(plotfiles) > 1:
-        probes.append(_warpx_frame(yt, plotfiles[-1], species, *read))
-    left, right = probes[0][4]
+    if velocity_scan not in {"all", "ends"}:
+        raise ValueError(
+            f"velocity_scan must be 'all' or 'ends'; got {velocity_scan!r}."
+        )
+    # Only the domain edges are needed before the range is settled; take them
+    # from the first frame, which every path reads anyway.
+    first = _warpx_frame(yt, plotfiles[0], species, *read)
+    left, right = first[4]
+
+    density_check: dict[str, Any] | None = None
+    if validate_density:
+        reference_dataset, reference_name = probe_dataset, plotfiles[0].name
+        if density_reference is not None:
+            step = _warpx_step_number(plotfiles[0], prefix)
+            match = _warpx_matching_plotfile(
+                path if density_reference_path is None else density_reference_path,
+                density_reference,
+                step,
+            )
+            if match is None:
+                raise FileNotFoundError(
+                    f"no {density_reference}* plotfile at step {step} to check "
+                    f"{plotfiles[0].name} against."
+                )
+            reference_dataset, reference_name = yt.load(str(match)), match.name
+        density_check = _check_against_deposited_charge(
+            reference_dataset,
+            species=species,
+            label=label,
+            charge=charge,
+            particle_weight=float(np.sum(first[2])),
+            source=reference_name,
+        )
 
     # --- which particles the scattering volume contains ---
     transverse_axes = [k for k in range(n_spatial) if k != axis]
@@ -2309,22 +2835,41 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
             keep &= np.abs(positions[k] - centres[k]) <= width
         return keep
 
-    extreme = max(
-        (
-            float(np.max(np.abs(velocities(momenta[:, select(positions)]))))
-            for positions, momenta, _, _, _ in probes
-            if momenta.size and select(positions).any()
-        ),
-        default=0.0,
-    )
-
     if velocity_range is None:
+        # Scanning every frame costs a second read pass, but the alternative --
+        # inferring the axis from the first and last frames alone -- silently
+        # clips whatever the run does in between, which for a shock is the
+        # entire point of the measurement.
+        if velocity_scan == "all":
+            scanned = list(plotfiles)
+        else:
+            scanned = list(dict.fromkeys([plotfiles[0], plotfiles[-1]]))
+        # The first frame is already in hand; re-reading it would double the
+        # cost of the common two-frame scan for nothing.
+        frames = (
+            first
+            if plotfile == plotfiles[0]
+            else _warpx_frame(yt, plotfile, species, *read)
+            for plotfile in (
+                tqdm(scanned, desc=f"Scanning {species} velocity range")
+                if progress and len(scanned) > 2
+                else scanned
+            )
+        )
+        extreme = max(
+            (
+                float(np.max(np.abs(velocities(momenta[:, keep]))))
+                for positions, momenta, _, _, _ in frames
+                if momenta.size and (keep := select(positions)).any()
+            ),
+            default=0.0,
+        )
         if extreme <= 0:
             raise ValueError(
                 f"species {species!r} has no particles in the scattering volume "
-                "in the first or last plotfile, so no velocity range could be "
-                "inferred; pass velocity_range explicitly, widen slab_halfwidth, "
-                "or check transverse_position."
+                f"in any of the {len(scanned)} plotfile(s) scanned, so no "
+                "velocity range could be inferred; pass velocity_range "
+                "explicitly, widen slab_halfwidth, or check transverse_position."
             )
         # Headroom, but never past the speed of light: no particle can live
         # there, and the empty bins would only give the taper more room to
@@ -2378,6 +2923,9 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
 
     blocks = []
     times = []
+    kept_weight = 0.0
+    clipped_weight = 0.0
+    clipped_count = 0
     iterator = (
         tqdm(plotfiles, desc=f"Binning {species} macroparticles")
         if progress
@@ -2386,14 +2934,41 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     for plotfile in iterator:
         positions, momenta, weight, time, _ = _warpx_frame(yt, plotfile, species, *read)
         keep = select(positions)
+        v_kept = velocities(momenta[:, keep])
+        x_kept = positions[axis][keep]
+        w_kept = weight[keep]
+        # np.histogram2d drops out-of-range samples without saying so. Count
+        # the ones lost to the velocity axis, because a clipped distribution
+        # tail is exactly the failure the taper then hides. Only particles the
+        # probe volume contains count: narrowing the position range is a
+        # deliberate selection, like the transverse slab, not a loss.
+        inside_x = (x_kept >= x_lo) & (x_kept <= x_hi)
+        outside_v = inside_x & ((v_kept < v_lo) | (v_kept > v_hi))
+        clipped_count += int(np.count_nonzero(outside_v))
+        clipped_weight += float(w_kept[outside_v].sum())
+        kept_weight += float(w_kept[inside_x].sum())
         histogram, _, _ = np.histogram2d(
-            velocities(momenta[:, keep]),
-            positions[axis][keep],
+            v_kept,
+            x_kept,
             bins=[v_edges, x_edges],
-            weights=weight[keep],
+            weights=w_kept,
         )
         blocks.append(histogram / bin_volume)
         times.append(time)
+
+    clipped_fraction = clipped_weight / kept_weight if kept_weight > 0 else 0.0
+    if clipped_count and clipped_fraction > _CLIP_WARNING_FRACTION:
+        warnings.warn(
+            f"{clipped_count} {species!r} macroparticle(s) carrying "
+            f"{100 * clipped_fraction:.2f}% of the weight inside the scattering "
+            f"volume fell outside the velocity axis "
+            f"[{v_lo:.3e}, {v_hi:.3e}] m/s and were discarded, so the "
+            "distribution is missing that much of its tail. Widen "
+            "velocity_range, or leave it unset with velocity_scan='all' so the "
+            "axis is sized from every frame.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     f = np.stack(blocks)
     t = np.asarray(times, dtype=np.float64)
@@ -2405,6 +2980,13 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
         "scatter_direction": direction.tolist(),
         "n_spatial": n_spatial,
         "transverse_axes": [position_fields[k] for k in transverse_axes],
+        # f is already a density in m^-3, so the driver needs no further scale.
+        "reference_density": 1.0,
+        "velocity_range": [v_lo, v_hi],
+        "position_range": [x_lo, x_hi],
+        "clipped_count": clipped_count,
+        "clipped_weight_fraction": clipped_fraction,
+        "density_check": density_check,
     }
 
     if cache is not None:
@@ -2434,6 +3016,973 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
             **resolved,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# openPMD phase space, as WarpX's ParticleHistogram2D writes it
+# ---------------------------------------------------------------------------
+
+#: Velocity conventions an openPMD histogram axis can be in.
+_VELOCITY_KINDS = ("beta", "proper", "velocity")
+
+
+def _openpmd_iteration(handle) -> tuple[str, dict[str, Any]]:
+    """
+    Locate the single iteration in a file-based openPMD series.
+
+    Returns its group path and the attributes of the group itself, which carry
+    the physical time.
+    """
+    base = _attr_text(handle, "basePath") if "basePath" in handle.attrs else "/data/%T/"
+    root = base.split("%T")[0].strip("/")
+    group = handle[root] if root else handle
+    iterations = sorted((str(key) for key in group), key=int)
+    if len(iterations) != 1:
+        raise ValueError(
+            f"expected one iteration per file in a file-based openPMD series; "
+            f"found {len(iterations)} in {handle.filename}."
+        )
+    only = iterations[0]
+    path = f"{root}/{only}" if root else only
+    return path, dict(group[only].attrs)
+
+
+def _openpmd_mesh(handle, iteration: str, mesh: str) -> "h5py.Dataset":
+    """The mesh record holding the histogram, as an h5py dataset."""
+    meshes_path = (
+        _attr_text(handle, "meshesPath") if "meshesPath" in handle.attrs else "meshes/"
+    )
+    node = handle[f"{iteration}/{meshes_path.strip('/')}"]
+    if mesh not in node:
+        raise KeyError(
+            f"{handle.filename} has no mesh {mesh!r}; it holds {sorted(node.keys())}."
+        )
+    record = node[mesh]
+    # A scalar record component is the record itself; a vector one would nest.
+    if isinstance(record, h5py.Group):
+        components = sorted(record.keys())
+        if len(components) != 1:
+            raise ValueError(
+                f"mesh {mesh!r} in {handle.filename} has {len(components)} "
+                "components; a phase-space histogram is a scalar record."
+            )
+        record = record[components[0]]
+    return record
+
+
+def read_openpmd_phase_space(  # noqa: C901, PLR0912, PLR0915
+    path,
+    *,
+    label: str,
+    is_electron: bool | None = None,
+    velocity_axis: str = "ordinate",
+    velocity_kind: str = "beta",
+    transverse_area: float = 1.0,
+    position=None,
+    position_scale: float = 1.0,
+    mesh: str = "data",
+    pattern: str = "*.h5",
+    timesteps=None,
+    progress: bool = True,
+) -> PICPhaseSpace:
+    r"""
+    Read a phase space that a PIC code binned itself, from openPMD output.
+
+    Where `read_warpx_phase_space` has to bin raw macroparticles, this reads a
+    histogram the code already built -- WarpX's ``ParticleHistogram2D`` reduced
+    diagnostic, and anything else writing a 2-D openPMD mesh in the same layout.
+    That is much cheaper, needs no ``yt``, and can be written at every timestep
+    rather than at the cadence full plotfiles can afford.
+
+    It is also *more* accurate, if the deck is written the way
+    `histogram2d_deck_block` writes it. Both axes of that diagnostic are
+    arbitrary expressions of the particle state, so the projection onto the
+    scattering vector -- with the Lorentz factor taken from the full momentum --
+    can be evaluated per particle inside the code, rather than reconstructed
+    afterwards from a single stored component.
+
+    Parameters
+    ----------
+    path : path-like
+        Directory the reduced diagnostic wrote, holding one file per iteration.
+    label : `str`
+        `~plasmapy.particles` identifier for the species.
+    is_electron : `bool`, optional
+        Whether this is an electron population. Inferred from *label* if omitted.
+    velocity_axis : ``'ordinate'`` or ``'abscissa'``
+        Which histogram axis holds velocity. ``ParticleHistogram2D`` writes the
+        ordinate first, and `histogram2d_deck_block` puts velocity there.
+    velocity_kind : ``'beta'``, ``'proper'``, or ``'velocity'``
+        What that axis actually is. ``"beta"`` -- the default, and what
+        `histogram2d_deck_block` emits -- is :math:`v \cdot \hat{k} / c`, the
+        lab-frame velocity itself. ``"proper"`` is :math:`u = \gamma v / c`, in
+        which case the reader converts and applies the :math:`\gamma^3 / c`
+        Jacobian; that conversion assumes the other momentum components are
+        negligible, since a single stored component does not determine
+        :math:`\gamma`. ``"velocity"`` is m/s.
+    transverse_area : `float`
+        Cross-section in m\ :sup:`2` of the volume the histogram covers, used to
+        turn binned weights into a density. For a 1-D run with no
+        ``filter_function`` this is 1 m\ :sup:`2`, the extent WarpX gives its
+        unresolved directions. `histogram2d_deck_block` reports the right value
+        for the block it generates.
+    position : `float` or `~astropy.units.Quantity`, optional
+        Reduce to the single grid point nearest here, in m.
+    position_scale : `float`
+        Metres per unit of the position axis, if the abscissa expression is not
+        already in metres.
+    mesh : `str`
+        Name of the openPMD mesh record. ``ParticleHistogram2D`` writes
+        ``"data"``.
+    pattern : `str`
+        Glob for the files. Use ``"*.bp"`` -- with a backend that can read it --
+        if the deck did not set ``openpmd_backend = h5``.
+    timesteps : iterable of `int`, optional
+        Indices into the sorted list of files. The default reads all.
+    progress : `bool`
+        Show a progress bar while reading.
+
+    Returns
+    -------
+    `PICPhaseSpace`
+        With ``f`` in SI, so `spectra_from_phase_spaces` needs no density scale.
+
+    Raises
+    ------
+    `FileNotFoundError`
+        If no files match *pattern* in *path*.
+
+    Notes
+    -----
+    The histogram holds :math:`\sum w`, a count of physical particles per bin,
+    so the reader divides by the bin's phase-space volume -- velocity width,
+    position width, and *transverse_area* -- to make :math:`\int f\,dv` a number
+    density.
+
+    Bin edges are fixed in the deck and particles outside them are discarded by
+    the code, before anything is written. Nothing in the file records how many,
+    so unlike `read_warpx_phase_space` this reader cannot warn about a clipped
+    tail. Choose the bounds generously.
+
+    Examples
+    --------
+    .. code-block:: python
+
+       electrons = read_openpmd_phase_space(
+           "runs/R1/diags/reducedfiles/eps_electrons",
+           label="e-",
+           transverse_area=2.0e-8,
+       )
+    """
+    path = Path(path)
+    if velocity_axis not in {"ordinate", "abscissa"}:
+        raise ValueError(
+            f"velocity_axis must be 'ordinate' or 'abscissa'; got {velocity_axis!r}."
+        )
+    if velocity_kind not in _VELOCITY_KINDS:
+        raise ValueError(
+            f"velocity_kind must be one of {_VELOCITY_KINDS}; got {velocity_kind!r}."
+        )
+
+    files = sorted(p for p in path.glob(pattern) if p.is_file())
+    if not files:
+        raise FileNotFoundError(f"no files matching {pattern!r} in {path}")
+    if timesteps is not None:
+        try:
+            files = [files[int(step)] for step in timesteps]
+        except IndexError as error:
+            raise IndexError(
+                f"requested a file beyond the {len(files)} present in {path}."
+            ) from error
+
+    blocks = []
+    times = []
+    axes: tuple[np.ndarray, np.ndarray] | None = None
+    functions: dict[str, str] = {}
+    iterator = (
+        tqdm(files, desc=f"Reading {path.name} phase space") if progress else files
+    )
+    for file in iterator:
+        with h5py.File(file, "r") as handle:
+            iteration, iteration_attrs = _openpmd_iteration(handle)
+            record = _openpmd_mesh(handle, iteration, mesh)
+            data = np.asarray(record[()], dtype=np.float64)
+            attrs = dict(record.attrs)
+            time_unit = float(iteration_attrs.get("timeUnitSI", 1.0))
+            times.append(float(iteration_attrs["time"]) * time_unit)
+
+            grid_unit = float(attrs.get("gridUnitSI", 1.0))
+            spacing = np.asarray(attrs["gridSpacing"], dtype=np.float64) * grid_unit
+            offset = np.asarray(attrs["gridGlobalOffset"], dtype=np.float64) * grid_unit
+            centre = np.asarray(
+                attrs.get("position", [0.5] * data.ndim), dtype=np.float64
+            )
+            built = tuple(
+                offset[k] + spacing[k] * (np.arange(data.shape[k]) + centre[k])
+                for k in range(data.ndim)
+            )
+            if axes is None:
+                axes = built
+                for name in ("function_abscissa", "function_ordinate", "filter"):
+                    if name in attrs:
+                        functions[name] = _attr_text(record, name)
+            elif not all(np.allclose(a, b) for a, b in zip(axes, built, strict=True)):
+                raise ValueError(
+                    f"{file.name} is binned on a different grid from the first "
+                    "file; a phase space needs one axis for the whole series."
+                )
+        blocks.append(data)
+
+    if axes is None or len(axes) != 2:  # pragma: no cover - guarded by the reads above
+        raise ValueError("expected a 2-D histogram.")
+
+    # openPMD orders the axes (ordinate, abscissa), matching (velocity,
+    # position) for the block this module's deck helper generates.
+    stacked = np.stack(blocks)
+    ordinate, abscissa = axes
+    if velocity_axis == "ordinate":
+        velocity_raw, x_axis = ordinate, abscissa
+    else:
+        velocity_raw, x_axis = abscissa, ordinate
+        stacked = np.transpose(stacked, (0, 2, 1))
+
+    x_axis = x_axis * position_scale
+    velocity_width = float(np.mean(np.diff(velocity_raw)))
+    position_width = float(np.mean(np.diff(x_axis)))
+
+    speed_of_light = const.c.si.value
+    if velocity_kind == "velocity":
+        v_axis = velocity_raw
+        jacobian = 1.0
+    elif velocity_kind == "beta":
+        v_axis = velocity_raw * speed_of_light
+        velocity_width *= speed_of_light
+        jacobian = 1.0
+    else:
+        gamma = np.sqrt(1.0 + velocity_raw**2)
+        v_axis = velocity_raw * speed_of_light / gamma
+        # Binning is uniform in u, so the density per unit v carries du/dv.
+        jacobian = (gamma**3 / speed_of_light)[np.newaxis, :, np.newaxis]
+
+    if np.any(np.diff(v_axis) <= 0):
+        raise ValueError(
+            "the velocity axis is not strictly increasing after conversion; "
+            "check velocity_kind and the deck's bin_min/bin_max ordering."
+        )
+
+    bin_volume = abs(velocity_width) * abs(position_width) * transverse_area
+    f = stacked * jacobian / bin_volume
+
+    phase_space = from_arrays(
+        f=f,
+        v=v_axis,
+        x=x_axis,
+        t=np.asarray(times, dtype=np.float64),
+        label=label,
+        is_electron=is_electron,
+        meta={
+            "code": "openPMD histogram",
+            "path": str(path),
+            "files": [p.name for p in files],
+            "mesh": mesh,
+            "velocity_axis": velocity_axis,
+            "velocity_kind": velocity_kind,
+            "transverse_area": transverse_area,
+            "reference_density": 1.0,
+            **functions,
+        },
+    )
+    return phase_space if position is None else phase_space.at_position(position)
+
+
+def histogram2d_deck_block(
+    name: str,
+    species: str,
+    *,
+    position_range,
+    velocity_range,
+    scatter_direction=(0.0, 0.0, 1.0),
+    position_axis: str = "z",
+    n_position_bins: int = 512,
+    n_velocity_bins: int = 512,
+    intervals: int | str = 100,
+    transverse_slab=None,
+    backend: str = "h5",
+) -> tuple[str, float]:
+    r"""
+    Generate the deck block for a WarpX phase-space diagnostic, and its area.
+
+    `read_openpmd_phase_space` can only be as good as the diagnostic it reads,
+    and the two have to agree about what the axes mean. This writes the
+    ``ParticleHistogram2D`` block that produces exactly what that reader expects:
+    position along the abscissa in metres, and the lab-frame velocity along
+    :math:`\hat{k}` -- in units of :math:`c` -- along the ordinate.
+
+    The velocity expression is worth reading:
+
+    .. code-block:: text
+
+       (kx*ux + ky*uy + kz*uz) / sqrt(1 + ux*ux + uy*uy + uz*uz)
+
+    WarpX gives the parser ``ux`` as :math:`\gamma v_x / c`, so this is
+    :math:`(\gamma \vec{v} \cdot \hat{k} / c) / \gamma`, the projection of the
+    lab-frame velocity onto the scattering vector, with :math:`\gamma` taken
+    from the **full** momentum. It is evaluated per particle inside the code,
+    which is something no reader working from a single stored momentum component
+    can reproduce.
+
+    Parameters
+    ----------
+    name : `str`
+        Name of the reduced diagnostic.
+    species : `str`
+        WarpX species name.
+    position_range : pair of `float` or `~astropy.units.Quantity`
+        Bounds of the position axis, in m if bare. Particles outside are
+        discarded by the code, silently -- cover the whole region of interest.
+    velocity_range : pair of `float` or `~astropy.units.Quantity`
+        Bounds of the velocity axis, in m/s if bare, converted to units of
+        :math:`c` for the deck.
+    scatter_direction : array_like
+        The scattering vector :math:`\hat{k}` in simulation coordinates.
+    position_axis : ``'x'``, ``'y'``, or ``'z'``
+        Which coordinate the abscissa bins.
+    n_position_bins, n_velocity_bins : `int`
+        Histogram resolution. Fixed at deck time; there is no rebinning later.
+    intervals : `int` or `str`
+        WarpX ``intervals`` string for the diagnostic. A reduced diag is cheap
+        enough to write far more often than a full plotfile, which is most of
+        the reason to use one.
+    transverse_slab : `dict`, optional
+        Scattering volume across the beam, as ``{axis: (centre, half_width)}``
+        in m -- for example ``{"y": (0.0, 50e-6)}``. Becomes a
+        ``filter_function``, so the selection happens in the code rather than
+        after the fact. Omit to integrate over the whole transverse extent.
+    backend : `str`
+        openPMD backend. ``"h5"`` keeps the output readable by `h5py` alone,
+        which is what `read_openpmd_phase_space` needs; WarpX otherwise defaults
+        to ``bp5`` wherever ADIOS2 is compiled in.
+
+    Returns
+    -------
+    block : `str`
+        Deck text, ready to paste in.
+    transverse_area : `float`
+        Cross-section in m\ :sup:`2` the block selects -- pass this straight to
+        `read_openpmd_phase_space` so its densities come out right.
+
+    Notes
+    -----
+    The area returned assumes the unresolved directions of the run span 1 m,
+    which is WarpX's convention, and that any axis not named in
+    *transverse_slab* is left unfiltered and so contributes 1 m as well. For a
+    2-D or 3-D run, filter every transverse direction and the area is the
+    product of the slab thicknesses.
+
+    Examples
+    --------
+    .. code-block:: python
+
+       block, area = histogram2d_deck_block(
+           "eps_electrons",
+           "electrons",
+           position_range=(0, 2e-3) * u.m,
+           velocity_range=(-2e8, 2e8) * u.m / u.s,
+           scatter_direction=(0, 0, 1),
+       )
+       print(block)
+    """
+    if position_axis not in "xyz":
+        raise ValueError(f"position_axis must be x, y, or z; got {position_axis!r}.")
+    direction = np.asarray(scatter_direction, dtype=np.float64).ravel()
+    if direction.size != 3:
+        raise ValueError(f"scatter_direction must be a 3-vector; got {direction.size}.")
+    norm = np.linalg.norm(direction)
+    if norm == 0:
+        raise ValueError("scatter_direction must not be the zero vector.")
+    direction = direction / norm
+
+    x_lo, x_hi = (float(_si_values(bound, u.m)) for bound in position_range)
+    v_lo, v_hi = (
+        float(_si_values(bound, u.m / u.s)) / const.c.si.value
+        for bound in velocity_range
+    )
+    if x_hi <= x_lo or v_hi <= v_lo:
+        raise ValueError("ranges must be given as (low, high) with high > low.")
+
+    # Drop the components k does not touch: the expression is read by people as
+    # well as by the parser, and "0*ux + 0*uy + 1*uz" hides which axis it is.
+    terms = [
+        f"{weight:.12g}*u{letter}"
+        for weight, letter in zip(direction, "xyz", strict=True)
+        if weight != 0.0
+    ]
+    projection = " + ".join(terms).replace("+ -", "- ")
+    velocity_function = f"({projection})/sqrt(1+ux*ux+uy*uy+uz*uz)"
+
+    lines = [
+        f"# --- phase space for plasmapy.diagnostics.pic_thomson, species {species} ---",
+        f"# Append {name} to warpx.reduced_diags_names.",
+        f"{name}.type = ParticleHistogram2D",
+        f"{name}.species = {species}",
+        f"{name}.intervals = {intervals}",
+        f"{name}.openpmd_backend = {backend}",
+        "",
+        "# abscissa: position along the diagnostic axis, in metres",
+        f"{name}.histogram_function_abs(t,x,y,z,ux,uy,uz,w) = {position_axis}",
+        f"{name}.bin_number_abs = {n_position_bins}",
+        f"{name}.bin_min_abs = {x_lo:.12g}",
+        f"{name}.bin_max_abs = {x_hi:.12g}",
+        "",
+        "# ordinate: lab-frame velocity along k-hat, in units of c. ux is",
+        "# gamma*vx/c, so dividing by gamma gives the velocity itself -- with",
+        "# gamma from the full momentum, evaluated per particle in the code.",
+        f"{name}.histogram_function_ord(t,x,y,z,ux,uy,uz,w) = {velocity_function}",
+        f"{name}.bin_number_ord = {n_velocity_bins}",
+        f"{name}.bin_min_ord = {v_lo:.12g}",
+        f"{name}.bin_max_ord = {v_hi:.12g}",
+        "",
+        "# The macroparticle weight is the documented default, but WarpX has a",
+        "# bug here: ParticleHistogram2D reads value_function into m_do_parser_value",
+        "# and then never checks it, so with the option absent the kernel calls a",
+        "# default-constructed (null) ParserExecutor. The histogram then fills with",
+        "# uninitialised memory -- NaN and DBL_MAX in some bins, zero in the rest --",
+        "# rather than failing. Stating the default explicitly avoids that, and is",
+        "# harmless once the bug is fixed.",
+        f"{name}.value_function(t,x,y,z,ux,uy,uz,w) = w",
+    ]
+
+    transverse_area = 1.0
+    if transverse_slab:
+        conditions = []
+        for coordinate, bounds in sorted(transverse_slab.items()):
+            if coordinate not in "xyz":
+                raise ValueError(
+                    f"transverse_slab keys must be x, y, or z; got {coordinate!r}."
+                )
+            slab_centre = float(_si_values(bounds[0], u.m))
+            slab_half_width = float(_si_values(bounds[1], u.m))
+            if slab_half_width <= 0:
+                raise ValueError(
+                    f"the {coordinate} slab half-width must be positive; "
+                    f"got {slab_half_width}."
+                )
+            conditions.append(
+                f"({coordinate}>{slab_centre - slab_half_width:.12g})"
+                f"*({coordinate}<{slab_centre + slab_half_width:.12g})"
+            )
+            transverse_area *= 2.0 * slab_half_width
+        lines += [
+            "",
+            "# the scattering volume across the beam, selected in the code",
+            f"{name}.filter_function(t,x,y,z,ux,uy,uz,w) = " + "*".join(conditions),
+        ]
+
+    lines += [
+        "",
+        "# Read it back with:",
+        f"#   read_openpmd_phase_space(<diags>/reducedfiles/{name},",
+        f"#                            label=..., transverse_area={transverse_area:.12g})",
+    ]
+    return "\n".join(lines), transverse_area
+
+
+# ---------------------------------------------------------------------------
+# Hybrid (kinetic-ion / fluid-electron) WarpX output
+# ---------------------------------------------------------------------------
+
+
+def _warpx_mesh_field(dataset, name: str) -> tuple[str, str] | None:
+    """Locate a mesh field by name whatever frontend prefix yt gave it."""
+    for kind, mesh_name in dataset.field_list:
+        if mesh_name == name and kind != "io":
+            return (kind, mesh_name)
+    return None
+
+
+def _warpx_field_frame(
+    yt, plotfile: Path, names: list[str]
+) -> tuple[dict[str, np.ndarray], float, tuple, dict[int, float], list[int]]:
+    """
+    Read named mesh fields from one plotfile onto a uniform grid.
+
+    Returns ``(fields, time, (left, right), spacing, resolved)`` where *fields*
+    maps each name to an array over the run's resolved directions only,
+    *spacing* is the cell size along each of those, and *resolved* lists the
+    physical direction index (0, 1, 2 for x, y, z) each grid axis corresponds
+    to. Squeezing the unresolved directions is what lets one code path serve
+    1-D, 2-D, and 3-D runs.
+    """
+    dataset = yt.load(str(plotfile))
+    dimensions = np.asarray(dataset.domain_dimensions, dtype=int)
+    left = np.asarray(dataset.domain_left_edge.to("m"), dtype=np.float64)
+    right = np.asarray(dataset.domain_right_edge.to("m"), dtype=np.float64)
+
+    grid = dataset.covering_grid(
+        level=0, left_edge=dataset.domain_left_edge, dims=dataset.domain_dimensions
+    )
+    fields = {}
+    for name in names:
+        located = _warpx_mesh_field(dataset, name)
+        if located is None:
+            raise KeyError(
+                f"{plotfile.name} carries no mesh field {name!r}; it has "
+                f"{sorted({f for _, f in dataset.field_list})}. Add it to the "
+                "diagnostic's fields_to_plot."
+            )
+        fields[name] = np.asarray(grid[located], dtype=np.float64)
+
+    # WarpX pads a 1-D or 2-D run out to three grid axes; drop the flat ones,
+    # remembering which physical direction each surviving axis is.
+    grid_axes = [k for k in range(len(dimensions)) if dimensions[k] > 1]
+    n_grid = len(dimensions)
+    deck = _WARPX_DECK_AXES.get(len(grid_axes), tuple("xyz"[:n_grid]))
+    resolved = ["xyz".index(direction) for direction in deck]
+    for name, data in fields.items():
+        fields[name] = data.reshape([dimensions[k] for k in grid_axes])
+
+    spacing = {
+        physical: float(abs(right[k] - left[k]) / max(int(dimensions[k]), 1))
+        for physical, k in zip(resolved, grid_axes, strict=True)
+    }
+    return fields, float(dataset.current_time), (left, right), spacing, resolved
+
+
+def _curl_along(direction, magnetic, spacing, resolved) -> np.ndarray | float:
+    r"""
+    The component of :math:`\nabla \times \vec{B}` along *direction*.
+
+    *magnetic* maps a physical direction index to that component of
+    :math:`\vec{B}`; a component that is absent from the run is taken to be
+    zero, and so are derivatives along unresolved directions. That second point
+    is what makes the 1-D case exact and free: with only :math:`\partial_z`
+    surviving, :math:`(\nabla \times \vec{B})_z \equiv 0`, so a probe looking
+    along the axis of a 1-D run needs no magnetic field at all.
+    """
+
+    def derivative(along: int, component: int) -> np.ndarray | float:
+        if along not in resolved or component not in magnetic:
+            return 0.0
+        return np.gradient(
+            magnetic[component], spacing[along], axis=resolved.index(along)
+        )
+
+    curl = [
+        derivative(1, 2) - derivative(2, 1),
+        derivative(2, 0) - derivative(0, 2),
+        derivative(0, 1) - derivative(1, 0),
+    ]
+    total = 0.0
+    for weight, term in zip(direction, curl, strict=True):
+        if weight != 0.0:
+            total = total + weight * term
+    return total
+
+
+def _curl_needs(direction, resolved) -> set[int]:
+    """Which magnetic components a curl along *direction* actually differentiates."""
+    needed: set[int] = set()
+    pairs = {0: ((1, 2), (2, 1)), 1: ((2, 0), (0, 2)), 2: ((0, 1), (1, 0))}
+    for component, weight in enumerate(direction):
+        if weight == 0.0:
+            continue
+        for along, source in pairs[component]:
+            if along in resolved:
+                needed.add(source)
+    return needed
+
+
+def read_warpx_hybrid_electrons(  # noqa: C901, PLR0912, PLR0915
+    path,
+    *,
+    scatter_direction=None,
+    axis: int = 0,
+    label: str = "e-",
+    mass=None,
+    charge_state: float = 1.0,
+    density_field: str = "rho",
+    temperature_field: str | None = "Te",
+    temperature_unit=u.eV,
+    closure: dict[str, Any] | None = None,
+    drift: str = "ampere",
+    current_prefix: str = "j",
+    magnetic_prefix: str = "B",
+    transverse_position=None,
+    transverse_reduction: str = "slab",
+    slab_halfwidth=None,
+    position=None,
+    v=None,
+    n_velocity_bins: int = 512,
+    timesteps=None,
+    prefix: str = "diag1",
+    progress: bool = True,
+) -> PICPhaseSpace:
+    r"""
+    Reconstruct the electron phase space of a hybrid WarpX run from its moments.
+
+    WarpX's kinetic-ion / fluid-electron solver has no electron macroparticles:
+    the electrons are an inertialess, quasineutral fluid, and everything the run
+    knows about them is in three mesh fields. This reads those fields and hands
+    the resulting drifting Maxwellian to `from_moments`, so a hybrid run can be
+    forward-modelled by exactly the same pipeline as a fully kinetic one.
+
+    The three moments come from:
+
+    * **Density.** :math:`n_e = \rho / (Z e)`. Quasineutrality is how the solver
+      defines the electron density, so with only ions carried as particles the
+      deposited charge density *is* the electron density -- this is exact, not an
+      estimate.
+    * **Temperature.** The ``Te`` field, when the run solves an electron energy
+      equation and dumps it. Otherwise the barotropic closure
+      :math:`T_e = T_{e0} (n_e / n_0)^{\gamma - 1}`, via *closure*.
+    * **Drift.** :math:`\vec{J}_e = \nabla \times \vec{B} / \mu_0 - \vec{J}_i`
+      and :math:`\vec{u}_e = -\vec{J}_e / (e n_e)`, where :math:`\vec{J}_i` is
+      the current the ion macroparticles deposited -- what the ``j`` fields hold
+      in this solver, since the electrons deposit nothing.
+
+    Parameters
+    ----------
+    path : path-like
+        Directory holding the plotfiles, conventionally ``<run>/diags``.
+    scatter_direction : array_like, optional
+        The scattering vector :math:`\hat{k}` in simulation coordinates, as a
+        3-vector. Defaults to the run's own axis for a 1-D run, and is required
+        otherwise.
+    axis : `int`
+        Which resolved direction is the diagnostic axis.
+    label : `str`
+        Species identifier; ``"e-"`` unless the fluid stands for something else.
+    mass : `float` or `~astropy.units.Quantity`, optional
+        Mass setting the thermal width. Defaults to the electron mass. Note that
+        the solver's massless-electron approximation does not apply here -- see
+        the notes on `from_moments`.
+    charge_state : `float`
+        Mean ion charge :math:`\bar{Z}` relating the deposited charge density to
+        the electron density. ``1`` unless *density_field* is a per-species
+        ``rho_<name>`` rather than the total.
+    density_field : `str`
+        Mesh field holding the charge density, in C/m\ :sup:`3`.
+    temperature_field : `str`, optional
+        Mesh field holding the electron temperature. `None` forces the closure.
+    temperature_unit : `~astropy.units.UnitBase`
+        Unit of *temperature_field*. WarpX dumps ``Te`` in eV, matching the unit
+        ``hybrid_pic_model.elec_temp`` is given in.
+    closure : `dict`, optional
+        Fallback barotropic closure, as ``{"T_e0": ..., "n0_ref": ...,
+        "gamma": ...}`` -- the deck's ``hybrid_pic_model`` parameters. Used only
+        when *temperature_field* is `None` or absent from the plotfiles.
+    drift : ``'ampere'``, ``'ion_current'``, or ``'zero'``
+        How to get the electron fluid velocity. ``"ampere"`` -- the default --
+        subtracts the deposited ion current from
+        :math:`\nabla \times \vec{B} / \mu_0`. ``"ion_current"`` assumes the
+        total current vanishes along :math:`\hat{k}`, which is **exact** for a
+        1-D run probed along its own axis and an approximation otherwise.
+        ``"zero"`` ignores the drift entirely.
+    current_prefix, magnetic_prefix : `str`
+        Name stems of the current and magnetic field components, so that
+        ``"j"`` means ``jx``, ``jy``, ``jz``.
+    transverse_position, transverse_reduction, slab_halfwidth : optional
+        The scattering volume, as in `read_warpx_phase_space`. Fields are
+        **averaged** over the transverse directions kept, since they are
+        intensive.
+    position : `float` or `~astropy.units.Quantity`, optional
+        Sample the diagnostic axis here, returning the single point the probe
+        looks at rather than a profile.
+    v : array_like, optional
+        Velocity axis, passed to `from_moments`. The default is sized from the
+        moments themselves.
+    n_velocity_bins : `int`
+        Resolution of the default velocity axis.
+    timesteps : iterable of `int`, optional
+        Indices into the sorted list of plotfiles. The default reads all.
+    prefix : `str`
+        Plotfile name prefix. A hybrid run usually writes a field-only
+        diagnostic at high cadence -- point this at that one, since it is the
+        only thing this reader needs.
+    progress : `bool`
+        Show a progress bar while reading.
+
+    Returns
+    -------
+    `PICPhaseSpace`
+        Electron phase space in SI, ready for `spectra_from_phase_spaces`.
+
+    Raises
+    ------
+    `ValueError`
+        If the deposited charge density is not positive, which means the run is
+        not hybrid -- an explicit run carries electron macroparticles too, and
+        its total ``rho`` is near zero.
+
+    Notes
+    -----
+    The ions of a hybrid run are still macroparticles, so read them with
+    `read_warpx_phase_space` as usual and pass both to the driver.
+
+    What this reconstruction cannot do is invent the electron kinetics the model
+    discarded: no Landau damping off a non-Maxwellian tail, no electron-scale
+    structure. It gives the spectrum the model's own electron population
+    implies, which is the right thing to compare against a kinetic twin.
+
+    Examples
+    --------
+    .. code-block:: python
+
+       electrons = read_warpx_hybrid_electrons(
+           "runs/H3_470eV_eheat/diags",
+           prefix="diag_fields",
+           position=0.5 * u.mm,
+       )
+       ions = read_warpx_phase_space(
+           "runs/H3_470eV_eheat/diags",
+           "amb_ions",
+           mass=100 * const.m_e,
+           label="p+",
+           prefix="diag_phase",
+       )
+    """
+    path = Path(path)
+    if drift not in {"ampere", "ion_current", "zero"}:
+        raise ValueError(
+            f"drift must be 'ampere', 'ion_current', or 'zero'; got {drift!r}."
+        )
+    if transverse_reduction not in {"slab", "chord"}:
+        raise ValueError(
+            f"transverse_reduction must be 'slab' or 'chord'; got "
+            f"{transverse_reduction!r}."
+        )
+
+    yt = _load_yt()
+    plotfiles = _warpx_plotfiles(path, prefix, timesteps)
+
+    # --- work out what to read, from the first frame's geometry ---
+    probe_dataset = yt.load(str(plotfiles[0]))
+    probe, _, (left, right), spacing, resolved = _warpx_field_frame(
+        yt, plotfiles[0], [density_field]
+    )
+    n_spatial = len(resolved)
+    if not 0 <= axis < n_spatial:
+        raise ValueError(
+            f"axis must index one of the {n_spatial} resolved direction(s); got {axis}."
+        )
+
+    if scatter_direction is None:
+        if n_spatial > 1:
+            raise ValueError(
+                f"this is a {n_spatial}-D run, so the scattering direction has "
+                "to be given: pass scatter_direction as the unit vector k in "
+                "simulation coordinates."
+            )
+        direction = np.zeros(3)
+        direction[resolved[axis]] = 1.0
+    else:
+        direction = np.asarray(scatter_direction, dtype=np.float64).ravel()
+        if direction.size != 3:
+            raise ValueError(
+                f"scatter_direction must be a 3-vector; got {direction.size} "
+                "component(s)."
+            )
+        norm = np.linalg.norm(direction)
+        if norm == 0:
+            raise ValueError("scatter_direction must not be the zero vector.")
+        direction = direction / norm
+
+    # Exactly one of these is set below, and the rest of the reader keys off
+    # which: the solved field when the run dumps one, the closure otherwise.
+    names = [density_field]
+    solved_temperature: str | None = None
+    if (
+        temperature_field is not None
+        and _warpx_mesh_field(probe_dataset, temperature_field) is not None
+    ):
+        solved_temperature = temperature_field
+        names.append(solved_temperature)
+    elif closure is None:
+        raise KeyError(
+            f"the plotfiles carry no {temperature_field!r} field and no "
+            "closure was given, so the electron temperature cannot be "
+            "determined. Either add Te to the diagnostic's fields_to_plot, "
+            "or pass closure={'T_e0': ..., 'n0_ref': ..., 'gamma': ...} "
+            "from the deck's hybrid_pic_model block."
+        )
+    else:
+        missing = {"T_e0", "n0_ref", "gamma"} - set(closure)
+        if missing:
+            raise ValueError(f"closure is missing {sorted(missing)}.")
+        reference_density = float(_si_values(closure["n0_ref"], u.m**-3))
+        closure_energy = _thermal_energy(closure["T_e0"] * temperature_unit)
+        closure_exponent = float(closure["gamma"]) - 1.0
+
+    current_components: dict[int, str] = {}
+    magnetic_components: dict[int, str] = {}
+    if drift != "zero":
+        for component, letter in enumerate("xyz"):
+            if direction[component] != 0.0:
+                current_components[component] = f"{current_prefix}{letter}"
+        if drift == "ampere":
+            for component in _curl_needs(direction, resolved):
+                magnetic_components[component] = f"{magnetic_prefix}{'xyz'[component]}"
+        names.extend(current_components.values())
+        names.extend(magnetic_components.values())
+
+    # --- the scattering volume, in the transverse directions ---
+    transverse_axes = [k for k in range(n_spatial) if k != axis]
+    grid_shape = probe[density_field].shape
+    centres = np.array(
+        [0.5 * (left[resolved[k]] + right[resolved[k]]) for k in range(n_spatial)],
+        dtype=np.float64,
+    )
+    if transverse_position is not None:
+        supplied = np.asarray(transverse_position, dtype=np.float64).ravel()
+        if supplied.size != len(transverse_axes):
+            raise ValueError(
+                f"transverse_position needs one coordinate per transverse axis "
+                f"({len(transverse_axes)}); got {supplied.size}."
+            )
+        for value, k in zip(supplied, transverse_axes, strict=True):
+            centres[k] = value
+    half_width = (
+        None if slab_halfwidth is None else float(_si_values(slab_halfwidth, u.m))
+    )
+
+    def cell_centres(k: int) -> np.ndarray:
+        physical = resolved[k]
+        step = spacing[physical]
+        return left[physical] + step * (np.arange(grid_shape[k]) + 0.5)
+
+    keep_slices: list[slice] = []
+    for k in range(n_spatial):
+        if k == axis or transverse_reduction == "chord":
+            keep_slices.append(slice(None))
+            continue
+        width = half_width if half_width is not None else 0.5 * spacing[resolved[k]]
+        lo, hi = _slab_indices(cell_centres(k), centres[k], width)
+        keep_slices.append(slice(lo, hi))
+
+    x_axis = cell_centres(axis)
+
+    def reduce_to_profile(data: np.ndarray) -> np.ndarray:
+        """Slab-average a field down to the diagnostic axis alone."""
+        sliced = data[tuple(keep_slices)]
+        # Average, not sum: these fields are intensive, and summing would scale
+        # them by however many transverse cells happened to be kept.
+        collapse = tuple(k for k in range(n_spatial) if k != axis)
+        return sliced.mean(axis=collapse) if collapse else sliced
+
+    # --- read every frame ---
+    densities = []
+    temperatures = []
+    drifts = []
+    times = []
+    iterator = (
+        tqdm(plotfiles, desc="Reading hybrid electron moments")
+        if progress
+        else plotfiles
+    )
+    elementary_charge = const.e.si.value
+    for plotfile in iterator:
+        fields, time, _, frame_spacing, frame_resolved = _warpx_field_frame(
+            yt, plotfile, names
+        )
+        charge_density = reduce_to_profile(fields[density_field])
+        density = charge_density / (charge_state * elementary_charge)
+
+        if solved_temperature is not None:
+            temperature = (
+                reduce_to_profile(fields[solved_temperature]) * temperature_unit
+            )
+            thermal_energy = _thermal_energy(temperature)
+        else:
+            # Where there is no plasma the closure has nothing to say; leave the
+            # ratio at one so the temperature stays finite and the zero density
+            # carries the point.
+            ratio = np.where(density > 0, density / reference_density, 1.0)
+            thermal_energy = closure_energy * ratio**closure_exponent
+
+        if drift == "zero":
+            velocity = np.zeros_like(density)
+        else:
+            ion_current = sum(
+                direction[component] * fields[name]
+                for component, name in current_components.items()
+            )
+            if drift == "ampere" and magnetic_components:
+                magnetic = {
+                    component: fields[name]
+                    for component, name in magnetic_components.items()
+                }
+                total_current = (
+                    _curl_along(direction, magnetic, frame_spacing, frame_resolved)
+                    / const.mu0.si.value
+                )
+            else:
+                # Either the run resolves nothing that could make a total
+                # current along k -- the exact 1-D axial case, where
+                # (curl B).z vanishes identically -- or the caller asked for
+                # that assumption directly.
+                total_current = 0.0
+            electron_current = reduce_to_profile(
+                np.broadcast_to(
+                    total_current - ion_current, fields[density_field].shape
+                )
+            )
+            # J_e = n_e q_e u_e with q_e = -e.
+            velocity = np.divide(
+                -electron_current,
+                elementary_charge * density,
+                out=np.zeros_like(density),
+                where=density > 0,
+            )
+
+        densities.append(density)
+        temperatures.append(thermal_energy)
+        drifts.append(velocity)
+        times.append(time)
+
+    density_block = np.stack(densities)
+    if not np.any(density_block > 0):
+        raise ValueError(
+            f"{density_field!r} is nowhere positive in {path}. In a hybrid run "
+            "only ions are macroparticles, so the deposited charge density is "
+            "the electron density; a total rho near zero means the run carries "
+            "electron macroparticles too and is not hybrid. Read its electrons "
+            "with read_warpx_phase_space instead."
+        )
+
+    phase_space = from_moments(
+        density_block,
+        np.stack(temperatures) * u.J,
+        np.stack(drifts),
+        t=np.asarray(times, dtype=np.float64),
+        x=x_axis,
+        label=label,
+        v=v,
+        mass=const.m_e.si.value if mass is None else mass,
+        is_electron=True,
+        n_velocity_bins=n_velocity_bins,
+        meta={
+            "code": "WarpX (hybrid)",
+            "path": str(path),
+            "plotfiles": [p.name for p in plotfiles],
+            "prefix": prefix,
+            "n_spatial": n_spatial,
+            "scatter_direction": direction.tolist(),
+            "density_field": density_field,
+            "charge_state": charge_state,
+            "temperature_source": (
+                solved_temperature
+                if solved_temperature is not None
+                else "barotropic closure"
+            ),
+            "closure": None if solved_temperature is not None else closure,
+            "drift": drift,
+            "current_fields": sorted(current_components.values()),
+            "magnetic_fields": sorted(magnetic_components.values()),
+            "transverse_reduction": transverse_reduction if transverse_axes else None,
+            "slab_halfwidth": half_width,
+        },
+    )
+    return phase_space if position is None else phase_space.at_position(position)
 
 
 # ---------------------------------------------------------------------------

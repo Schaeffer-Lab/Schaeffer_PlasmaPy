@@ -5,6 +5,7 @@ Tests for the PIC -> Thomson scattering pipeline in
 
 import warnings
 from dataclasses import replace
+from pathlib import Path
 
 import astropy.constants as const
 import astropy.units as u
@@ -14,6 +15,7 @@ import pytest
 from scipy.ndimage import gaussian_filter
 
 from plasmapy.diagnostics import pic_thomson, thomson
+from plasmapy.diagnostics.pic_thomson import histogram2d_deck_block
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -893,6 +895,42 @@ class TestDriverValidation:
         with pytest.raises(ValueError, match="outside the spatial axis"):
             run_driver(position=1.0 * u.m)
 
+    def test_takes_the_density_scale_from_the_readers(self):
+        """
+        Every reader records the scale its ``f`` is in, so the caller should not
+        have to remember that OSIRIS means n0 and WarpX means 1 per cubic metre.
+        """
+        pytest.importorskip("numba")
+        scale = REFERENCE_DENSITY.to_value(u.m**-3)
+        electrons = replace(
+            species_phase_space("e-", 100, const.m_e),
+            meta={"reference_density": scale},
+        )
+        ions = replace(
+            species_phase_space("p+", 50, const.m_p),
+            meta={"reference_density": scale},
+        )
+        inferred = run_driver(electrons=electrons, ions=[ions], reference_density=None)
+        explicit = run_driver(electrons=electrons, ions=[ions])
+        assert inferred.meta["reference_density"] == pytest.approx(scale)
+        np.testing.assert_allclose(inferred.epw, explicit.epw, rtol=1e-12)
+
+    def test_rejects_phase_spaces_that_disagree_about_the_scale(self):
+        electrons = replace(
+            species_phase_space("e-", 100, const.m_e),
+            meta={"reference_density": 1e24},
+        )
+        ions = replace(
+            species_phase_space("p+", 50, const.m_p),
+            meta={"reference_density": 1e25},
+        )
+        with pytest.raises(ValueError, match="disagree about the density scale"):
+            run_driver(electrons=electrons, ions=[ions], reference_density=None)
+
+    def test_reports_a_missing_density_scale(self):
+        with pytest.raises(ValueError, match="carry no 'reference_density'"):
+            run_driver(reference_density=None)
+
     def test_rejects_velocity_scale_factor_in_conditioning(self):
         with pytest.raises(ValueError, match="must be the same for every species"):
             run_driver(
@@ -1644,8 +1682,216 @@ def make_warpx_plotfiles(tmp_path, n_frames=3, prefix="diag1"):
     """Create empty plotfile directories for the reader to enumerate."""
     diags = tmp_path / "diags"
     for index in range(n_frames):
-        (diags / f"{prefix}{index:06d}").mkdir(parents=True)
+        (diags / f"{prefix}{index:06d}").mkdir(parents=True, exist_ok=True)
     return diags
+
+
+def fake_warpx_frames_with_a_fast_middle(monkeypatch, mass, *, n_frames):
+    """
+    Frames whose fastest particles live in the middle of the series -- the
+    shape a shock has, and the one a first-and-last scan cannot see.
+    """
+    speed_of_light = const.c.si.value
+    middle = n_frames // 2
+
+    def frame(_yt, plotfile, _species, _positions=None, _momenta=None):
+        index = int(str(plotfile).rsplit("diag1", 1)[1])
+        rng = np.random.default_rng(index)
+        # Ends are cold; the middle frame is ten times hotter.
+        sigma = WARPX_SIGMA * (10.0 if index == middle else 1.0)
+        velocity = np.stack(
+            [
+                rng.normal(0.0, 0.01 * WARPX_SIGMA, 20_000),
+                rng.normal(0.0, 0.01 * WARPX_SIGMA, 20_000),
+                rng.normal(0.0, sigma, 20_000),
+            ]
+        )
+        speed = np.sqrt(np.sum(velocity**2, axis=0))
+        gamma = 1.0 / np.sqrt(1.0 - (speed / speed_of_light) ** 2)
+        positions = rng.uniform(0.0, WARPX_DOMAIN, (1, 20_000))
+        weight = np.full(20_000, WARPX_DENSITY * WARPX_DOMAIN / 20_000)
+        domain = (np.zeros(3), np.array([WARPX_DOMAIN, 1.0, 1.0]))
+        return positions, mass * gamma * velocity, weight, index * 1e-9, domain
+
+    dataset = FakeDataset(
+        TEST_SPECIES,
+        ("particle_position_x",),
+        ("particle_momentum_x", "particle_momentum_y", "particle_momentum_z"),
+        (64, 1, 1),
+    )
+    monkeypatch.setattr(pic_thomson, "_load_yt", lambda: FakeYt(dataset))
+    monkeypatch.setattr(pic_thomson, "_warpx_frame", frame)
+
+
+class TestWarpxVelocityScan:
+    """
+    Sizing the velocity axis from the first and last frames alone silently
+    clips whatever the run does in between -- which, for a shock, is the entire
+    measurement.
+    """
+
+    N_FRAMES = 5
+
+    def test_scanning_every_frame_covers_the_middle(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames_with_a_fast_middle(monkeypatch, mass, n_frames=self.N_FRAMES)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=self.N_FRAMES)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            velocity_scan="all",
+            n_velocity_bins=256,
+            progress=False,
+        )
+        # The axis has to reach past the hot middle frame, which is ten times
+        # the thermal speed of the frames at either end.
+        assert phase_space.v.max() > 10 * WARPX_SIGMA
+        assert phase_space.meta["clipped_count"] == 0
+
+    def test_scanning_only_the_ends_clips_and_says_so(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames_with_a_fast_middle(monkeypatch, mass, n_frames=self.N_FRAMES)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=self.N_FRAMES)
+
+        settings = {
+            "mass": mass,
+            "label": "p+",
+            "n_velocity_bins": 256,
+            "progress": False,
+        }
+        with pytest.warns(RuntimeWarning, match="fell outside the velocity axis"):
+            ends = pic_thomson.read_warpx_phase_space(
+                diags, "amb_ions", velocity_scan="ends", **settings
+            )
+        every = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", velocity_scan="all", **settings
+        )
+        # The ends are cold, so an axis sized from them alone falls far short
+        # of the one sized from the whole series.
+        assert ends.v.max() < 0.5 * every.v.max()
+        assert ends.meta["clipped_count"] > 0
+
+    def test_rejects_an_unknown_scan(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=2)
+        with pytest.raises(ValueError, match="velocity_scan must be"):
+            pic_thomson.read_warpx_phase_space(
+                diags,
+                "amb_ions",
+                mass=mass,
+                label="p+",
+                velocity_scan="middle",
+                progress=False,
+            )
+
+
+class TestDepositedChargeCheck:
+    """
+    The macroparticles a diagnostic writes are not always the macroparticles
+    the code deposited. ``random_fraction`` subsamples them without
+    reweighting, so every density built from that output is low by exactly that
+    factor, and nothing in the file says so.
+    """
+
+    def test_a_subsampled_diagnostic_is_caught(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        # The code deposited five times what the diagnostic wrote: exactly what
+        # `random_fraction = 0.2` produces.
+        monkeypatch.setattr(
+            pic_thomson,
+            "_warpx_deposited_weight",
+            lambda _dataset, _species, _charge: 5.0 * WARPX_DENSITY * WARPX_DOMAIN,
+        )
+        with pytest.warns(RuntimeWarning, match="random_fraction"):
+            phase_space = pic_thomson.read_warpx_phase_space(
+                diags,
+                "amb_ions",
+                mass=mass,
+                label="p+",
+                n_velocity_bins=64,
+                progress=False,
+            )
+        assert phase_space.meta["density_check"]["ratio"] == pytest.approx(0.2)
+
+    def test_agreement_is_silent_and_recorded(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        monkeypatch.setattr(
+            pic_thomson,
+            "_warpx_deposited_weight",
+            lambda _dataset, _species, _charge: WARPX_DENSITY * WARPX_DOMAIN,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            phase_space = pic_thomson.read_warpx_phase_space(
+                diags,
+                "amb_ions",
+                mass=mass,
+                label="p+",
+                n_velocity_bins=64,
+                progress=False,
+            )
+        assert phase_space.meta["density_check"]["ratio"] == pytest.approx(1.0)
+
+    def test_can_be_switched_off(self, tmp_path, monkeypatch):
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        monkeypatch.setattr(
+            pic_thomson,
+            "_warpx_deposited_weight",
+            lambda *_args: pytest.fail("the check should not have run"),
+        )
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            validate_density=False,
+            n_velocity_bins=64,
+            progress=False,
+        )
+        assert phase_space.meta["density_check"] is None
+
+    def test_a_plotfile_without_the_field_is_skipped(self, tmp_path, monkeypatch):
+        """Most plotfiles carry no per-species charge density; that is not an error."""
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=64,
+            progress=False,
+        )
+        assert phase_space.meta["density_check"] is None
+
+    def test_finds_the_field_by_name(self):
+        dataset = FakeDataset(
+            ("amb_ions",),
+            ("particle_position_x",),
+            ("particle_momentum_z",),
+            (8, 1, 1),
+        )
+        assert pic_thomson._warpx_rho_field(dataset, "amb_ions") is None
+        dataset.field_list.append(("boxlib", "rho_amb_ions"))
+        assert pic_thomson._warpx_rho_field(dataset, "amb_ions") == (
+            "boxlib",
+            "rho_amb_ions",
+        )
 
 
 class TestWarpxReader:
@@ -1775,6 +2021,51 @@ class TestWarpxReader:
         assert 2.0 < phase_space.x[0] < 2.2
         assert 7.8 < phase_space.x[-1] < 8.0
 
+    def test_a_clipped_velocity_axis_is_reported(self, tmp_path, monkeypatch):
+        """
+        ``np.histogram2d`` discards out-of-range samples without a word, and a
+        truncated tail is exactly what the taper would then smooth over -- so
+        the reader has to count what it lost.
+        """
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        with pytest.warns(RuntimeWarning, match="fell outside the velocity axis"):
+            phase_space = pic_thomson.read_warpx_phase_space(
+                diags,
+                "amb_ions",
+                mass=mass,
+                label="p+",
+                # A quarter of a sigma: most of the distribution is outside.
+                velocity_range=(-WARPX_SIGMA / 4, WARPX_SIGMA / 4),
+                n_velocity_bins=64,
+                progress=False,
+            )
+        assert phase_space.meta["clipped_count"] > 0
+        assert phase_space.meta["clipped_weight_fraction"] > 0.5
+
+    def test_narrowing_the_position_range_is_not_clipping(self, tmp_path, monkeypatch):
+        """
+        Sampling one point is a deliberate selection, like the transverse slab.
+        Counting the rest of the domain as lost would make the check cry wolf
+        on every single-position read.
+        """
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            position=WARPX_DOMAIN / 2,
+            n_velocity_bins=64,
+            progress=False,
+        )
+        assert phase_space.meta["clipped_count"] == 0
+
     def test_cache_round_trip(self, tmp_path, monkeypatch):
         mass = 100 * const.m_e.si.value
         fake_warpx_frames(monkeypatch, mass)
@@ -1830,6 +2121,54 @@ class TestWarpxReader:
         )
         assert coarse.shape[1] == 64
         assert fine.shape[1] == 128
+
+    def test_cache_is_keyed_on_the_frames_read(self, tmp_path, monkeypatch):
+        """
+        ``timesteps`` changes which frames ``f`` holds, so a cache built from a
+        short test read must not be handed back for the full series.
+        """
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=4)
+        cache = tmp_path / "amb_ions.npz"
+        settings = {
+            "mass": mass,
+            "label": "p+",
+            "n_velocity_bins": 32,
+            "velocity_range": (-4e6, 4e6),
+            "cache": cache,
+            "progress": False,
+        }
+
+        subset = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", timesteps=[0], **settings
+        )
+        every = pic_thomson.read_warpx_phase_space(diags, "amb_ions", **settings)
+        assert subset.shape[0] == 1
+        assert every.shape[0] == 4
+
+    def test_cache_is_keyed_on_the_transverse_area(self, tmp_path, monkeypatch):
+        """``transverse_area`` scales ``f`` linearly, so it has to key the cache."""
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        cache = tmp_path / "amb_ions.npz"
+        settings = {
+            "mass": mass,
+            "label": "p+",
+            "n_velocity_bins": 32,
+            "velocity_range": (-4e6, 4e6),
+            "cache": cache,
+            "progress": False,
+        }
+
+        unit = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", transverse_area=1.0, **settings
+        )
+        doubled = pic_thomson.read_warpx_phase_space(
+            diags, "amb_ions", transverse_area=2.0, **settings
+        )
+        np.testing.assert_allclose(2.0 * doubled.f, unit.f, rtol=1e-12)
 
     def test_selects_requested_frames(self, tmp_path, monkeypatch):
         mass = 100 * const.m_e.si.value
@@ -2376,6 +2715,7 @@ class TestWarpxNDim:
             "amb_ions",
             mass=mass,
             label="p+",
+            scatter_direction=(0, 0, 1),
             n_velocity_bins=64,
             n_position_bins=8,
             progress=False,
@@ -2398,6 +2738,7 @@ class TestWarpxNDim:
         settings = {
             "mass": mass,
             "label": "p+",
+            "scatter_direction": (0, 0, 1),
             "n_velocity_bins": 256,
             "n_position_bins": 8,
             "velocity_range": (-5e6, 5e6),
@@ -2537,6 +2878,7 @@ class TestWarpxNDim:
             "amb_ions",
             mass=mass,
             label="p+",
+            scatter_direction=(0, 0, 1),
             position=WARPX_DOMAIN / 2,
             transverse_position=[WARPX_DOMAIN / 2],
             slab_halfwidth=WARPX_DOMAIN / 8,
@@ -2587,6 +2929,7 @@ class TestWarpxNDim:
                 "amb_ions",
                 mass=mass,
                 label="p+",
+                scatter_direction=(0, 0, 1),
                 transverse_position=[0.0, 1.0],
                 progress=False,
             )
@@ -2604,5 +2947,896 @@ class TestWarpxNDim:
         diags = make_warpx_plotfiles(tmp_path, n_frames=1)
         with pytest.raises(KeyError, match="particle_momentum_z"):
             pic_thomson.read_warpx_phase_space(
-                diags, "electrons", mass=mass, is_electron=True, progress=False
+                diags,
+                "electrons",
+                mass=mass,
+                is_electron=True,
+                momentum_field="particle_momentum_z",
+                progress=False,
             )
+
+    def test_refuses_to_guess_the_projection_beyond_one_dimension(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Momenta are stored for all three directions whatever the geometry, so a
+        default projection in 2-D or 3-D is a silently wrong answer rather than
+        an error. It has to be refused.
+        """
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass, n_spatial=2)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        with pytest.raises(ValueError, match="no single momentum component"):
+            pic_thomson.read_warpx_phase_space(
+                diags, "amb_ions", mass=mass, label="p+", progress=False
+            )
+
+    def test_one_dimensional_runs_still_default(self, tmp_path, monkeypatch):
+        """A 1-D run resolves one direction, so there is nothing to guess."""
+        mass = 100 * const.m_e.si.value
+        fake_warpx_frames(monkeypatch, mass)
+        diags = make_warpx_plotfiles(tmp_path, n_frames=1)
+        phase_space = pic_thomson.read_warpx_phase_space(
+            diags,
+            "amb_ions",
+            mass=mass,
+            label="p+",
+            n_velocity_bins=64,
+            progress=False,
+        )
+        assert phase_space.meta["scatter_direction"] == [0.0, 0.0, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# Moment-based reconstruction, for codes that carry a species as a fluid
+# ---------------------------------------------------------------------------
+
+
+class TestFromMoments:
+    """
+    A fluid species has no macroparticles, so its distribution has to be built
+    from the moments the code does carry. On a grid that contains it, that
+    reconstruction must return exactly the moments it was given.
+    """
+
+    DENSITY = 1e25  # m^-3
+    TEMPERATURE = 100.0  # eV
+    DRIFT = 4e5  # m/s
+
+    def build(self, **kwargs):
+        settings = {
+            "t": [0.0],
+            "x": [0.0],
+            "label": "e-",
+        }
+        settings.update(kwargs)
+        return pic_thomson.from_moments(
+            [[self.DENSITY]],
+            [[self.TEMPERATURE]] * u.eV,
+            [[self.DRIFT]],
+            **settings,
+        )
+
+    def moments(self, phase_space):
+        f = phase_space.f[0, :, 0]
+        v = phase_space.v
+        total = np.trapezoid(f, v)
+        mean = np.trapezoid(f * v, v) / total
+        width = np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / total)
+        return total, mean, width
+
+    def test_recovers_the_moments_it_was_given(self):
+        density, mean, width = self.moments(self.build())
+        expected_width = np.sqrt(
+            (self.TEMPERATURE * u.eV).to_value(u.J) / const.m_e.si.value
+        )
+        np.testing.assert_allclose(density, self.DENSITY, rtol=1e-6)
+        np.testing.assert_allclose(mean, self.DRIFT, rtol=1e-6)
+        np.testing.assert_allclose(width, expected_width, rtol=1e-6)
+
+    def test_temperature_units_are_honoured(self):
+        """Electronvolts and the equivalent kelvin give the same distribution."""
+        in_ev = self.build()
+        kelvin = (self.TEMPERATURE * u.eV / const.k_B).to(u.K)
+        in_kelvin = pic_thomson.from_moments(
+            [[self.DENSITY]],
+            [[kelvin.value]] * u.K,
+            [[self.DRIFT]],
+            t=[0.0],
+            x=[0.0],
+            label="e-",
+            v=in_ev.v,
+        )
+        np.testing.assert_allclose(in_kelvin.f, in_ev.f, rtol=1e-9)
+
+    def test_a_bare_temperature_is_read_as_kelvin(self):
+        bare = pic_thomson.from_moments(
+            [[self.DENSITY]],
+            [[1.0e6]],
+            t=[0.0],
+            x=[0.0],
+            label="e-",
+        )
+        _, _, width = self.moments(bare)
+        expected = np.sqrt(const.k_B.si.value * 1.0e6 / const.m_e.si.value)
+        np.testing.assert_allclose(width, expected, rtol=1e-6)
+
+    def test_rejects_a_temperature_that_is_not_one(self):
+        with pytest.raises(u.UnitConversionError, match="K or in energy units"):
+            pic_thomson.from_moments(
+                [[self.DENSITY]],
+                [[1.0]] * u.m,
+                t=[0.0],
+                x=[0.0],
+                label="e-",
+            )
+
+    def test_mass_sets_the_width(self):
+        """
+        The thermal spread is sqrt(kT/m), so a hundredfold mass gives a tenfold
+        narrower distribution at the same temperature.
+        """
+        light = self.build(label="p+", mass=const.m_p)
+        heavy = self.build(label="p+", mass=100 * const.m_p)
+        _, _, width_light = self.moments(light)
+        _, _, width_heavy = self.moments(heavy)
+        np.testing.assert_allclose(width_light / width_heavy, 10.0, rtol=1e-3)
+
+    def test_default_velocity_axis_contains_the_distribution(self):
+        phase_space = self.build()
+        assert phase_space.meta["moment_recovery_error"] < 1e-6
+        assert phase_space.v.min() < self.DRIFT < phase_space.v.max()
+
+    def test_warns_when_the_grid_clips_the_distribution(self):
+        """
+        A supplied axis that does not contain the Maxwellian holds less plasma
+        than the moments describe, and nothing downstream would notice.
+        """
+        thermal = np.sqrt((self.TEMPERATURE * u.eV).to_value(u.J) / const.m_e.si.value)
+        with pytest.warns(RuntimeWarning, match="does not contain the reconstructed"):
+            pic_thomson.from_moments(
+                [[self.DENSITY]],
+                [[self.TEMPERATURE]] * u.eV,
+                [[self.DRIFT]],
+                t=[0.0],
+                x=[0.0],
+                label="e-",
+                v=np.linspace(self.DRIFT - thermal, self.DRIFT + thermal, 128),
+            )
+
+    def test_records_an_si_density_scale(self):
+        """The driver should not need to be told; f is already in SI."""
+        assert self.build().meta["reference_density"] == 1.0
+
+    def test_rejects_moments_of_different_shapes(self):
+        with pytest.raises(ValueError, match="must share a shape"):
+            pic_thomson.from_moments(
+                [[1e25, 1e25]],
+                [[100.0]] * u.eV,
+                t=[0.0],
+                x=[0.0, 1.0],
+                label="e-",
+            )
+
+    def test_rejects_a_zero_temperature_where_there_is_plasma(self):
+        with pytest.raises(ValueError, match="temperature must be positive"):
+            pic_thomson.from_moments(
+                [[self.DENSITY]],
+                [[0.0]] * u.eV,
+                t=[0.0],
+                x=[0.0],
+                label="e-",
+            )
+
+    def test_allows_a_zero_temperature_where_there_is_none(self):
+        """Vacuum cells carry no plasma, so their temperature is meaningless."""
+        phase_space = pic_thomson.from_moments(
+            [[self.DENSITY, 0.0]],
+            [[self.TEMPERATURE, 0.0]] * u.eV,
+            t=[0.0],
+            x=[0.0, 1.0],
+            label="e-",
+        )
+        density = pic_thomson.number_density(phase_space.f, phase_space.v)
+        np.testing.assert_allclose(density[0, 0], self.DENSITY, rtol=1e-6)
+        assert density[0, 1] == 0.0
+
+    def test_reports_an_empty_species(self):
+        with pytest.raises(ValueError, match="zero density everywhere"):
+            pic_thomson.from_moments(
+                [[0.0]],
+                [[self.TEMPERATURE]] * u.eV,
+                t=[0.0],
+                x=[0.0],
+                label="e-",
+            )
+
+    def test_tapering_a_reconstructed_maxwellian_fabricates_a_pedestal(self):
+        """
+        The taper exists to replace the discontinuity where macroparticle shot
+        noise meets the edge of the velocity grid. A reconstructed distribution
+        has no shot noise and no such edge, so tapering it only invents a
+        pedestal -- which is why these phase spaces want ``taper_threshold=None``.
+        """
+        phase_space = self.build()
+        with pytest.warns(RuntimeWarning, match="fabricating a pedestal"):
+            pic_thomson.condition_phase_space(phase_space)
+
+        untapered = pic_thomson.condition_phase_space(phase_space, taper_threshold=None)
+        _, _, width = self.moments(untapered)
+        expected = np.sqrt((self.TEMPERATURE * u.eV).to_value(u.J) / const.m_e.si.value)
+        np.testing.assert_allclose(width, expected, rtol=1e-6)
+
+    def test_feeds_the_driver(self):
+        """A fluid species has to be usable exactly like a kinetic one."""
+        pytest.importorskip("numba")
+        times = np.linspace(0.0, 1e-9, 3)
+        positions = np.linspace(0.0, 1e-3, 4)
+        shape = (times.size, positions.size)
+        electrons = pic_thomson.from_moments(
+            np.full(shape, 1e25),
+            np.full(shape, 300.0) * u.eV,
+            np.zeros(shape),
+            t=times,
+            x=positions,
+            label="e-",
+        )
+        ions = pic_thomson.from_moments(
+            np.full(shape, 1e25),
+            np.full(shape, 30.0) * u.eV,
+            np.zeros(shape),
+            t=times,
+            x=positions,
+            label="p+",
+            mass=const.m_p,
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            spectra = pic_thomson.spectra_from_phase_spaces(
+                electrons=electrons,
+                ions=[ions],
+                position=positions[1],
+                probe_wavelength=532 * u.nm,
+                epw_wavelengths=np.linspace(480, 580, 120) * u.nm,
+                electron_conditioning={"taper_threshold": None},
+                ion_conditioning={"taper_threshold": None},
+                progress=False,
+            )
+        assert spectra.n_time == times.size
+        assert np.all(np.isfinite(spectra.epw))
+        np.testing.assert_allclose(spectra.electron_density, 1e25, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid WarpX: electrons that exist only as moments
+# ---------------------------------------------------------------------------
+
+HYBRID_CELLS = 128
+HYBRID_LENGTH = 2.0e-3  # m
+HYBRID_DENSITY = 1.0e25  # m^-3
+HYBRID_TEMPERATURE = 100.0  # eV
+HYBRID_CURRENT = 3.0e4  # A/m^2, deposited by the ions
+
+
+class FakeMeshDataset:
+    """A yt dataset carrying mesh fields but no particles."""
+
+    def __init__(self, fields, dimensions=(HYBRID_CELLS, 1, 1)):
+        self.field_list = [("boxlib", name) for name in fields]
+        self.particle_types = ()
+        self.domain_dimensions = np.asarray(dimensions)
+
+
+def fake_hybrid_fields(
+    monkeypatch,
+    *,
+    fields=("rho", "Te", "jz", "Bx", "By"),
+    density=HYBRID_DENSITY,
+    temperature=HYBRID_TEMPERATURE,
+    current=HYBRID_CURRENT,
+    n_spatial=1,
+):
+    """
+    Stand in for the yt layer with uniform hybrid moments, so the reader's
+    arithmetic can be checked against values worked out by hand.
+    """
+    shape = (HYBRID_CELLS,) * n_spatial
+    resolved = [2] if n_spatial == 1 else [0, 2][:n_spatial]
+    spacing = dict.fromkeys(resolved, HYBRID_LENGTH / HYBRID_CELLS)
+    charge = const.e.si.value
+
+    def frame(_yt, plotfile, names):
+        index = int(str(plotfile).rsplit("diag1", 1)[1])
+        values = {
+            "rho": np.full(shape, charge * density),
+            "Te": np.full(shape, temperature),
+            "jz": np.full(shape, current),
+            "Bx": np.zeros(shape),
+            "By": np.zeros(shape),
+            "Bz": np.zeros(shape),
+        }
+        left = np.zeros(3)
+        right = np.array([1.0, 1.0, 1.0])
+        for k in resolved:
+            right[k] = HYBRID_LENGTH
+        return (
+            {name: values[name] for name in names},
+            index * 1e-12,
+            (left, right),
+            spacing,
+            resolved,
+        )
+
+    monkeypatch.setattr(
+        pic_thomson, "_load_yt", lambda: FakeYt(FakeMeshDataset(fields))
+    )
+    monkeypatch.setattr(pic_thomson, "_warpx_field_frame", frame)
+
+
+class TestHybridElectrons:
+    """
+    A hybrid run has no electron macroparticles: quasineutrality fixes the
+    density, the closure or the energy equation fixes the temperature, and the
+    current fixes the drift. Each of those has to come out exactly right.
+    """
+
+    def read(self, tmp_path, **kwargs):
+        diags = make_warpx_plotfiles(tmp_path, n_frames=kwargs.pop("n_frames", 2))
+        return pic_thomson.read_warpx_hybrid_electrons(diags, progress=False, **kwargs)
+
+    def test_density_comes_from_quasineutrality(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch)
+        phase_space = self.read(tmp_path)
+        density = pic_thomson.number_density(phase_space.f, phase_space.v)
+        np.testing.assert_allclose(density, HYBRID_DENSITY, rtol=1e-6)
+        assert phase_space.is_electron
+        assert phase_space.meta["reference_density"] == 1.0
+
+    def test_temperature_comes_from_the_solved_field(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch)
+        phase_space = self.read(tmp_path)
+        f = phase_space.f[0, :, 0]
+        v = phase_space.v
+        total = np.trapezoid(f, v)
+        mean = np.trapezoid(f * v, v) / total
+        width = np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / total)
+        expected = np.sqrt(
+            (HYBRID_TEMPERATURE * u.eV).to_value(u.J) / const.m_e.si.value
+        )
+        np.testing.assert_allclose(width, expected, rtol=1e-6)
+        assert phase_space.meta["temperature_source"] == "Te"
+
+    def test_drift_comes_from_the_deposited_ion_current(self, tmp_path, monkeypatch):
+        r"""
+        In 1-D, :math:`(\nabla \times \vec{B})_z` vanishes identically, so the
+        total current along the axis is zero and the electrons must exactly
+        counterstream the ions: :math:`u_e = j_z / (e n_e)`.
+        """
+        fake_hybrid_fields(monkeypatch)
+        phase_space = self.read(tmp_path)
+        f = phase_space.f[0, :, 0]
+        v = phase_space.v
+        mean = np.trapezoid(f * v, v) / np.trapezoid(f, v)
+        expected = HYBRID_CURRENT / (const.e.si.value * HYBRID_DENSITY)
+        np.testing.assert_allclose(mean, expected, rtol=1e-6)
+
+    def test_one_dimensional_ampere_needs_no_magnetic_field(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        The curl term is identically zero along the axis of a 1-D run, so the
+        reader should not ask for B at all -- and the two drift routes must
+        agree exactly.
+        """
+        fake_hybrid_fields(monkeypatch, fields=("rho", "Te", "jz"))
+        ampere = self.read(tmp_path, drift="ampere")
+        ion_current = self.read(tmp_path, drift="ion_current")
+        assert ampere.meta["magnetic_fields"] == []
+        np.testing.assert_array_equal(ampere.f, ion_current.f)
+
+    def test_drift_can_be_switched_off(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch)
+        phase_space = self.read(tmp_path, drift="zero")
+        f = phase_space.f[0, :, 0]
+        v = phase_space.v
+        mean = np.trapezoid(f * v, v) / np.trapezoid(f, v)
+        assert abs(mean) < 1e-6 * np.sqrt(
+            (HYBRID_TEMPERATURE * u.eV).to_value(u.J) / const.m_e.si.value
+        )
+
+    def test_falls_back_to_the_barotropic_closure(self, tmp_path, monkeypatch):
+        r"""
+        Runs that do not solve an electron energy equation have only the
+        closure :math:`T_e = T_{e0} (n_e/n_0)^{\gamma-1}`.
+        """
+        fake_hybrid_fields(monkeypatch, fields=("rho", "jz"))
+        closure = {"T_e0": 40.0, "n0_ref": HYBRID_DENSITY / 8.0, "gamma": 5.0 / 3.0}
+        phase_space = self.read(tmp_path, closure=closure)
+
+        f = phase_space.f[0, :, 0]
+        v = phase_space.v
+        total = np.trapezoid(f, v)
+        mean = np.trapezoid(f * v, v) / total
+        width = np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / total)
+        # n_e / n_0 = 8, and 8^(2/3) = 4.
+        expected_temperature = 40.0 * 4.0
+        expected = np.sqrt(
+            (expected_temperature * u.eV).to_value(u.J) / const.m_e.si.value
+        )
+        np.testing.assert_allclose(width, expected, rtol=1e-6)
+        assert phase_space.meta["temperature_source"] == "barotropic closure"
+
+    def test_reports_a_missing_temperature_with_no_closure(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch, fields=("rho", "jz"))
+        with pytest.raises(KeyError, match="no 'Te' field and no closure"):
+            self.read(tmp_path)
+
+    def test_rejects_an_incomplete_closure(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch, fields=("rho", "jz"))
+        with pytest.raises(ValueError, match=r"closure is missing \['gamma'\]"):
+            self.read(tmp_path, closure={"T_e0": 40.0, "n0_ref": 1e25})
+
+    def test_rejects_a_run_that_is_not_hybrid(self, tmp_path, monkeypatch):
+        """
+        An explicit run carries electron macroparticles too, so its total rho
+        is near zero rather than e * n_e.
+        """
+        fake_hybrid_fields(monkeypatch, density=0.0)
+        with pytest.raises(ValueError, match="nowhere positive"):
+            self.read(tmp_path)
+
+    def test_reduces_to_a_point(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch)
+        phase_space = self.read(tmp_path, position=HYBRID_LENGTH / 2)
+        assert phase_space.shape[2] == 1
+
+    def test_shares_a_time_axis_with_the_ions(self, tmp_path, monkeypatch):
+        """The driver needs one time axis, and both readers must produce it."""
+        fake_hybrid_fields(monkeypatch)
+        phase_space = self.read(tmp_path, n_frames=3)
+        np.testing.assert_allclose(phase_space.t, [0.0, 1e-12, 2e-12])
+
+    def test_rejects_an_unknown_drift(self, tmp_path, monkeypatch):
+        fake_hybrid_fields(monkeypatch)
+        with pytest.raises(ValueError, match="drift must be"):
+            self.read(tmp_path, drift="guess")
+
+    def test_refuses_to_guess_the_projection_beyond_one_dimension(
+        self, tmp_path, monkeypatch
+    ):
+        fake_hybrid_fields(monkeypatch, n_spatial=2)
+        with pytest.raises(ValueError, match="scattering direction has to be given"):
+            self.read(tmp_path)
+
+
+class TestCurlAlong:
+    r"""
+    The curl term in Ohm's law is what makes the drift exact in more than one
+    dimension, and identically zero along the axis of a 1-D run.
+    """
+
+    def test_vanishes_along_the_axis_of_a_one_dimensional_run(self):
+        magnetic = {0: np.linspace(0.0, 1.0, 16), 1: np.linspace(1.0, 0.0, 16)}
+        result = pic_thomson._curl_along((0.0, 0.0, 1.0), magnetic, {2: 0.1}, [2])
+        assert np.all(np.asarray(result) == 0.0)
+
+    def test_names_no_field_it_does_not_differentiate(self):
+        # Along z, with only z resolved: nothing survives.
+        assert pic_thomson._curl_needs((0.0, 0.0, 1.0), [2]) == set()
+        # Along x, with only z resolved: only dBy/dz survives.
+        assert pic_thomson._curl_needs((1.0, 0.0, 0.0), [2]) == {1}
+
+    def test_matches_an_analytic_curl(self):
+        r"""For :math:`B_y = b z`, :math:`(\nabla \times B)_x = -b`."""
+        spacing = 0.25
+        z = spacing * np.arange(32)
+        slope = 3.0
+        magnetic = {1: slope * z}
+        result = pic_thomson._curl_along((1.0, 0.0, 0.0), magnetic, {2: spacing}, [2])
+        np.testing.assert_allclose(result, -slope, rtol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# openPMD phase space, as WarpX's ParticleHistogram2D writes it
+# ---------------------------------------------------------------------------
+
+OPENPMD_DENSITY = 1.0e24  # m^-3
+OPENPMD_LENGTH = 1.0e-3  # m
+OPENPMD_DRIFT = 0.05  # v/c
+OPENPMD_SPREAD = 0.02  # v/c
+
+
+def write_openpmd_histogram(
+    directory,
+    *,
+    step,
+    time,
+    data,
+    ordinate_range,
+    abscissa_range,
+    ordinate_function="(1*uz)/sqrt(1+ux*ux+uy*uy+uz*uz)",
+    abscissa_function="z",
+    filter_function="",
+):
+    """
+    Write one openPMD file in the layout ``ParticleHistogram2D`` produces.
+
+    Every attribute here was read back off a file a real WarpX run wrote, so a
+    reader that satisfies this fixture satisfies the diagnostic.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    n_ord, n_abs = data.shape
+    ord_lo, ord_hi = ordinate_range
+    abs_lo, abs_hi = abscissa_range
+
+    with h5py.File(directory / f"openpmd_{step:06d}.h5", "w") as handle:
+        handle.attrs["basePath"] = np.bytes_(b"/data/%T/")
+        handle.attrs["meshesPath"] = np.bytes_(b"meshes/")
+        handle.attrs["openPMD"] = np.bytes_(b"1.1.0")
+        handle.attrs["iterationEncoding"] = np.bytes_(b"fileBased")
+        handle.attrs["iterationFormat"] = np.bytes_(b"openpmd_%06T")
+
+        iteration = handle.create_group(f"data/{step}")
+        iteration.attrs["time"] = np.float64(time)
+        iteration.attrs["dt"] = np.float64(1.0)
+        iteration.attrs["timeUnitSI"] = np.float64(1.0)
+
+        mesh = iteration.create_group("meshes")
+        record = mesh.create_dataset("data", data=data.astype(np.float64))
+        record.attrs["axisLabels"] = np.array(
+            [ordinate_function.encode(), abscissa_function.encode()]
+        )
+        record.attrs["dataOrder"] = np.bytes_(b"C")
+        record.attrs["geometry"] = np.bytes_(b"cartesian")
+        record.attrs["gridGlobalOffset"] = np.array([ord_lo, abs_lo])
+        record.attrs["gridSpacing"] = np.array(
+            [(ord_hi - ord_lo) / n_ord, (abs_hi - abs_lo) / n_abs]
+        )
+        record.attrs["gridUnitSI"] = np.float64(1.0)
+        record.attrs["position"] = np.array([0.5, 0.5])
+        record.attrs["unitSI"] = np.float64(1.0)
+        record.attrs["function_abscissa"] = np.bytes_(abscissa_function.encode())
+        record.attrs["function_ordinate"] = np.bytes_(ordinate_function.encode())
+        record.attrs["filter"] = np.bytes_(filter_function.encode())
+
+
+def make_openpmd_run(
+    directory, *, n_frames=2, n_ord=128, n_abs=64, ord_range=(-0.2, 0.2)
+):
+    """
+    A drifting Gaussian in v/c, uniform in position, holding a known number of
+    physical particles -- the same thing the WarpX test run produced.
+    """
+    ord_lo, ord_hi = ord_range
+    edges = np.linspace(ord_lo, ord_hi, n_ord + 1)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    profile = np.exp(-0.5 * ((centres - OPENPMD_DRIFT) / OPENPMD_SPREAD) ** 2)
+    profile /= profile.sum()
+
+    total = OPENPMD_DENSITY * OPENPMD_LENGTH  # particles per m^2 of cross-section
+    data = np.outer(profile, np.full(n_abs, total / n_abs))
+    for step in range(n_frames):
+        write_openpmd_histogram(
+            directory,
+            step=5 * step,
+            time=step * 1.3e-13,
+            data=data,
+            ordinate_range=ord_range,
+            abscissa_range=(0.0, OPENPMD_LENGTH),
+        )
+    return Path(directory)
+
+
+class TestOpenPMDReader:
+    def test_recovers_density_drift_and_spread(self, tmp_path):
+        """
+        Every number here is fixed by the fixture, so the reader's axis
+        construction, unit conversion, and bin-volume normalisation are all
+        pinned at once.
+        """
+        path = make_openpmd_run(tmp_path / "eps")
+        phase_space = pic_thomson.read_openpmd_phase_space(
+            path, label="e-", progress=False
+        )
+        speed_of_light = const.c.si.value
+
+        density = pic_thomson.number_density(phase_space.f, phase_space.v)
+        np.testing.assert_allclose(density, OPENPMD_DENSITY, rtol=2e-3)
+
+        f = phase_space.f[0].sum(axis=1)
+        v = phase_space.v
+        mean = np.trapezoid(f * v, v) / np.trapezoid(f, v)
+        width = np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / np.trapezoid(f, v))
+        np.testing.assert_allclose(mean, OPENPMD_DRIFT * speed_of_light, rtol=1e-3)
+        np.testing.assert_allclose(width, OPENPMD_SPREAD * speed_of_light, rtol=1e-2)
+
+    def test_axes_and_times(self, tmp_path):
+        path = make_openpmd_run(tmp_path / "eps", n_frames=3)
+        phase_space = pic_thomson.read_openpmd_phase_space(
+            path, label="e-", progress=False
+        )
+        assert phase_space.shape == (3, 128, 64)
+        np.testing.assert_allclose(phase_space.t, [0.0, 1.3e-13, 2.6e-13])
+        # Bin centres, not edges: half a bin in from each end.
+        step = OPENPMD_LENGTH / 64
+        np.testing.assert_allclose(phase_space.x[0], step / 2, rtol=1e-9)
+        np.testing.assert_allclose(
+            phase_space.x[-1], OPENPMD_LENGTH - step / 2, rtol=1e-9
+        )
+
+    def test_records_the_deck_expressions(self, tmp_path):
+        """
+        The expressions are the only record of what the axes mean, so they have
+        to survive into the metadata.
+        """
+        path = make_openpmd_run(tmp_path / "eps")
+        phase_space = pic_thomson.read_openpmd_phase_space(
+            path, label="e-", progress=False
+        )
+        assert phase_space.meta["function_abscissa"] == "z"
+        assert "sqrt(1+ux*ux+uy*uy+uz*uz)" in phase_space.meta["function_ordinate"]
+        assert phase_space.meta["reference_density"] == 1.0
+
+    def test_transverse_area_scales_the_density(self, tmp_path):
+        path = make_openpmd_run(tmp_path / "eps")
+        unit = pic_thomson.read_openpmd_phase_space(
+            path, label="e-", transverse_area=1.0, progress=False
+        )
+        slab = pic_thomson.read_openpmd_phase_space(
+            path, label="e-", transverse_area=1e-4, progress=False
+        )
+        np.testing.assert_allclose(slab.f, unit.f * 1e4, rtol=1e-12)
+
+    def test_reduces_to_a_point(self, tmp_path):
+        path = make_openpmd_run(tmp_path / "eps")
+        phase_space = pic_thomson.read_openpmd_phase_space(
+            path, label="e-", position=OPENPMD_LENGTH / 2, progress=False
+        )
+        assert phase_space.shape[2] == 1
+
+    def test_selects_requested_files(self, tmp_path):
+        path = make_openpmd_run(tmp_path / "eps", n_frames=4)
+        phase_space = pic_thomson.read_openpmd_phase_space(
+            path, label="e-", timesteps=[0, 2], progress=False
+        )
+        assert phase_space.shape[0] == 2
+
+    def test_proper_velocity_carries_the_jacobian(self, tmp_path):
+        r"""
+        An axis in :math:`u = \gamma v/c` is not uniform in :math:`v`, so the
+        density per unit velocity has to pick up :math:`\gamma^3/c`.
+        """
+        path = make_openpmd_run(tmp_path / "eps", ord_range=(-2.0, 2.0))
+        proper = pic_thomson.read_openpmd_phase_space(
+            path, label="e-", velocity_kind="proper", progress=False
+        )
+        # The Jacobian is exactly what keeps the zeroth moment a density.
+        density = pic_thomson.number_density(proper.f, proper.v)
+        np.testing.assert_allclose(density, OPENPMD_DENSITY, rtol=2e-3)
+        assert proper.v.max() < const.c.si.value
+
+    def test_velocity_on_the_abscissa_is_transposed(self, tmp_path):
+        directory = tmp_path / "eps"
+        data = np.arange(4 * 3, dtype=np.float64).reshape(4, 3)
+        write_openpmd_histogram(
+            directory,
+            step=0,
+            time=0.0,
+            data=data,
+            ordinate_range=(0.0, OPENPMD_LENGTH),
+            abscissa_range=(-0.1, 0.1),
+            ordinate_function="z",
+            abscissa_function="(1*uz)/sqrt(1+ux*ux+uy*uy+uz*uz)",
+        )
+        phase_space = pic_thomson.read_openpmd_phase_space(
+            directory, label="e-", velocity_axis="abscissa", progress=False
+        )
+        # (n_time, n_v, n_x) with velocity now the length-3 axis.
+        assert phase_space.shape == (1, 3, 4)
+
+    def test_reports_an_empty_directory(self, tmp_path):
+        (tmp_path / "eps").mkdir()
+        with pytest.raises(FileNotFoundError, match="no files matching"):
+            pic_thomson.read_openpmd_phase_space(
+                tmp_path / "eps", label="e-", progress=False
+            )
+
+    def test_rejects_a_changing_grid(self, tmp_path):
+        directory = tmp_path / "eps"
+        make_openpmd_run(directory, n_frames=1)
+        write_openpmd_histogram(
+            directory,
+            step=5,
+            time=1e-13,
+            data=np.ones((128, 64)),
+            ordinate_range=(-0.5, 0.5),
+            abscissa_range=(0.0, OPENPMD_LENGTH),
+        )
+        with pytest.raises(ValueError, match="binned on a different grid"):
+            pic_thomson.read_openpmd_phase_space(directory, label="e-", progress=False)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"velocity_axis": "middle"}, "velocity_axis must be"),
+            ({"velocity_kind": "momentum"}, "velocity_kind must be"),
+        ],
+    )
+    def test_rejects_bad_settings(self, tmp_path, kwargs, match):
+        path = make_openpmd_run(tmp_path / "eps", n_frames=1)
+        with pytest.raises(ValueError, match=match):
+            pic_thomson.read_openpmd_phase_space(
+                path, label="e-", progress=False, **kwargs
+            )
+
+
+class TestHistogram2DDeckBlock:
+    SETTINGS = {
+        "position_range": (0.0, 1.0e-3),
+        "velocity_range": (-4.0e7, 4.0e7),
+        "n_position_bins": 64,
+        "n_velocity_bins": 128,
+    }
+
+    def test_names_every_required_option(self):
+        block, _ = histogram2d_deck_block("eps", "electrons", **self.SETTINGS)
+        for required in (
+            "eps.type = ParticleHistogram2D",
+            "eps.species = electrons",
+            "eps.bin_number_abs = 64",
+            "eps.bin_number_ord = 128",
+            "eps.histogram_function_abs(t,x,y,z,ux,uy,uz,w)",
+            "eps.histogram_function_ord(t,x,y,z,ux,uy,uz,w)",
+        ):
+            assert required in block
+
+    def test_states_the_value_function_explicitly(self):
+        """
+        WarpX reads value_function into m_do_parser_value and then never checks
+        it, so leaving it out makes the kernel call a null ParserExecutor and
+        fill the histogram with uninitialised memory. Stating the documented
+        default is the workaround.
+        """
+        block, _ = histogram2d_deck_block("eps", "electrons", **self.SETTINGS)
+        assert "eps.value_function(t,x,y,z,ux,uy,uz,w) = w" in block
+
+    def test_keeps_the_output_readable_without_openpmd_api(self):
+        block, _ = histogram2d_deck_block("eps", "electrons", **self.SETTINGS)
+        assert "eps.openpmd_backend = h5" in block
+
+    def test_velocity_expression_is_the_lab_frame_projection(self):
+        """
+        WarpX gives the parser ux as gamma*vx/c, so dividing the projection by
+        gamma is what turns it into the velocity itself.
+        """
+        block, _ = histogram2d_deck_block(
+            "eps", "electrons", scatter_direction=(0, 0, 1), **self.SETTINGS
+        )
+        assert "(1*uz)/sqrt(1+ux*ux+uy*uy+uz*uz)" in block
+        # Components k does not touch are dropped rather than written as 0*ux.
+        assert "0*ux" not in block
+
+    def test_normalises_the_scattering_direction(self):
+        block, _ = histogram2d_deck_block(
+            "eps", "electrons", scatter_direction=(0, 3, 4), **self.SETTINGS
+        )
+        assert "0.6*uy + 0.8*uz" in block
+
+    def test_velocity_bounds_are_in_units_of_c(self):
+        block, _ = histogram2d_deck_block("eps", "electrons", **self.SETTINGS)
+        expected = 4.0e7 / const.c.si.value
+        line = next(entry for entry in block.splitlines() if "bin_max_ord" in entry)
+        np.testing.assert_allclose(float(line.split("=")[1]), expected, rtol=1e-9)
+
+    def test_slab_becomes_a_filter_and_an_area(self):
+        block, area = histogram2d_deck_block(
+            "eps",
+            "electrons",
+            transverse_slab={"y": (0.0, 50e-6)},
+            **self.SETTINGS,
+        )
+        assert "eps.filter_function(t,x,y,z,ux,uy,uz,w) = (y>-5e-05)*(y<5e-05)" in block
+        np.testing.assert_allclose(area, 1e-4)
+
+    def test_a_two_axis_slab_multiplies_the_area(self):
+        _, area = histogram2d_deck_block(
+            "eps",
+            "electrons",
+            transverse_slab={"x": (0.0, 1e-3), "y": (0.0, 2e-3)},
+            **self.SETTINGS,
+        )
+        np.testing.assert_allclose(area, (2e-3) * (4e-3))
+
+    def test_unfiltered_is_one_square_metre(self):
+        """WarpX gives the directions a run does not resolve an extent of 1 m."""
+        _, area = histogram2d_deck_block("eps", "electrons", **self.SETTINGS)
+        assert area == 1.0
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"position_axis": "q"}, "position_axis must be"),
+            ({"scatter_direction": (0, 0, 0)}, "zero vector"),
+            ({"scatter_direction": (1, 0)}, "must be a 3-vector"),
+            ({"transverse_slab": {"q": (0.0, 1.0)}}, "keys must be"),
+            ({"transverse_slab": {"y": (0.0, -1.0)}}, "half-width must be positive"),
+        ],
+    )
+    def test_rejects_bad_settings(self, kwargs, match):
+        settings = {**self.SETTINGS, **kwargs}
+        with pytest.raises(ValueError, match=match):
+            histogram2d_deck_block("eps", "electrons", **settings)
+
+    def test_rejects_inverted_ranges(self):
+        with pytest.raises(ValueError, match=r"\(low, high\)"):
+            histogram2d_deck_block(
+                "eps",
+                "electrons",
+                position_range=(1.0e-3, 0.0),
+                velocity_range=(-4.0e7, 4.0e7),
+            )
+
+    def test_the_block_and_the_reader_agree_on_the_grid(self, tmp_path):
+        """
+        The deck fixes the axes and the reader reconstructs them; if the two
+        ever disagree the spectra are wrong with nothing to show for it. Round
+        trip the generated numbers through a file to pin them together.
+        """
+        block, area = histogram2d_deck_block(
+            "eps",
+            "electrons",
+            scatter_direction=(0, 0, 1),
+            transverse_slab={"y": (0.0, 50e-6)},
+            **self.SETTINGS,
+        )
+        settings: dict[str, str] = {}
+        for line in block.splitlines():
+            if line.startswith("eps.") and "=" in line:
+                key, _, value = line.partition("=")
+                settings[key.strip().removeprefix("eps.")] = value.strip()
+
+        n_ord = int(settings["bin_number_ord"])
+        n_abs = int(settings["bin_number_abs"])
+        directory = tmp_path / "eps"
+        write_openpmd_histogram(
+            directory,
+            step=0,
+            time=0.0,
+            data=np.ones((n_ord, n_abs)),
+            ordinate_range=(
+                float(settings["bin_min_ord"]),
+                float(settings["bin_max_ord"]),
+            ),
+            abscissa_range=(
+                float(settings["bin_min_abs"]),
+                float(settings["bin_max_abs"]),
+            ),
+        )
+        phase_space = pic_thomson.read_openpmd_phase_space(
+            directory, label="e-", transverse_area=area, progress=False
+        )
+
+        assert phase_space.shape == (1, n_ord, n_abs)
+        # The reader's axes must span exactly what the deck asked for, to
+        # within the half bin that separates a centre from an edge.
+        v_step = float(np.diff(phase_space.v)[0])
+        x_step = float(np.diff(phase_space.x)[0])
+        np.testing.assert_allclose(
+            phase_space.v[0] - v_step / 2, self.SETTINGS["velocity_range"][0], rtol=1e-9
+        )
+        np.testing.assert_allclose(
+            phase_space.v[-1] + v_step / 2,
+            self.SETTINGS["velocity_range"][1],
+            rtol=1e-9,
+        )
+        np.testing.assert_allclose(
+            phase_space.x[0] - x_step / 2,
+            self.SETTINGS["position_range"][0],
+            atol=1e-15,
+        )
+        np.testing.assert_allclose(
+            phase_space.x[-1] + x_step / 2,
+            self.SETTINGS["position_range"][1],
+            rtol=1e-9,
+        )
