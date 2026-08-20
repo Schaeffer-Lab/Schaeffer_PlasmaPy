@@ -518,6 +518,10 @@ class TestConditionPhaseSpace:
             smoothing_window=5,
             smoothing_iterations=2,
             pedestal_warning=None,
+            # This fixture's velocity grid is only a few thermal widths wide, so
+            # a 5-bin boxcar does inflate the second moment; that is the subject
+            # of TestSmoothingWidth, not of this test.
+            smoothing_variance_warning=None,
         )
         np.testing.assert_array_equal(phase_space.f, before)
 
@@ -585,10 +589,11 @@ class TestConditionPhaseSpace:
         np.testing.assert_allclose(recovered_drift, drift, rtol=1e-3)
         np.testing.assert_allclose(recovered_sigma, sigma, rtol=1e-3)
 
-    def test_default_settings_warn_and_inflate_width_on_a_wide_grid(self):
+    def test_the_taper_inflates_the_width_on_a_wide_grid(self):
         """
-        Companion to the test above: with the default taper on a 6-sigma grid
-        the recovered width comes out ~5% high, and the user is told.
+        Companion to the test above: with the taper on a 6-sigma grid the
+        recovered width comes out ~5% high, and the user is told. This is why
+        the taper is no longer the default -- see `extend_vdf_tail`.
         """
         sigma = 5e6
         v = np.linspace(-6 * sigma, 6 * sigma, 2048)
@@ -600,7 +605,9 @@ class TestConditionPhaseSpace:
             label="e-",
         )
         with pytest.warns(RuntimeWarning, match="fabricating a pedestal"):
-            conditioned = pic_thomson.condition_phase_space(phase_space)
+            conditioned = pic_thomson.condition_phase_space(
+                phase_space, tail_model=None
+            )
         f = conditioned.f[0, :, 0]
         recovered_sigma = np.sqrt(np.trapezoid(f * v**2, v))
         np.testing.assert_allclose(recovered_sigma / sigma - 1.0, 0.054, atol=5e-3)
@@ -938,8 +945,13 @@ class TestDriverValidation:
             )
 
     def test_warns_when_an_ion_is_passed_as_an_electron(self):
-        with pytest.warns(RuntimeWarning, match="not flagged as one"):
+        # A proton standing in for an electron also puts the EPW resonance some
+        # 77 thermal widths out, so the tail check fires too. Match on the
+        # category and assert on the message, rather than letting pytest
+        # re-emit the second warning into the error filter.
+        with pytest.warns(RuntimeWarning) as record:
             run_driver(electrons=species_phase_space("p+", 100, const.m_p))
+        assert any("not flagged as one" in str(entry.message) for entry in record)
 
     @pytest.mark.parametrize("notches", [np.zeros((2, 3)), np.zeros(3)])
     def test_rejects_malformed_notches(self, notches):
@@ -1678,6 +1690,14 @@ def fake_warpx_frames(
     monkeypatch.setattr(pic_thomson, "_warpx_frame", frame)
 
 
+COARSE_VELOCITY_AXIS = pytest.mark.filterwarnings(
+    # These fixtures hold a handful of macroparticles, so their "thermal width"
+    # is a couple of bins by construction. The velocity-resolution check has its
+    # own tests; here it is noise.
+    "ignore:the velocity axis gives species:RuntimeWarning"
+)
+
+
 def make_warpx_plotfiles(tmp_path, n_frames=3, prefix="diag1"):
     """Create empty plotfile directories for the reader to enumerate."""
     diags = tmp_path / "diags"
@@ -1732,6 +1752,7 @@ class TestWarpxVelocityScan:
 
     N_FRAMES = 5
 
+    @COARSE_VELOCITY_AXIS
     def test_scanning_every_frame_covers_the_middle(self, tmp_path, monkeypatch):
         mass = 100 * const.m_e.si.value
         fake_warpx_frames_with_a_fast_middle(monkeypatch, mass, n_frames=self.N_FRAMES)
@@ -1751,6 +1772,7 @@ class TestWarpxVelocityScan:
         assert phase_space.v.max() > 10 * WARPX_SIGMA
         assert phase_space.meta["clipped_count"] == 0
 
+    @COARSE_VELOCITY_AXIS
     def test_scanning_only_the_ends_clips_and_says_so(self, tmp_path, monkeypatch):
         mass = 100 * const.m_e.si.value
         fake_warpx_frames_with_a_fast_middle(monkeypatch, mass, n_frames=self.N_FRAMES)
@@ -2170,6 +2192,7 @@ class TestWarpxReader:
         )
         np.testing.assert_allclose(2.0 * doubled.f, unit.f, rtol=1e-12)
 
+    @COARSE_VELOCITY_AXIS
     def test_selects_requested_frames(self, tmp_path, monkeypatch):
         mass = 100 * const.m_e.si.value
         fake_warpx_frames(monkeypatch, mass)
@@ -2826,6 +2849,7 @@ class TestWarpxNDim:
         )
         np.testing.assert_array_equal(named.f, vector.f)
 
+    @COARSE_VELOCITY_AXIS
     def test_gamma_uses_the_full_momentum(self, tmp_path, monkeypatch):
         r"""
         For a particle with momentum in more than one direction, the velocity
@@ -3916,6 +3940,9 @@ class TestPerSpeciesVelocityScaling:
             t=times,
             x=positions,
             label="e-",
+            # alpha is about 5.5 here, so the EPW resonance sits near 6.3
+            # thermal speeds and the default headroom of 6 stops just short.
+            velocity_headroom=12.0,
         )
         ions = pic_thomson.from_moments(
             np.full(shape, 1e25),
@@ -3968,9 +3995,7 @@ class TestPerSpeciesVelocityScaling:
         # near zero at the resonance and so amplifies even a small term. The
         # residual is a few parts in 1e5, against the factor-of-4 change the
         # same rescaling makes to the ion feature.
-        np.testing.assert_allclose(
-            renormalised(scaled), renormalised(plain), rtol=1e-3
-        )
+        np.testing.assert_allclose(renormalised(scaled), renormalised(plain), rtol=1e-3)
         # ...and the satellite sits in the same bin.
         assert np.argmax(scaled.epw[0][wings]) == np.argmax(plain.epw[0][wings])
 
@@ -4113,3 +4138,1179 @@ class TestAlreadyReducedPhaseSpace:
                 progress=False,
             )
         assert np.all(np.isfinite(spectra.epw))
+
+
+class TestNotchBoundaries:
+    r"""
+    A notch blocks a closed interval of wavelengths. Locating its edges with
+    ``argmin`` rounded each to the nearest bin centre, and the half-open slice
+    that followed left the upper endpoint bin unblocked on top of that: on the
+    0.4 nm grid used for OSIRIS EPW windows a requested [530, 534] came out as
+    [530.2, 533.4]. That matters because the bin immediately outside a notch
+    holds the skirt of the central feature, which is orders of magnitude above
+    the EPW satellites and takes the whole window once each row is normalised
+    to unit area.
+    """
+
+    @staticmethod
+    def spectrum(wavelengths, notches):
+        pytest.importorskip("numba")
+        electrons = species_phase_space("e-", 100, const.m_e)
+        ions = species_phase_space("p+", 50, const.m_p)
+        conditioned = [
+            # No taper: these tests are about which wavelength bins the notch
+            # covers, and the fixture's grid would trip the pedestal check.
+            pic_thomson.condition_phase_space(
+                ps.at_position(0.5e-3), taper_threshold=None
+            )
+            for ps in (electrons, ions)
+        ]
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            _, spectrum = thomson.arbitrary_forwardmodel(
+                wavelengths=wavelengths,
+                probe_wavelength=PROBE_WAVELENGTH,
+                e_velocity_axes=[conditioned[0].v] * u.m / u.s,
+                i_velocity_axes=[conditioned[1].v] * u.m / u.s,
+                efn=[conditioned[0].f[0, :, 0]] * u.s / u.m,
+                ifn=[conditioned[1].f[0, :, 0]] * u.s / u.m,
+                efract=np.array([1.0]),
+                ifract=np.array([1.0]),
+                n=REFERENCE_DENSITY,
+                ion_species=["p+"],
+                probe_vec=np.asarray(PROBE_VEC, dtype=float),
+                scatter_vec=np.asarray(SCATTER_VEC, dtype=float),
+                scattered_power=True,
+                notches=notches,
+            )
+        return np.asarray(spectrum, dtype=float)
+
+    def test_blocks_exactly_the_requested_interval(self):
+        # 0.4008 nm bins, deliberately offset so that neither notch edge lands
+        # on a bin centre -- which is the case argmin used to get wrong.
+        wavelengths = np.linspace(432, 632, 500) * u.nm
+        grid = wavelengths.to_value(u.nm)
+        spectrum = self.spectrum(wavelengths, np.array([[530.0, 534.0]]) * u.nm)
+
+        inside = (grid >= 530.0) & (grid <= 534.0)
+        assert np.all(spectrum[inside] == 0.0)
+        # In particular the bin nearest the upper edge, which the half-open
+        # slice used to leave in.
+        assert grid[inside][-1] == pytest.approx(533.804, abs=1e-3)
+
+    def test_leaves_everything_outside_it_alone(self):
+        wavelengths = np.linspace(432, 632, 500) * u.nm
+        grid = wavelengths.to_value(u.nm)
+        spectrum = self.spectrum(wavelengths, np.array([[530.0, 534.0]]) * u.nm)
+
+        outside = (grid < 530.0) | (grid > 534.0)
+        # Nothing beyond the interval was zeroed: argmin could round an edge
+        # outwards and take a bin the filter does not cover.
+        assert np.all(spectrum[outside] > 0.0)
+
+    def test_an_edge_landing_on_a_bin_centre_is_included(self):
+        # 0.5 nm bins, so 530.0 and 534.0 are exactly bin centres.
+        wavelengths = np.linspace(430, 630, 401) * u.nm
+        grid = wavelengths.to_value(u.nm)
+        spectrum = self.spectrum(wavelengths, np.array([[530.0, 534.0]]) * u.nm)
+
+        assert spectrum[np.argmin(np.abs(grid - 530.0))] == 0.0
+        assert spectrum[np.argmin(np.abs(grid - 534.0))] == 0.0
+        assert spectrum[np.argmin(np.abs(grid - 529.5))] > 0.0
+        assert spectrum[np.argmin(np.abs(grid - 534.5))] > 0.0
+
+    def test_several_notches_are_all_applied(self):
+        wavelengths = np.linspace(432, 632, 500) * u.nm
+        grid = wavelengths.to_value(u.nm)
+        spectrum = self.spectrum(
+            wavelengths, np.array([[500.0, 505.0], [530.0, 534.0]]) * u.nm
+        )
+        for lo, hi in ((500.0, 505.0), (530.0, 534.0)):
+            assert np.all(spectrum[(grid >= lo) & (grid <= hi)] == 0.0)
+
+
+class TestSmoothingWidth:
+    r"""
+    A boxcar is a convolution, so it adds ``iterations * (window^2 - 1) / 12``
+    bins^2 of variance to every slice whatever that slice's own width. In
+    velocity units that is an additive temperature, and the forward model reads
+    the thermal speed straight off the distribution. A window given in bins is
+    therefore only meaningful next to the data; ``smoothing_width`` gives it in
+    thermal speeds instead.
+    """
+
+    @staticmethod
+    def narrow_phase_space(n_v=1024, half_width=40.0):
+        """A Maxwellian occupying a small part of a wide velocity grid."""
+        sigma = sigma_of(40.0, const.m_e)
+        v = np.linspace(-half_width * sigma, half_width * sigma, n_v)
+        return pic_thomson.from_arrays(
+            f=block(maxwellian(v, sigma), n_time=2, n_x=2),
+            v=v,
+            x=np.linspace(0.0, 1e-3, 2),
+            t=np.linspace(0.0, 1e-9, 2),
+            label="e-",
+        )
+
+    @staticmethod
+    def width_of(phase_space, step=0, cell=0):
+        f = phase_space.f[step, :, cell]
+        v = phase_space.v
+        norm = np.trapezoid(f, v)
+        mean = np.trapezoid(f * v, v) / norm
+        return float(np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / norm))
+
+    def test_a_window_in_bins_inflates_the_temperature(self):
+        phase_space = self.narrow_phase_space()
+        before = self.width_of(phase_space)
+        with pytest.warns(RuntimeWarning, match="additive temperature"):
+            conditioned = pic_thomson.condition_phase_space(
+                phase_space,
+                smoothing_window=40,
+                smoothing_iterations=3,
+                taper_threshold=None,
+            )
+        # T scales as the square of the width, so this is a factor of a few in
+        # temperature -- exactly the effect that has to be caught.
+        assert self.width_of(conditioned) / before > 1.5
+
+    def test_a_width_in_thermal_speeds_does_not(self):
+        phase_space = self.narrow_phase_space()
+        before = self.width_of(phase_space)
+        conditioned = pic_thomson.condition_phase_space(
+            phase_space,
+            smoothing_width=0.25,
+            smoothing_iterations=3,
+            taper_threshold=None,
+        )
+        assert self.width_of(conditioned) / before == pytest.approx(1.0, abs=0.02)
+
+    def test_the_window_follows_the_data_not_the_grid(self):
+        """
+        The same plasma dumped on a grid twice as wide must get half the window
+        in bins -- that is the whole point of asking in thermal speeds.
+        """
+        windows = []
+        for half_width in (20.0, 40.0):
+            conditioned = pic_thomson.condition_phase_space(
+                self.narrow_phase_space(half_width=half_width),
+                smoothing_width=0.25,
+                smoothing_iterations=2,
+                taper_threshold=None,
+            )
+            windows.append(conditioned.meta["conditioning"]["smoothing_window"])
+        assert windows[0] == pytest.approx(2 * windows[1], rel=0.05)
+
+    def test_the_resolved_window_is_recorded(self):
+        conditioned = pic_thomson.condition_phase_space(
+            self.narrow_phase_space(),
+            smoothing_width=0.5,
+            smoothing_iterations=1,
+            taper_threshold=None,
+        )
+        conditioning = conditioned.meta["conditioning"]
+        assert conditioning["smoothing_width"] == 0.5
+        assert conditioning["smoothing_window"] > 1
+
+    def test_window_and_width_together_are_refused(self):
+        with pytest.raises(ValueError, match="not both"):
+            pic_thomson.condition_phase_space(
+                self.narrow_phase_space(),
+                smoothing_window=10,
+                smoothing_width=0.25,
+                smoothing_iterations=1,
+            )
+
+    def test_smoothing_is_sized_by_the_narrowest_slice(self):
+        """
+        One boxcar serves every slice, so it has to suit the slice that can
+        least afford it -- otherwise a cold cell beside a hot one is smeared to
+        match the hot one's width.
+        """
+        sigma = sigma_of(40.0, const.m_e)
+        v = np.linspace(-40 * sigma, 40 * sigma, 1024)
+        cold = maxwellian(v, sigma)
+        hot = maxwellian(v, 8 * sigma)
+        f = np.stack([cold, hot], axis=-1)[np.newaxis, :, :]
+        phase_space = pic_thomson.from_arrays(
+            f=f,
+            v=v,
+            x=np.array([0.0, 1e-3]),
+            t=np.array([0.0]),
+            label="e-",
+        )
+        conditioned = pic_thomson.condition_phase_space(
+            phase_space,
+            smoothing_width=0.25,
+            smoothing_iterations=3,
+            taper_threshold=None,
+        )
+        assert self.width_of(conditioned, cell=0) / self.width_of(
+            phase_space, cell=0
+        ) == pytest.approx(1.0, abs=0.02)
+
+    def test_no_smoothing_means_no_window_to_resolve(self):
+        # Nothing is smoothed, so nothing needs sizing -- and an unpopulated
+        # phase space must not raise on the way past.
+        empty = replace(self.narrow_phase_space(), f=np.zeros((2, 1024, 2)))
+        conditioned = pic_thomson.condition_phase_space(
+            empty, smoothing_iterations=0, taper_threshold=None
+        )
+        assert conditioned.meta["conditioning"]["smoothing_window"] == 1
+
+    def test_a_species_absent_from_the_point_is_not_an_alarm(self):
+        """
+        A population with no macroparticles at the sampled point -- a piston
+        that has not arrived -- has no width to size anything against. That is
+        ordinary, and must not warn.
+        """
+        empty = replace(self.narrow_phase_space(), f=np.zeros((2, 1024, 2)))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            conditioned = pic_thomson.condition_phase_space(
+                empty,
+                tail_model=None,
+                smoothing_width=0.25,
+                smoothing_iterations=2,
+                max_taper_width=0.5,
+            )
+        assert conditioned.meta["conditioning"]["smoothing_window"] == 1
+        assert conditioned.meta["conditioning"]["max_taper_bins"] == 1
+
+    def test_a_slice_the_grid_cannot_resolve_still_warns(self):
+        # A single occupied bin has weight but no measurable spread, which is
+        # not ordinary -- it means the grid cannot resolve the distribution.
+        f = np.zeros((1, 1024, 1))
+        f[0, 512, 0] = 1.0
+        spike = replace(
+            self.narrow_phase_space(), f=f, t=np.array([0.0]), x=np.array([0.0])
+        )
+        with pytest.warns(RuntimeWarning, match="under one velocity bin"):
+            conditioned = pic_thomson.condition_phase_space(
+                spike,
+                smoothing_width=0.25,
+                smoothing_iterations=2,
+                taper_threshold=None,
+            )
+        assert conditioned.meta["conditioning"]["smoothing_window"] == 1
+
+    def test_smooth_vdf_stays_silent_unless_asked(self):
+        phase_space = self.narrow_phase_space()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            pic_thomson.smooth_vdf(phase_space.f, window=40, iterations=3)
+
+
+class TestEPWTailCheck:
+    r"""
+    The EPW satellite sits at the Bohm--Gross resonance, so it reads :math:`f_e`
+    at :math:`\sqrt{\alpha^2 + 3}` thermal widths. A PIC histogram is populated
+    only as far as its last macroparticle, typically three to five widths --
+    reaching :math:`n` widths needs of order :math:`e^{n^2/2}` particles per
+    cell. Past that the taper and the floor supply whatever the resonance of
+    :math:`|1 - \chi_e/\epsilon|^2` then amplifies into a satellite, and that
+    satellite moves when ``max_taper_bins`` moves. It is not a measurement and
+    the spectrogram has to say so.
+    """
+
+    @staticmethod
+    def electrons(reach, T_eV=100.0, n_v=2048):
+        """A Maxwellian truncated at *reach* thermal widths."""
+        sigma = sigma_of(T_eV, const.m_e)
+        v = np.linspace(-reach * sigma, reach * sigma, n_v)
+        return pic_thomson.from_arrays(
+            f=block(maxwellian(v, sigma), n_time=3, n_x=4),
+            v=v,
+            x=np.linspace(0.0, 1e-3, 4),
+            t=np.linspace(0.0, 2e-9, 3),
+            label="e-",
+        )
+
+    def spectra(self, reach, T_eV=100.0, **kwargs):
+        pytest.importorskip("numba")
+        return run_driver(
+            electrons=self.electrons(reach, T_eV=T_eV),
+            electron_conditioning={"taper_threshold": None},
+            ion_conditioning={"taper_threshold": None},
+            **kwargs,
+        )
+
+    def test_reports_what_the_satellite_needs(self):
+        spectra = self.spectra(8.0)
+        # sqrt(alpha_conventional^2 + 3), with the model's alpha being sqrt(2)
+        # times the conventional one.
+        expected = np.sqrt(spectra.alpha_epw**2 / 2 + 3)
+        np.testing.assert_allclose(spectra.epw_tail_required, expected, rtol=1e-12)
+
+    def test_reports_how_far_the_histogram_reaches(self):
+        spectra = self.spectra(8.0)
+        assert spectra.epw_tail_ratio.shape == (1, spectra.n_time)
+        np.testing.assert_allclose(spectra.epw_tail_ratio, 8.0, rtol=0.02)
+
+    def test_a_reachable_resonance_is_left_alone(self):
+        spectra = self.spectra(8.0)
+        assert np.all(spectra.epw_resolved)
+        assert np.all(np.isfinite(spectra.epw))
+
+    def test_an_unreachable_resonance_is_kept_but_priced(self):
+        """
+        Since `extend_vdf_tail` fits the tail rather than tapering it, a
+        resonance past the sampled data is an extrapolation with a stated
+        uncertainty, not an artefact -- so it is kept, and the uncertainty is
+        what says whether to believe it.
+        """
+        # Colder electrons at the same density put the resonance at 4.4
+        # widths, and this histogram stops at 4.
+        with pytest.warns(RuntimeWarning, match="beyond the last velocity"):
+            spectra = self.spectra(4.0, T_eV=20.0)
+        assert not np.any(spectra.epw_resolved)
+        assert np.all(np.isfinite(spectra.epw))
+        assert np.all(spectra.epw_tail_uncertainty >= 1.0)
+        # The check does not touch the IAW feature, which reads the bulk.
+        assert np.all(np.isfinite(spectra.alpha_epw))
+
+    def test_nothing_extrapolated_is_priced_at_one(self):
+        spectra = self.spectra(8.0)
+        assert np.all(spectra.epw_resolved)
+        np.testing.assert_allclose(spectra.epw_tail_uncertainty, 1.0)
+
+    def test_the_mask_can_still_be_asked_for(self):
+        with pytest.warns(RuntimeWarning, match="beyond the last velocity"):
+            spectra = self.spectra(4.0, T_eV=20.0, mask_unresolved_epw=True)
+        assert not np.any(spectra.epw_resolved)
+        assert np.all(np.isnan(spectra.epw))
+
+    def test_the_warning_names_the_sampling_as_the_cause(self):
+        with pytest.warns(RuntimeWarning, match="sampled no 'e-' that fast"):
+            self.spectra(4.0, T_eV=20.0)
+
+    def test_a_reconstructed_tail_is_named_as_such(self):
+        r"""
+        `from_moments` has no last macroparticle -- its grid stops where
+        ``velocity_headroom`` was told to stop -- so the remedy is a wider grid,
+        and the spectrogram records that the population was reconstructed.
+        """
+        pytest.importorskip("numba")
+        times = np.linspace(0.0, 1e-9, 2)
+        positions = np.linspace(0.0, 1e-3, 3)
+        shape = (times.size, positions.size)
+        electrons = pic_thomson.from_moments(
+            np.full(shape, 1e25),
+            np.full(shape, 20.0) * u.eV,
+            t=times,
+            x=positions,
+            label="e-",
+            velocity_headroom=4.0,
+        )
+        ions = pic_thomson.from_moments(
+            np.full(shape, 1e25),
+            np.full(shape, 20.0) * u.eV,
+            t=times,
+            x=positions,
+            label="p+",
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            with pytest.warns(RuntimeWarning, match="widen velocity_headroom"):
+                spectra = pic_thomson.spectra_from_phase_spaces(
+                    electrons=electrons,
+                    ions=[ions],
+                    position=positions[1],
+                    probe_wavelength=PROBE_WAVELENGTH,
+                    epw_wavelengths=EPW_WINDOW,
+                    electron_conditioning={"taper_threshold": None},
+                    ion_conditioning={"taper_threshold": None},
+                    progress=False,
+                )
+        assert spectra.meta["epw_tail_analytic"] == ["e-"]
+
+    def test_an_absent_population_cannot_fail_the_check(self):
+        """
+        A population below the presence threshold is not handed to the forward
+        model at all, so its tail cannot fabricate anything.
+        """
+        pytest.importorskip("numba")
+        present = self.electrons(8.0)
+        absent = replace(
+            self.electrons(2.0),
+            f=self.electrons(2.0).f * 1e-6,
+            label="e- halo",
+        )
+        spectra = run_driver(
+            electrons=[present, absent],
+            electron_conditioning={"taper_threshold": None},
+            ion_conditioning={"taper_threshold": None},
+        )
+        assert np.all(spectra.epw_resolved)
+        assert np.all(np.isfinite(spectra.epw))
+
+    def test_the_diagnostic_survives_a_round_trip(self, tmp_path):
+        spectra = self.spectra(8.0)
+        path = tmp_path / "spectra.h5"
+        spectra.to_hdf5(path)
+        restored = pic_thomson.ThomsonSpectrogram.from_hdf5(path)
+        np.testing.assert_allclose(restored.epw_tail_ratio, spectra.epw_tail_ratio)
+        np.testing.assert_allclose(
+            restored.epw_tail_required, spectra.epw_tail_required
+        )
+        np.testing.assert_array_equal(restored.epw_resolved, spectra.epw_resolved)
+        np.testing.assert_allclose(
+            restored.epw_tail_uncertainty, spectra.epw_tail_uncertainty
+        )
+
+    def test_a_spectrogram_without_the_diagnostic_is_unassessed(self):
+        """
+        Files written before the check existed, and spectrograms built by hand,
+        must read back as "not assessed" rather than as a verdict.
+        """
+        spectrogram = synthetic_spectrogram()
+        assert spectrogram.epw_tail_ratio.shape == (1, spectrogram.n_time)
+        assert np.all(np.isnan(spectrogram.epw_tail_ratio))
+        assert np.all(np.isnan(spectrogram.epw_tail_required))
+        assert np.all(spectrogram.epw_resolved)
+
+
+class TestTaperWidth:
+    """
+    ``max_taper_bins`` has the same trouble as ``smoothing_window``: how much
+    width a rolloff of N bins adds depends on how wide the code's velocity grid
+    happens to be, not on the plasma. ``max_taper_width`` asks in thermal
+    speeds instead.
+    """
+
+    @staticmethod
+    def phase_space(half_width):
+        sigma = sigma_of(40.0, const.m_p)
+        v = np.linspace(-half_width * sigma, half_width * sigma, 1024)
+        return pic_thomson.from_arrays(
+            f=block(maxwellian(v, sigma), n_time=2, n_x=2),
+            v=v,
+            x=np.linspace(0.0, 1e-3, 2),
+            t=np.linspace(0.0, 1e-9, 2),
+            label="p+",
+        )
+
+    def test_the_rolloff_follows_the_data_not_the_grid(self):
+        rolloffs = []
+        for half_width in (20.0, 40.0):
+            conditioned = pic_thomson.condition_phase_space(
+                self.phase_space(half_width),
+                tail_model=None,
+                max_taper_width=0.5,
+                pedestal_warning=None,
+            )
+            rolloffs.append(conditioned.meta["conditioning"]["max_taper_bins"])
+        # Half the grid spacing, so twice the bins -- give or take the rounding
+        # of each to a whole number.
+        assert rolloffs[0] == pytest.approx(2 * rolloffs[1], abs=1)
+
+    def test_it_keeps_the_second_moment(self):
+        phase_space = self.phase_space(40.0)
+        v = phase_space.v
+
+        def width(f):
+            norm = np.trapezoid(f, v)
+            mean = np.trapezoid(f * v, v) / norm
+            return float(np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / norm))
+
+        before = width(phase_space.f[0, :, 0])
+        conditioned = pic_thomson.condition_phase_space(
+            phase_space, tail_model=None, max_taper_width=0.5, pedestal_warning=None
+        )
+        assert width(conditioned.f[0, :, 0]) / before == pytest.approx(1.0, abs=0.05)
+
+    def test_bins_and_width_together_are_refused(self):
+        with pytest.raises(ValueError, match="not both"):
+            pic_thomson.condition_phase_space(
+                self.phase_space(40.0),
+                tail_model=None,
+                max_taper_bins=8,
+                max_taper_width=0.5,
+            )
+
+
+class TestExtendVDFTail:
+    r"""
+    The tail beyond the last macroparticle is not measured, and the EPW
+    satellite reads it. `taper_vdf_edges` filled it with a half-cosine to zero,
+    whose amplitude, slope and extent were all free choices;
+    `extend_vdf_tail` fills it with the distribution's own fitted Maxwellian,
+    which has none.
+    """
+
+    SIGMA = 1.0
+
+    @staticmethod
+    def grid(half_width=40.0, n_v=1024):
+        return np.linspace(-half_width, half_width, n_v)
+
+    @classmethod
+    def sampled(cls, n_particles, v, sigma=None, rng=None, drift=0.0):
+        """A histogram of *n_particles* drawn from a Maxwellian, as PIC gives."""
+        rng = rng or np.random.default_rng(4)
+        sigma = cls.SIGMA if sigma is None else sigma
+        dv = v[1] - v[0]
+        edges = np.append(v - dv / 2, v[-1] + dv / 2)
+        draws = rng.normal(drift, sigma, int(n_particles))
+        return np.histogram(draws, bins=edges)[0].astype(float)[np.newaxis, :, None]
+
+    @staticmethod
+    def truth(v, n_particles, sigma=1.0):
+        dv = v[1] - v[0]
+        return (
+            np.exp(-(v**2) / (2 * sigma**2))
+            / (sigma * np.sqrt(2 * np.pi))
+            * n_particles
+            * dv
+        )
+
+    def test_recovers_the_temperature_it_was_drawn_at(self):
+        v = self.grid()
+        _, info = pic_thomson.extend_vdf_tail(self.sampled(1e5, v), v)
+        assert info["tail_over_core_width"] == pytest.approx(1.0, abs=0.01)
+        assert info["fallback_fraction"] == 0.0
+
+    def test_extrapolates_well_past_the_last_particle(self):
+        """
+        The point of the exercise: be right where the satellite reads, which is
+        several times beyond anything the run sampled.
+        """
+        v = self.grid()
+        extended, info = pic_thomson.extend_vdf_tail(self.sampled(1e5, v), v)
+        truth = self.truth(v, 1e5)
+        assert info["join_thermal_speeds"] < 4.0
+        # Right to within a factor of two at twelve thermal speeds, which is
+        # three times beyond the last macroparticle. The taper's answer there
+        # was whatever max_taper_bins happened to be.
+        for probe in (5.0, 8.0, 12.0):
+            index = int(np.argmin(np.abs(v - probe)))
+            assert 0.5 < extended[0, index, 0] / truth[index] < 2.0
+
+    def test_the_reported_uncertainty_bounds_the_error(self):
+        r"""
+        ``tail_width_error`` is the standard error on :math:`\sigma_t`, and
+        :math:`\delta \ln f = (x/\sigma_t)^2 \delta\sigma_t/\sigma_t`. A run too
+        thin to constrain the tail has to say so rather than quietly extrapolate.
+        """
+        v = self.grid()
+        extended, info = pic_thomson.extend_vdf_tail(self.sampled(1e4, v), v)
+        index = int(np.argmin(np.abs(v - 12.0)))
+        observed = extended[0, index, 0] / self.truth(v, 1e4)[index]
+        allowed = np.exp(144.0 * info["tail_width_error"])
+        assert 1 / allowed <= observed <= allowed
+        # And a better-sampled run must be quoted as more certain.
+        _, better = pic_thomson.extend_vdf_tail(self.sampled(1e6, v), v)
+        assert better["tail_width_error"] < info["tail_width_error"]
+
+    def test_a_resolved_suprathermal_tail_survives(self):
+        """
+        A fitted tail temperature is worth having only if it can differ from the
+        core; otherwise the core temperature would do.
+        """
+        v = self.grid()
+        rng = np.random.default_rng(11)
+        dv = v[1] - v[0]
+        edges = np.append(v - dv / 2, v[-1] + dv / 2)
+        draws = np.concatenate(
+            [rng.normal(0.0, 1.0, 500_000), rng.normal(0.0, 2.5, 25_000)]
+        )
+        f = np.histogram(draws, bins=edges)[0].astype(float)[np.newaxis, :, None]
+        _, info = pic_thomson.extend_vdf_tail(f, v)
+        assert info["tail_over_core_width"] > 1.1
+
+    def test_it_falls_back_to_the_core_when_there_is_no_tail_to_fit(self):
+        v = self.grid()
+        extended, info = pic_thomson.extend_vdf_tail(self.sampled(60, v), v)
+        # Sixty particles leave nothing to fit on at least one side.
+        assert info["fallback_fraction"] > 0.0
+        assert np.all(np.isfinite(extended))
+        assert np.all(extended >= 0)
+
+    def test_it_anchors_on_the_fit_not_on_the_join_bin(self):
+        """
+        The join is the outermost bin still holding ``min_counts``, so it is a
+        selected upward fluctuation. ``join_step`` records the disagreement, and
+        it must sit below one -- anchoring there would bias the whole tail high.
+        """
+        v = self.grid()
+        _, info = pic_thomson.extend_vdf_tail(self.sampled(1e5, v), v)
+        assert 0.4 < info["join_step"] < 1.0
+
+    def test_more_particles_buys_more_measured_tail(self):
+        """
+        What the fraction-of-peak threshold could not do: a count-based join has
+        to move outwards when the run is better sampled.
+        """
+        v = self.grid()
+        joins = [
+            pic_thomson.extend_vdf_tail(self.sampled(n, v), v)[1]["join_thermal_speeds"]
+            for n in (1e4, 1e6)
+        ]
+        assert joins[1] > joins[0] + 0.5
+
+    def test_a_drifting_slice_is_measured_about_its_own_mean(self):
+        v = self.grid(half_width=60.0)
+        _, info = pic_thomson.extend_vdf_tail(self.sampled(1e5, v, drift=8.0), v)
+        assert info["tail_over_core_width"] == pytest.approx(1.0, abs=0.05)
+
+    def test_an_empty_slice_is_untouched(self):
+        v = self.grid()
+        f = np.zeros((1, v.size, 1))
+        extended, info = pic_thomson.extend_vdf_tail(f, v)
+        np.testing.assert_array_equal(extended, f)
+        assert info["join_thermal_speeds"] is None
+
+    def test_an_analytic_distribution_is_left_alone(self):
+        """
+        Nothing was counted, so there is no particle quantum and no ragged edge
+        to join at. Extending it would be inventing a join.
+        """
+        v = self.grid()
+        f = block(maxwellian(v, 1.0), n_time=1, n_x=1)
+        extended, info = pic_thomson.extend_vdf_tail(f, v)
+        np.testing.assert_array_equal(extended, f)
+        assert info["counted_fraction"] == 0.0
+
+    def test_the_smoothed_distribution_is_extended_but_the_raw_one_is_counted(self):
+        """
+        Smoothing mixes bins and destroys the particle quantum, so the counts
+        have to come from the histogram as the code wrote it.
+        """
+        v = self.grid()
+        raw = self.sampled(1e5, v)
+        smoothed = pic_thomson.smooth_vdf(raw, window=8, iterations=2)
+        _, with_counts = pic_thomson.extend_vdf_tail(smoothed, v, counts=raw)
+        _, without = pic_thomson.extend_vdf_tail(smoothed, v)
+        # A boxcar spreads single particles over its width, so the smallest
+        # positive value is no longer one particle and the join lands somewhere
+        # else entirely.
+        assert with_counts["counted_fraction"] == 1.0
+        assert without["join_thermal_speeds"] != pytest.approx(
+            with_counts["join_thermal_speeds"], rel=0.05
+        )
+
+    def test_mismatched_counts_are_refused(self):
+        v = self.grid()
+        with pytest.raises(ValueError, match="same histogram"):
+            pic_thomson.extend_vdf_tail(
+                self.sampled(1e4, v), v, counts=np.zeros((1, 10, 1))
+            )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [({"min_counts": 0}, "min_counts"), ({"fit_from": -1.0}, "fit_from")],
+    )
+    def test_rejects_impossible_settings(self, kwargs, match):
+        v = self.grid()
+        with pytest.raises(ValueError, match=match):
+            pic_thomson.extend_vdf_tail(self.sampled(1e4, v), v, **kwargs)
+
+    def test_condition_phase_space_uses_it_by_default(self):
+        v = self.grid()
+        phase_space = pic_thomson.from_arrays(
+            f=self.sampled(1e5, v),
+            v=v,
+            x=np.zeros(1),
+            t=np.zeros(1),
+            label="e-",
+        )
+        conditioned = pic_thomson.condition_phase_space(phase_space)
+        conditioning = conditioned.meta["conditioning"]
+        assert conditioning["tail"]["model"] == "maxwellian"
+        assert conditioning["taper_threshold"] is None
+        # No floor: it would put a flat pedestal at ~12 thermal speeds, which is
+        # exactly where the satellite reads at alpha ~ 12.
+        assert conditioning["floor"] == 0.0
+        assert conditioned.f.min() >= 0.0
+
+    def test_selecting_the_taper_instead_still_works(self):
+        v = self.grid()
+        phase_space = pic_thomson.from_arrays(
+            f=self.sampled(1e5, v),
+            v=v,
+            x=np.zeros(1),
+            t=np.zeros(1),
+            label="e-",
+        )
+        conditioned = pic_thomson.condition_phase_space(
+            phase_space, tail_model=None, max_taper_bins=20, pedestal_warning=None
+        )
+        conditioning = conditioned.meta["conditioning"]
+        assert conditioning["tail"] is None
+        assert conditioning["taper_threshold"] == 0.005
+        assert conditioning["floor"] == pic_thomson.DEFAULT_FLOOR
+
+    def test_an_unknown_tail_model_is_refused(self):
+        with pytest.raises(ValueError, match="tail_model must be"):
+            pic_thomson.condition_phase_space(simple_phase_space(), tail_model="kappa")
+
+
+class TestAutomaticNotch:
+    r"""
+    A stray-light mask fixed in wavelength does not stay over a feature the flow
+    is Doppler-shifting: at :math:`2\times10^6` m/s the shift is
+    :math:`\lambda^2 k u / 2\pi c \approx 3.7` nm, most of a 4 nm notch, and the
+    bin immediately outside holds the skirt of a feature orders of magnitude
+    above the satellites. ``epw_notches="auto"`` sizes it from the central
+    feature as measured in the IAW window, every timestep.
+    """
+
+    def run(self, **kwargs):
+        pytest.importorskip("numba")
+        return run_driver(iaw_wavelengths=IAW_WINDOW, **kwargs)
+
+    def test_it_records_what_it_masked(self):
+        spectra = self.run(epw_notches="auto")
+        applied = np.asarray(spectra.meta["epw_notch_applied"], dtype=float)
+        assert applied.shape == (spectra.n_time, 2)
+        assert np.all(applied[:, 1] > applied[:, 0])
+        # And it lands on the probe, which is where the central feature is for
+        # a plasma with no bulk flow.
+        centres = applied.mean(axis=1)
+        np.testing.assert_allclose(centres, PROBE_WAVELENGTH.to_value(u.nm), atol=1.0)
+
+    def test_the_masked_bins_are_zero(self):
+        spectra = self.run(epw_notches="auto")
+        applied = np.asarray(spectra.meta["epw_notch_applied"], dtype=float)
+        grid = spectra.epw_wavelengths * 1e9
+        for step in range(spectra.n_time):
+            lo, hi = applied[step]
+            inside = (grid >= lo) & (grid <= hi)
+            if inside.any():
+                assert np.all(spectra.epw[step][inside] == 0.0)
+
+    def test_a_fixed_notch_is_still_honoured(self):
+        spectra = self.run(epw_notches=[528, 536] * u.nm)
+        grid = spectra.epw_wavelengths * 1e9
+        inside = (grid >= 528) & (grid <= 536)
+        assert np.all(spectra.epw[0][inside] == 0.0)
+        assert np.all(np.isnan(np.asarray(spectra.meta["epw_notch_applied"])))
+
+    def test_auto_needs_a_window_to_measure_the_feature_in(self):
+        with pytest.raises(ValueError, match="measures in the IAW window"):
+            run_driver(epw_notches="auto")
+
+    def test_an_unknown_keyword_is_refused(self):
+        with pytest.raises(ValueError, match="epw_notches must be"):
+            self.run(epw_notches="widest")
+
+
+class TestContainingInterval:
+    """The measurement behind the automatic notch."""
+
+    def test_it_finds_a_gaussian(self):
+        x = np.linspace(-10.0, 10.0, 4001)
+        y = np.exp(-(x**2) / 2)
+        lo, hi = pic_thomson._containing_interval(y, x, 0.9973)  # +-3 sigma
+        assert lo == pytest.approx(-3.0, abs=0.05)
+        assert hi == pytest.approx(3.0, abs=0.05)
+
+    def test_it_follows_a_shifted_feature(self):
+        x = np.linspace(-10.0, 10.0, 4001)
+        lo, hi = pic_thomson._containing_interval(
+            np.exp(-((x - 4.0) ** 2) / 2), x, 0.9973
+        )
+        assert (lo + hi) / 2 == pytest.approx(4.0, abs=0.05)
+
+    def test_an_empty_spectrum_has_no_interval(self):
+        x = np.linspace(-10.0, 10.0, 101)
+        assert pic_thomson._containing_interval(np.zeros_like(x), x, 0.999) is None
+
+
+class TestSatelliteOffset:
+    r"""
+    Where Bohm--Gross puts the satellite, which is what stops the automatic
+    stray-light mask from eating it.
+    """
+
+    def test_it_matches_the_plasma_frequency_shift_at_large_alpha(self):
+        r"""
+        As :math:`\alpha \to \infty` the thermal correction vanishes and the
+        satellite sits at the plasma-frequency shift.
+        """
+        density = 1e25
+        omega_pe = pic_thomson._plasma_frequency(density)
+        expected = (532e-9) ** 2 * omega_pe / (2 * np.pi * const.c.si.value) * 1e9
+        offset = pic_thomson._satellite_offset(1e4, density, 532 * u.nm)
+        assert offset == pytest.approx(expected, rel=1e-3)
+
+    def test_the_thermal_correction_pushes_it_out(self):
+        near = pic_thomson._satellite_offset(np.sqrt(2.0), 1e25, 532 * u.nm)
+        far = pic_thomson._satellite_offset(1e4, 1e25, 532 * u.nm)
+        # sqrt(1 + 6/alpha^2) is exactly 2 at alpha = sqrt(2).
+        assert near / far == pytest.approx(2.0, rel=1e-6)
+
+    @pytest.mark.parametrize(
+        ("alpha", "density"), [(np.nan, 1e25), (0.0, 1e25), (2.0, 0.0)]
+    )
+    def test_no_resonance_no_offset(self, alpha, density):
+        assert np.isnan(pic_thomson._satellite_offset(alpha, density, 532 * u.nm))
+
+    def test_the_mask_is_capped_by_it(self):
+        """
+        Where the plasma is only weakly collective the central feature and the
+        electron feature merge, and a containment-sized mask swallows 30 nm of
+        the window -- the satellites with it.
+        """
+        pytest.importorskip("numba")
+        spectra = run_driver(iaw_wavelengths=IAW_WINDOW, epw_notches="auto")
+        applied = np.asarray(spectra.meta["epw_notch_applied"], dtype=float)
+        widths = applied[:, 1] - applied[:, 0]
+        offsets = np.array(
+            [
+                pic_thomson._satellite_offset(a, n, PROBE_WAVELENGTH)
+                for a, n in zip(
+                    spectra.alpha_iaw, spectra.electron_density, strict=True
+                )
+            ]
+        )
+        good = np.isfinite(widths) & np.isfinite(offsets)
+        assert good.any()
+        # Half-width never past the default fraction of the satellite offset.
+        assert np.all(widths[good] / 2 <= 0.2 * offsets[good] + 1e-9)
+
+
+class TestStalePlotfiles:
+    """
+    WarpX renames a plotfile it is about to overwrite to ``<name>.old.<pid>``
+    rather than deleting it, so a run that was killed and relaunched, or
+    restarted, leaves stale copies in ``diags/``. They sort immediately after
+    the plotfile they duplicate, so a plain ``<prefix>*`` glob returns them as
+    extra timesteps carrying another run's data.
+    """
+
+    def test_old_directories_are_not_timesteps(self, tmp_path):
+        diags = make_warpx_plotfiles(tmp_path, n_frames=3)
+        (diags / "diag1000001.old.2859663").mkdir()
+        found = pic_thomson._warpx_plotfiles(diags, "diag1", None)
+        assert [p.name for p in found] == [
+            "diag1000000",
+            "diag1000001",
+            "diag1000002",
+        ]
+
+    def test_other_diagnostics_sharing_the_prefix_are_not_taken(self, tmp_path):
+        """``diag1`` must not swallow ``diag1_fields``."""
+        diags = make_warpx_plotfiles(tmp_path, n_frames=2)
+        (diags / "diag1_fields000000").mkdir()
+        found = pic_thomson._warpx_plotfiles(diags, "diag1", None)
+        assert [p.name for p in found] == ["diag1000000", "diag1000001"]
+
+    def test_an_empty_directory_still_reports_clearly(self, tmp_path):
+        diags = tmp_path / "diags"
+        diags.mkdir()
+        (diags / "diag1000000.old.1").mkdir()
+        with pytest.raises(FileNotFoundError, match=r"diag1<step> plotfiles"):
+            pic_thomson._warpx_plotfiles(diags, "diag1", None)
+
+    def test_the_density_cross_check_skips_them_too(self, tmp_path):
+        diags = make_warpx_plotfiles(tmp_path, n_frames=2, prefix="diag_fields")
+        (diags / "diag_fields000001.old.7").mkdir()
+        found = pic_thomson._warpx_plotfile_directories(diags, "diag_fields")
+        assert [p.name for p in found] == ["diag_fields000000", "diag_fields000001"]
+
+
+class TestAlphaScan:
+    r"""
+    `TestMaxwellianConsistency` checks the pipeline against
+    `~plasmapy.diagnostics.thomson.spectral_density` at one operating point.
+    A synthetic diagnostic is used across regimes, so the agreement is pinned
+    over a range of :math:`\alpha` here, and with metrics that mean something
+    for a narrow feature.
+
+    Pointwise ratios do not: above :math:`\alpha \sim 3` the satellites are
+    narrow, and half a nanometre of offset between two otherwise correct
+    resonances reads as a factor of a hundred while the power under them agrees
+    to a few percent. Integrated band power and peak position are what the
+    measurement is, so those are what is checked.
+    """
+
+    PROBE = 532 * u.nm
+    PROBE_VEC = np.array([1.0, 0.0, 0.0])
+    SCATTER_VEC = np.array([0.0, 1.0, 0.0])
+    T_E = 100.0
+    T_I = 50.0
+    SPLIT = 5.0  # nm about the probe dividing the centre from the wings
+
+    @classmethod
+    def spectra(cls, n_e):
+        """The same plasma through the VDF model and the analytic one."""
+        pytest.importorskip("numba")
+        sigma_e = sigma_of(cls.T_E, const.m_e)
+        sigma_i = sigma_of(cls.T_I, const.m_p)
+        v_e = np.linspace(-12 * sigma_e, 12 * sigma_e, 8001)
+        v_i = np.linspace(-12 * sigma_i, 12 * sigma_i, 8001)
+
+        def phase_space(v, sigma, label):
+            return pic_thomson.condition_phase_space(
+                pic_thomson.from_arrays(
+                    f=maxwellian(v, sigma)[np.newaxis, :, np.newaxis],
+                    v=v,
+                    x=np.zeros(1),
+                    t=np.zeros(1),
+                    label=label,
+                )
+            )
+
+        electrons = phase_space(v_e, sigma_e, "e-")
+        ions = phase_space(v_i, sigma_i, "p+")
+        wavelengths = np.linspace(380, 760, 4000) * u.nm
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*numba_scipy.*")
+            _, vdf = thomson.arbitrary_forwardmodel(
+                wavelengths=wavelengths,
+                probe_wavelength=cls.PROBE,
+                e_velocity_axes=[electrons.v] * u.m / u.s,
+                i_velocity_axes=[ions.v] * u.m / u.s,
+                efn=[electrons.f[0, :, 0]] * u.s / u.m,
+                ifn=[ions.f[0, :, 0]] * u.s / u.m,
+                n=n_e * u.m**-3,
+                ion_species=["p+"],
+                probe_vec=cls.PROBE_VEC,
+                scatter_vec=cls.SCATTER_VEC,
+            )
+        alpha, analytic = thomson.spectral_density(
+            wavelengths,
+            cls.PROBE,
+            n_e * u.m**-3,
+            T_e=cls.T_E * u.eV,
+            T_i=np.array([cls.T_I]) * u.eV,
+            ions=["p+"],
+            probe_vec=cls.PROBE_VEC,
+            scatter_vec=cls.SCATTER_VEC,
+        )
+        grid = wavelengths.to_value(u.nm)
+
+        def unit(spectrum):
+            spectrum = as_array(spectrum)
+            return spectrum / np.trapezoid(spectrum, grid)
+
+        return float(np.mean(np.asarray(alpha))), grid, unit(vdf), unit(analytic)
+
+    @pytest.mark.parametrize(
+        ("n_e", "alpha", "power_tolerance", "position_tolerance"),
+        [
+            (1.4e23, 0.31, 0.01, 0.15),
+            (1.5e24, 1.01, 0.01, 0.15),
+            (6.2e24, 2.05, 0.03, 0.35),
+            (2.5e25, 4.12, 0.06, 1.20),
+        ],
+    )
+    def test_band_power_and_satellite_position(
+        self, n_e, alpha, power_tolerance, position_tolerance
+    ):
+        got_alpha, grid, vdf, analytic = self.spectra(n_e)
+        assert got_alpha == pytest.approx(alpha, abs=0.05)
+
+        blue = grid < self.PROBE.to_value(u.nm) - self.SPLIT
+        centre = np.abs(grid - self.PROBE.to_value(u.nm)) <= self.SPLIT
+        for name, band in (("blue wing", blue), ("centre", centre)):
+            a = np.trapezoid(vdf[band], grid[band])
+            b = np.trapezoid(analytic[band], grid[band])
+            assert a == pytest.approx(b, rel=power_tolerance), (
+                f"{name} power at alpha = {alpha}: {a:.4f} against {b:.4f}"
+            )
+
+        peak_vdf = grid[blue][np.argmax(vdf[blue])]
+        peak_analytic = grid[blue][np.argmax(analytic[blue])]
+        assert abs(peak_vdf - peak_analytic) < position_tolerance
+
+    def test_the_electron_feature_all_but_vanishes_by_alpha_eight(self):
+        r"""
+        Not a tolerance but a fact worth pinning: by :math:`\alpha \approx 8`
+        the satellites carry under a thousandth of the scattered power, so the
+        electron channel stops being a measurement of anything whatever the
+        pipeline does with it.
+        """
+        _, grid, vdf, analytic = self.spectra(1.0e26)
+        blue = grid < self.PROBE.to_value(u.nm) - self.SPLIT
+        assert np.trapezoid(analytic[blue], grid[blue]) < 1e-3
+        assert np.trapezoid(vdf[blue], grid[blue]) < 1e-3
+
+
+class TestPlotfileOrdering:
+    r"""
+    WarpX pads the step number in a plotfile name to six digits but does not
+    truncate it, so a run past step 999999 writes seven-digit names that do not
+    sort lexically against the six-digit ones. ``diag11002384`` (step 1002384)
+    lands before ``diag1111376`` (step 111376), and the frames come back
+    interleaved with a time axis that runs backwards in places.
+    """
+
+    def test_seven_digit_steps_sort_after_six(self, tmp_path):
+        diags = tmp_path / "diags"
+        steps = [0, 55688, 111376, 1002384, 1058072, 2784400]
+        for step in steps:
+            (diags / f"diag1{step:06d}").mkdir(parents=True)
+        found = pic_thomson._warpx_plotfiles(diags, "diag1", None)
+        assert [p.name for p in found] == [f"diag1{step:06d}" for step in steps]
+
+    def test_a_lexical_sort_would_have_got_it_wrong(self, tmp_path):
+        """Guard the guard: the fixture has to actually exercise the bug."""
+        diags = tmp_path / "diags"
+        names = ["diag1000000", "diag1111376", "diag11002384"]
+        for name in names:
+            (diags / name).mkdir(parents=True)
+        assert sorted(names) != names
+        found = pic_thomson._warpx_plotfiles(diags, "diag1", None)
+        assert [p.name for p in found] == names
+
+    def test_timesteps_index_the_step_ordered_list(self, tmp_path):
+        diags = tmp_path / "diags"
+        for step in (0, 111376, 1002384):
+            (diags / f"diag1{step:06d}").mkdir(parents=True)
+        found = pic_thomson._warpx_plotfiles(diags, "diag1", [1])
+        assert [p.name for p in found] == ["diag1111376"]
+
+
+class TestRescaleVDFDrift:
+    r"""
+    A run with kinetic electrons at the real :math:`m_e` and a reduced ion mass
+    has two velocity scales in one array: an electron thermal speed that is
+    already physical, and a bulk flow shared with the ions that is
+    :math:`\sqrt{R}` too fast. `rescale_velocity_axis` cannot fix one without
+    ruining the other. Translating each slice fixes the drift and leaves every
+    central moment -- the temperature included -- exactly alone.
+    """
+
+    R = 18.3615
+    T_EV = 100.0
+
+    @classmethod
+    def drifting(cls, drift, n_v=4001, span=12.0):
+        sigma = sigma_of(cls.T_EV, const.m_e)
+        v = np.linspace(drift - span * sigma, drift + span * sigma, n_v)
+        return v, maxwellian(v, sigma, drift), sigma
+
+    @staticmethod
+    def moments(f, v):
+        n = np.trapezoid(f, v)
+        mean = np.trapezoid(f * v, v) / n
+        return mean, float(np.sqrt(np.trapezoid(f * (v - mean) ** 2, v) / n))
+
+    def test_the_drift_lands_on_target(self):
+        scale = np.sqrt(self.R)
+        v, f, _ = self.drifting(3e6)
+        shifted, _ = pic_thomson.rescale_vdf_drift(
+            f[np.newaxis, :, np.newaxis], v, scale
+        )
+        mean, _ = self.moments(shifted[0, :, 0], v)
+        assert mean == pytest.approx(3e6 / scale, rel=1e-4)
+
+    def test_the_temperature_is_untouched(self):
+        v, f, _ = self.drifting(3e6)
+        _, before = self.moments(f, v)
+        shifted, _ = pic_thomson.rescale_vdf_drift(
+            f[np.newaxis, :, np.newaxis], v, np.sqrt(self.R)
+        )
+        _, after = self.moments(shifted[0, :, 0], v)
+        assert after == pytest.approx(before, rel=1e-4)
+
+    def test_a_stationary_distribution_is_unchanged(self):
+        v, f, _ = self.drifting(0.0)
+        shifted, info = pic_thomson.rescale_vdf_drift(
+            f[np.newaxis, :, np.newaxis], v, np.sqrt(self.R)
+        )
+        np.testing.assert_allclose(shifted[0, :, 0], f, atol=1e-30)
+        assert info["max_shift_m_per_s"] == 0.0
+
+    def test_each_slice_moves_by_its_own_drift(self):
+        """
+        The point of doing it per slice: a shock has a stationary upstream and a
+        fast-moving front in the same array.
+        """
+        sigma = sigma_of(self.T_EV, const.m_e)
+        v = np.linspace(-20 * sigma, 20 * sigma, 4001)
+        f = np.stack(
+            [maxwellian(v, sigma, drift) for drift in (0.0, 2e6, 5e6)], axis=-1
+        )[np.newaxis, :, :]
+        scale = np.sqrt(self.R)
+        shifted, _ = pic_thomson.rescale_vdf_drift(f, v, scale)
+        for cell, drift in enumerate((0.0, 2e6, 5e6)):
+            mean, width = self.moments(shifted[0, :, cell], v)
+            assert mean == pytest.approx(drift / scale, abs=0.01 * sigma)
+            assert width == pytest.approx(sigma, rel=1e-3)
+
+    def test_it_warns_when_the_shift_runs_off_the_grid(self):
+        # A grid sized tightly around a fast-drifting population has nowhere to
+        # put the distribution once it is moved back towards zero.
+        sigma = sigma_of(self.T_EV, const.m_e)
+        drift = 40 * sigma
+        v = np.linspace(drift - 3 * sigma, drift + 3 * sigma, 2001)
+        f = maxwellian(v, sigma, drift)[np.newaxis, :, np.newaxis]
+        with pytest.warns(RuntimeWarning, match="off the end of its velocity grid"):
+            pic_thomson.rescale_vdf_drift(f, v, np.sqrt(self.R))
+
+    def test_an_empty_slice_is_returned_unchanged(self):
+        v = np.linspace(-1e7, 1e7, 501)
+        f = np.zeros((1, v.size, 1))
+        shifted, info = pic_thomson.rescale_vdf_drift(f, v, 2.0)
+        np.testing.assert_array_equal(shifted, f)
+        assert info["max_shift_m_per_s"] == 0.0
+
+    def test_a_non_positive_scale_is_refused(self):
+        v, f, _ = self.drifting(1e6)
+        with pytest.raises(ValueError, match="scale must be positive"):
+            pic_thomson.rescale_vdf_drift(f[np.newaxis, :, np.newaxis], v, 0.0)
+
+    def test_condition_phase_space_takes_it(self):
+        v, f, sigma = self.drifting(3e6)
+        phase_space = pic_thomson.from_arrays(
+            f=f[np.newaxis, :, np.newaxis],
+            v=v,
+            x=np.zeros(1),
+            t=np.zeros(1),
+            label="e-",
+        )
+        conditioned = pic_thomson.condition_phase_space(
+            phase_space,
+            drift_scale_factor=self.R,
+            tail_model=None,
+            taper_threshold=None,
+        )
+        mean, width = self.moments(conditioned.f[0, :, 0], conditioned.v)
+        assert mean == pytest.approx(3e6 / np.sqrt(self.R), rel=1e-3)
+        assert width == pytest.approx(sigma, rel=1e-3)
+        assert conditioned.meta["conditioning"]["drift"][
+            "drift_scale"
+        ] == pytest.approx(np.sqrt(self.R))
+
+    def test_the_two_scalings_are_mutually_exclusive(self):
+        v, f, _ = self.drifting(1e6)
+        phase_space = pic_thomson.from_arrays(
+            f=f[np.newaxis, :, np.newaxis],
+            v=v,
+            x=np.zeros(1),
+            t=np.zeros(1),
+            label="e-",
+        )
+        with pytest.raises(ValueError, match="not both"):
+            pic_thomson.condition_phase_space(
+                phase_space, velocity_scale_factor=self.R, drift_scale_factor=self.R
+            )
+
+    def test_the_driver_leaves_alpha_alone(self):
+        r"""
+        The whole point: scaling the electron velocity axis drags
+        :math:`\alpha` by :math:`\sqrt{R}`, and scaling only the drift does not.
+        """
+        pytest.importorskip("numba")
+        electrons = species_phase_space("e-", 100, const.m_e, drift=2e6)
+        ions = species_phase_space("p+", 50, const.m_p, drift=2e6)
+        plain = run_driver(electrons=electrons, ions=[ions])
+        drifted = run_driver(
+            electrons=electrons, ions=[ions], electron_drift_scale_factor=self.R
+        )
+        np.testing.assert_allclose(drifted.alpha_epw, plain.alpha_epw, rtol=1e-3)
+
+        with warnings.catch_warnings():
+            # Compressing the axis by sqrt(R) squeezes the distribution into a
+            # fraction of its bins, and the forward model divides by the zeros
+            # that leaves. That is the treatment being argued against, and the
+            # numerical complaint is part of the argument.
+            warnings.filterwarnings("ignore", message=".*encountered in divide.*")
+            scaled = run_driver(
+                electrons=electrons, ions=[ions], velocity_scale_factor=self.R
+            )
+        assert np.nanmedian(scaled.alpha_epw) > 3 * np.nanmedian(plain.alpha_epw)

@@ -1,0 +1,18 @@
+`~plasmapy.diagnostics.pic_thomson.condition_phase_space` now takes its boxcar
+width and its taper rolloff in **thermal speeds** rather than in velocity bins,
+as ``smoothing_width`` and ``max_taper_width``, and sizes them against the
+narrowest appreciably populated slice it is given. Smoothing is a convolution,
+so a boxcar of :math:`W` bins applied :math:`n` times adds
+:math:`n (W^2 - 1) \Delta v^2 / 12` to the second moment of *every* slice
+whatever its own width -- an additive temperature, and the forward model reads
+the thermal speed straight off the distribution. How much that costs depends on
+how wide the code's velocity grid happens to be, which is a choice in the input
+deck rather than anything about the plasma: on an OSIRIS run whose momentum
+diagnostic spanned :math:`\pm 0.71 c` while its electrons occupied
+:math:`\pm 0.03 c`, ``smoothing_window=40`` over three passes turned a 38.8 eV
+ambient into 813 eV and moved :math:`\alpha` from 12.0 to 3.2 -- and cost only
+18% later in the same run, so the bias does not cancel between two measurements.
+`~plasmapy.diagnostics.pic_thomson.smooth_vdf` gained a ``variance_warning``,
+which `~plasmapy.diagnostics.pic_thomson.condition_phase_space` enables by
+default, so a window given in bins now says what it cost. The bin-valued
+``smoothing_window`` and ``max_taper_bins`` still work and are unchanged.

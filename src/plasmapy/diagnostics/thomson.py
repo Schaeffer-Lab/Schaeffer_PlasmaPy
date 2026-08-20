@@ -364,6 +364,7 @@ def arbitrary_fast_spectral_density_arbdist(
     scattered_power=False,
     inner_range=0.1,
     inner_frac=0.8,
+    n_quadrature_points=1e3,
     return_chi = False
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor],
@@ -495,6 +496,7 @@ def arbitrary_fast_spectral_density_arbdist(
             n=ne[i],
             particle_m=5.4858e-4,
             particle_q=-1,
+            nPoints=n_quadrature_points,
             inner_range = inner_range,
             inner_frac = inner_frac
         )
@@ -513,6 +515,7 @@ def arbitrary_fast_spectral_density_arbdist(
             n=ni[i],
             particle_m=ion_m[i],
             particle_q=ion_z[i],
+            nPoints=n_quadrature_points,
             inner_range = inner_range,
             inner_frac = inner_frac
         )
@@ -572,10 +575,14 @@ def arbitrary_fast_spectral_density_arbdist(
     for myNotch in notches:
         if len(myNotch) != 2:
             raise ValueError("Notches must be pairs of values")
-            
-        x0 = np.argmin(np.abs(wavelengths - myNotch[0]))
-        x1 = np.argmin(np.abs(wavelengths - myNotch[1]))
-        Skw[x0:x1] = 0
+
+        # Every bin whose centre lies in the closed interval, which is what a
+        # filter blocking [lo, hi] does to a binned detector. Locating the
+        # endpoints with argmin instead rounds each edge to the nearest bin
+        # centre -- so the notch could be up to half a bin narrow on either
+        # side -- and the half-open slice then left the upper endpoint bin
+        # unnotched as well.
+        Skw[(wavelengths >= myNotch[0]) & (wavelengths <= myNotch[1])] = 0
 
     # print("S(k,w) before normaliation:", Skw)
 
@@ -612,6 +619,7 @@ def arbitrary_spectral_density_arbdist(
     scattered_power=False,
     inner_range=0.1,
     inner_frac=0.8,
+    n_quadrature_points=1e3,
     return_chi: bool = False,   # <-- NEW
     ) -> Union[
     Tuple[np.floating, np.ndarray],
@@ -683,6 +691,7 @@ def arbitrary_spectral_density_arbdist(
         scattered_power,
         inner_range,
         inner_frac,
+        n_quadrature_points,
         return_chi=return_chi
         )
     
@@ -829,11 +838,11 @@ def arbitrary_fast_spectral_density_maxwellian(
     for myNotch in notches:  # ty:ignore[not-iterable]
         if len(myNotch) != 2:
             raise ValueError("Notches must be pairs of values")
-            
-        x0 = np.argmin(np.abs(wavelengths - myNotch[0]))
-        x1 = np.argmin(np.abs(wavelengths - myNotch[1]))
-        Skw[x0:x1] = 0
-        
+
+        # See the note in fast_spectral_density_arbdist: bin centres inside the
+        # closed interval, not an argmin-located half-open slice.
+        Skw[(wavelengths >= myNotch[0]) & (wavelengths <= myNotch[1])] = 0
+
     Skw = Skw / np.trapezoid(Skw, wavelengths)
 
     return np.mean(alpha), Skw
@@ -2052,9 +2061,11 @@ def autodiff_fast_spectral_density_arbdist(
         for i, j in enumerate(notches):
             if len(j) != 2:
                 raise ValueError("Notches must be pairs of values")
-            x0 = torch.argmin(torch.abs(wavelengths - j[0]))
-            x1 = torch.argmin(torch.abs(wavelengths - j[-1]))
-            bools[x0:x1] = False
+            # Bin centres inside the closed interval. Locating the endpoints
+            # with argmin rounds each edge to the nearest bin centre, and the
+            # half-open slice then left the upper endpoint bin unnotched: on a
+            # 0.4 nm grid a requested [530, 534] came out as [530.2, 533.4].
+            bools &= ~((wavelengths >= j[0]) & (wavelengths <= j[-1]))
         Skw = torch.mul(Skw, bools)
 
     # Normalize result to have integral 1
@@ -2466,11 +2477,12 @@ def spectral_density_lite_plasmapy(
             )
 
         for notch_i in notch:
-            # For each notch, identify the index for the beginning and end
-            # wavelengths and set Skw to zero between those indices
-            x0 = np.argmin(np.abs(wavelengths - notch_i[0]))
-            x1 = np.argmin(np.abs(wavelengths - notch_i[1]))
-            Skw[x0:x1] = 0
+            # Zero every bin whose centre falls in the closed interval, which is
+            # what a filter blocking [lo, hi] does to a binned detector. Locating
+            # the endpoints with argmin instead rounded each edge to the nearest
+            # bin centre, and the half-open slice left the upper endpoint bin
+            # unnotched on top of that.
+            Skw[(wavelengths >= notch_i[0]) & (wavelengths <= notch_i[1])] = 0
 
     return np.mean(alpha), Skw
 

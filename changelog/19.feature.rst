@@ -1,0 +1,8 @@
+`~plasmapy.diagnostics.pic_thomson.read_warpx_phase_space` now warns when its
+velocity axis is too coarse for the distribution it is binning. One axis spans
+every frame and every cell, so it is sized by the fastest macroparticle in the
+whole run while the feature that matters is usually carried by the coldest
+population: on a shock run whose piston ions reach 2.6e7 m/s, the 10 eV upstream
+ions got 1.4 bins across a thermal width. Binning adds :math:`\Delta v^2/12` to
+the second moment, which is 4% of the temperature there. The count is reported
+as ``bins_per_thermal_width`` in the reader's ``meta`` either way.

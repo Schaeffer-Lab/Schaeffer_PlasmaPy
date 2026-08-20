@@ -1,0 +1,29 @@
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` now says whether
+the electron feature it returns is a measurement at all. The EPW satellite sits
+at the Bohm--Gross resonance, so it reads :math:`f_e` at
+:math:`\sqrt{\alpha^2 + 3}` thermal speeds; a PIC histogram is populated only as
+far as its last macroparticle, and reaching :math:`n \sigma` needs of order
+:math:`e^{n^2/2}` particles per cell, so three to five is typical and no amount
+of compute reaches twelve. Beyond it the taper and the floor supply the tail and
+the resonance of :math:`|1 - \chi_e/\epsilon|^2` amplifies that into a satellite
+which looks like data, tracks nothing, and moves when ``max_taper_bins`` moves.
+The two numbers are recorded per timestep as ``epw_tail_ratio`` and
+``epw_tail_required`` on
+`~plasmapy.diagnostics.pic_thomson.ThomsonSpectrogram`, reduced to
+``epw_resolved``, and written to and read back from HDF5. Since
+`~plasmapy.diagnostics.pic_thomson.extend_vdf_tail` fits the tail rather than
+tapering it, a resonance outside the sampled data is an extrapolation rather
+than an artefact, and is kept and priced instead of hidden:
+``epw_tail_uncertainty`` is the factor by which the amplitude there is
+uncertain, from the standard error of the fitted tail width. On a real OSIRIS
+shock the resonance runs out to 17.4 thermal speeds against data reaching 3.4,
+and the fit still holds the amplitude to a factor of 3.2. Pass
+``mask_unresolved_epw=True`` to blank those rows instead, which is what you want
+with ``tail_model=None``, where the tail really is a property of the taper.
+
+Reconstructed populations are handled separately: they have no last
+macroparticle, so the limit is wherever ``velocity_headroom`` stopped, and the
+default of 6 covers the resonance only to :math:`\alpha \approx 5.7`.
+`~plasmapy.diagnostics.pic_thomson.read_warpx_hybrid_electrons` therefore takes
+``velocity_headroom`` too, and ``meta["epw_tail_analytic"]`` names the
+populations whose tail is assumed rather than sampled.

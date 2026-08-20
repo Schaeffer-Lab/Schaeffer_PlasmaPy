@@ -1,0 +1,19 @@
+Added ``tools/pic_thomson_warpx_validation.py`` and the decks beside it in
+``tools/warpx_validation_decks/``, which check
+`plasmapy.diagnostics.pic_thomson` end to end against a known answer. Each deck
+is a uniform Maxwellian hydrogen plasma in 1D whose density, temperatures and
+drift are set in the deck, so
+`~plasmapy.diagnostics.thomson.spectral_density` gives the exact spectrum and
+everything between the macroparticles and the result -- reader units and
+weighting, the velocity projection, the conditioning, the tail model, the
+forward model -- is under test at once. A shock has no analytic answer to check
+against, so a disagreement there cannot be attributed; these can.
+
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` is also pinned
+against `~plasmapy.diagnostics.thomson.spectral_density` over a scan in
+:math:`\alpha` rather than at the single operating point
+``TestMaxwellianConsistency`` used, and with metrics that mean something for a
+narrow feature: integrated band power and peak position, not a pointwise ratio.
+Above :math:`\alpha \sim 3` the satellites are narrow enough that half a
+nanometre of offset between two otherwise correct resonances reads as a factor
+of a hundred pointwise while the power under them agrees to a few percent.

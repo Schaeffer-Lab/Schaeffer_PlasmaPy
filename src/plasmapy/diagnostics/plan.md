@@ -1217,3 +1217,775 @@ all of them.
   run, not against a production shock.
 - The hybrid-vs-kinetic comparison the moment reconstruction makes possible
   (§11.2) has not been done.
+
+## 12. What the EPW panel was actually showing
+
+Three separate defects had been running together in the electron channel of
+`tools/pic_thomson_osiris_comparison.py`, all diagnosed on
+`omegashock_w3.5e11_exp` at x = 5 mm. The evidence figure is
+`media/11_epw_artifact_diagnosis.png`.
+
+### 12.1 The notch edge (not fixed here)
+
+The notch was fixed at `[530, 534]` nm while the central feature is Doppler
+shifted by the flow: `λ²/(2πc)·k·u` is 3.7 nm at 2×10⁶ m/s, most of a 4 nm
+notch. Measured at the probe, the two bins flanking the notch carry **0.5% of
+the EPW window's area before the piston arrives and 88–98% after it**, so once
+each row is normalised to unit area the satellites are crushed into the
+remaining percent. That is the bright line at ~530 nm in the figure the whole
+investigation started from.
+
+It is made worse by resolution. The EPW grid is 0.4 nm and the central feature
+is ~0.1 nm, so the surviving flank value is a point sample of a near-singular
+function: shifting the grid by 0.1 nm — no physics change — moves the area
+outside 528–536 nm by **27×**, and refining 500 → 32000 bins raises the flank
+peak from 2.5e9 to 9.4e10 without converging.
+
+The fix is to derive the mask from the measured extent of the central feature
+per frame rather than hard-coding it. **Not done.**
+
+### 12.2 The notch's own arithmetic (fixed)
+
+All four notch code paths in `thomson.py` located the endpoints with `argmin`
+and zeroed `[x0:x1]`. `argmin` rounds each edge to the nearest bin centre and
+the half-open slice drops the upper endpoint bin, so a requested `[530, 534]`
+was realised as `[530.196, 533.403]` — 0.6 nm short on the red side, where the
+feature's skirt is brightest. Now a boolean mask on the closed interval.
+
+### 12.3 A smoothing window measured in bins (fixed)
+
+`smoothing_window=40` over three passes, on a distribution occupying **31 of the
+1024 bins** OSIRIS's `p1x1` diagnostic spans. A boxcar is a convolution, so it
+adds `n(W²−1)Δv²/12` to the second moment of every slice whatever its own width:
+
+|                      | T_e raw     | T_e smoothed | α raw    | α reported |
+| -------------------- | ----------- | ------------ | -------- | ---------- |
+| ambient, t < 0.33 ns | **38.8 eV** | 813 eV       | **12.0** | 3.2        |
+| shocked, t = 0.42 ns | 1858 eV     | 2598 eV      | 3.2      | 2.7        |
+
+So the published α panel was low by ~3.7× in the ambient, and the bias runs from
+21× to 1.2× across the run — it does not cancel between two measurements. Median
+occupancy over the whole run is 37 bins, i.e. the window was wider than the
+distribution nearly everywhere.
+
+`condition_phase_space` now takes `smoothing_width` in thermal speeds and sizes
+the window from the narrowest populated slice; `smooth_vdf` gained a
+`variance_warning`. Rerunning the comparison moves the median α from **1.69 to
+13.99**. `max_taper_width` does the same for the taper rolloff, which is the
+same defect in the sibling knob — on H-PICShock's ambient ions the old
+`smoothing_window=16` + `max_taper_bins=8` inflated T_i by 45%, the width forms
+by 3%.
+
+### 12.4 A satellite with no electrons behind it (fixed)
+
+The deepest one. The satellite reads `f_e` at `√(α²+3)` thermal speeds; the
+histogram is populated only as far as its last macroparticle, which for this run
+is 3.5–4.8 σ everywhere. So:
+
+| t (ns)    | α         | needs (σ) | has (σ) |
+| --------- | --------- | --------- | ------- |
+| 0.00–0.33 | 12.0      | 12.1      | 3.5     |
+| 0.39–0.48 | 1.9–3.2   | 2.6–3.7   | 3.7–4.0 |
+| 0.51–0.64 | 13.9–17.0 | 14.0–17.1 | 3.9–4.8 |
+
+**Only 4 of 23 sampled frames put the resonance inside sampled data.** Everywhere
+else the satellite is the taper's cosine rolloff and the 1e-30 floor, amplified
+by the ε resonance. Confirmed by construction: with `max_taper_bins` at 5, 10,
+20, 40, 80 the apparent satellite moves 510.96 → 508.95 nm, converging only once
+the rolloff extends past the resonance.
+
+This supersedes the empirical "α ≲ 9 ceiling" of `RESULTS.md`. The ceiling is not
+a constant — it is `v_max/v_th` of the code's dump — and it cannot be bought with
+particles, since reaching `nσ` needs `~e^{n²/2}` per cell. `e^{72}` for α = 12.
+
+The driver now records `epw_tail_ratio`, `epw_tail_required` and `epw_resolved`,
+and masks the EPW where the check fails. On this run that is 53 of 65 frames; on
+the 12 that survive the satellite tracks the plasma-frequency shift to a median
+of **0.997**.
+
+Reconstructed populations are a separate case: `from_moments` has no last
+macroparticle, so the limit is `velocity_headroom`, whose default of 6 covers
+only α ≲ 5.7. H-PICShock's H3 run reaches α = 11.6, so its electron grid was
+stopping *before* the resonance — `read_warpx_hybrid_electrons` now takes
+`velocity_headroom` and `scripts/thomson.py` sizes it from the measured α.
+
+### 12.5 Still open from §12
+
+- §12.1, the notch mask, is the remaining defect in the EPW channel.
+- Whether the α-ceiling entries in `RESULTS.md` survive re-measurement now that
+  the H3 electron grid reaches the resonance and α is no longer smoothing-biased.
+  The H3 and L2 spectrograms in `media/` predate all of §12 and should be
+  regenerated before being quoted.
+- An analytic tail beyond the sampled support, in place of taper-then-floor,
+  would let the EPW be modelled where it cannot be measured — with the
+  assumption stated rather than hidden.
+
+## 13. The taper, replaced
+
+§12 fixed the taper's *extent* (`max_taper_width`) without touching what it was
+doing. That was the wrong end of the problem.
+
+### 13.1 The taper was setting the answer, not perturbing it
+
+Measured on `omegashock_w3.5e11_exp` at x = 5 mm, sweeping `max_taper_bins`
+alone on identical data:
+
+| `max_taper_bins` | α     | blue satellite |
+| ---------------- | ----- | -------------- |
+| 5                | 16.00 | 523.38 nm      |
+| 20               | 13.47 | 527.39 nm      |
+| 80               | 5.28  | 524.18 nm      |
+| unbounded        | 0.76  | 524.99 nm      |
+
+**α moves by a factor of 21.** The rolloff leaves a pedestal at large `|v|`,
+which is where the `v²` weighting of the second moment lives, so a numerical
+knob was setting a reported plasma parameter. The satellite moves with it.
+
+### 13.2 Why the method was wrong
+
+- **The threshold is a fraction of the peak, not a particle count.** For a
+  Maxwellian `0.005 × peak` is always 3.26 σ whatever the particle budget. Here
+  that put the anchor at 3.24 σ while ≥10 macroparticles only reached 2.60 σ —
+  the entire tail hung off a bin holding one or two particles, and that shot
+  noise went straight into α and into the satellite amplitude.
+- **The shape is wrong in the derivative.** Landau damping reads `∂f/∂v` at the
+  resonance, so a half-cosine fabricates the feature's width as well as its
+  height.
+- **It goes to zero**, so the amplitude is set by where you chose to stop.
+
+### 13.3 `extend_vdf_tail`
+
+Join from counts (the smallest positive raw bin is one macroparticle; join at
+the outermost bin with ≥ `min_counts`), fit `ln f` against `(v−v̄)²` over the
+resolved band with counts as inverse-variance weights, continue with the fit
+beyond the join at **its own intercept** — the join is by construction the
+outermost bin still reaching `min_counts`, so anchoring there biases the tail
+high by 20–30%, measured. Fall back to the core temperature when the band is too
+thin or the fit does not decay.
+
+Validation on a sampled Maxwellian (fitted tail width / true, and the
+extrapolated `f` against truth):
+
+| particles | join   | fitted width | f(5σ) | f(8σ) | f(12σ) |
+| --------- | ------ | ------------ | ----- | ----- | ------ |
+| 1e4       | 2.60 σ | 1.0147       | 1.65  | 3.61  | 16.9   |
+| 1e5       | 3.32 σ | 0.9991       | 1.009 | 1.006 | 0.994  |
+| 1e6       | 3.99 σ | 0.9991       | 0.972 | 0.922 | 0.829  |
+
+At 1e5 particles the extrapolation is right to 0.6% **three times beyond the
+last particle**. The 1e4 row is not a failure of the method but of the data, and
+`tail_width_error` says so: ±2.10% on the width predicts a factor of 20.5 at
+12 σ, against 16.9 actually observed. A 5% suprathermal component at 2.5× the
+core temperature comes back as a tail/core width of 1.221 rather than 1.000, so
+a resolved non-Maxwellian tail survives.
+
+The floor goes with the taper: a Maxwellian crosses 1e-30 at about 12 thermal
+speeds, so a floor would put a flat pedestal exactly where the satellite reads
+at α ~ 12.
+
+### 13.4 What this changes downstream
+
+`epw_tail_uncertainty` replaces blanket masking. On the OSIRIS run the resonance
+is at 17.4 σ against data reaching 3.4 σ, and the fitted tail still holds the
+amplitude to a factor of **3.2** — so the rows are kept and priced rather than
+NaN'd. `mask_unresolved_epw` now defaults to `False`, and is what you want only
+with `tail_model=None`.
+
+### 13.5 Still open
+
+- **§12.1, the notch mask, is now the only defect left in that EPW panel.** With
+  the tail modelled and α stable, what remains at ~530 nm is the central
+  feature's skirt escaping a hard-coded `[530, 534]`.
+- The velocity-scaling convention. The deck has electrons at `rqm = -1.0` and
+  `uth_bnd(1:3,2,1) = 8.766e-03`, which read as `γv/c` is 39.3 eV and matches
+  the raw histogram's 38.8 eV to 1%; applying `velocity_scale_factor = 50` to
+  them makes the mapped `T_e` 0.79 eV and α ≈ 12 rather than 1.7. Confirmed with
+  the run's owner that the factor **does** apply to the electrons here, so the
+  pipeline keeps doing that; the reconciliation with the deck is unresolved and
+  matters, because α ≈ 12 vs ≈ 1.7 decides whether the EPW channel is a
+  measurement or an extrapolation.
+
+## 14. Why the EPW panel is empty at high alpha, and it is not the notch
+
+Chasing the leftover band at 530 nm turned up the actual reason the electron
+channel of `07_osiris_end_to_end.png` carries nothing.
+
+### 14.1 The satellite is there, and enormous
+
+At x = 5 mm, on a grid refined around the Bohm--Gross root:
+
+| step | Bohm--Gross | 0.4 nm production grid                 | refined grid               |
+| ---- | ----------- | -------------------------------------- | -------------------------- |
+| 0    | 523.85 nm   | peak 1.95e9 at **531.80** (notch edge) | peak 3.01e14 at **523.65** |
+| 55   | 488.90 nm   | peak 1.12e9 at **530.20** (notch edge) | peak 2.63e14 at **489.16** |
+
+Position agrees with Bohm--Gross to 0.2 nm. The production grid never sees it:
+the FWHM is under 3 pm, and refining 100x raises the peak 160x, so it is a pole,
+not a resolved feature.
+
+### 14.2 Two separate limits, both from an undamped wave
+
+- **Resolution.** The EPW resonance width goes as the Landau damping,
+  `exp(-alpha^2/2)`. Past alpha ~ 3-4 no practical uniform grid resolves it.
+  Bin-averaging does not help: 256x oversampling (0.0016 nm sub-bins) still
+  steps over it, and the blue wing carries 0.00-0.14% of the area.
+
+- **Precision.** `Re(eps)` is computed as `1 + chiE + chiI` with `chiE ~ alpha^2`,
+  so its floating-point floor is `|chiE| * 2.2e-16`, flat at **2.2e-16**. The
+  physical `Im(eps)` at the root falls away underneath it:
+
+  | alpha     | 8       | 9       | 10          | 12      |
+  | --------- | ------- | ------- | ----------- | ------- |
+  | `Im(eps)` | 4.5e-11 | 5.0e-14 | **2.7e-17** | 9.6e-25 |
+
+  They cross at **alpha ~ 9.5**. Above it `|1 - chiE/eps|^2` plateaus at
+  1e13-1e14 regardless of alpha -- rounding noise, not physics.
+
+**This is the mechanism behind the empirical "alpha \<~ 9 ceiling" in
+`H-PICShock/RESULTS.md`.** That ceiling was real. It is not a physics ceiling,
+not the taper, and not the tail model: it is double precision losing Landau
+damping in the dielectric function.
+
+### 14.3 What this run can and cannot show
+
+alpha runs 12-24 at this position under the run's scaling convention, so the
+electron channel is above both limits nearly everywhere. The one window where it
+works is t = 0.35-0.50 ns, where alpha dips to 2.5-5, and the corrected panel
+does show structure there. Probe wavelength scales alpha directly:
+
+| probe  | step 0                     | step 40                | step 55                |
+| ------ | -------------------------- | ---------------------- | ---------------------- |
+| 532 nm | alpha 11.6, wing 0.00%     | alpha 3.40, wing 5.00% | alpha 16.9, wing 0.00% |
+| 266 nm | alpha 5.81, wing 0.03%     | alpha 1.70, wing 6.62% | alpha 8.42, wing 0.00% |
+| 133 nm | alpha 2.90, wing **33.9%** | alpha 0.85, wing 10.4% | alpha 4.21, wing 0.78% |
+
+### 14.4 The notch, fixed anyway
+
+`epw_notches="auto"` now sizes the mask from the central feature measured in the
+IAW window each frame. It picks 0.5 nm at t = 0 and 25 nm at t = 0.40, which is
+right, and it is a genuine improvement -- but it cannot rescue a run sitting
+above the resolution and precision limits, and it does not on this one.
+
+### 14.5 The way out
+
+Both limits come from modelling a wave with no damping. Either would remove
+them, and both are physical:
+
+- **Collisional damping in `eps`.** At alpha >~ 10 Landau damping is negligible
+  and electron-ion collisions dominate; a BGK or Lenard-Bernstein term gives the
+  resonance a finite, representable width. This is the physically correct model
+  for the regime, not a numerical patch.
+- **The instrument function, applied before sampling.** A real spectrometer
+  integrates a finite slit over the line. `ThomsonSpectrogram. apply_instrument_response` does this *after* the spectrum is sampled, which is
+  too late -- the line has already been missed. Convolving on a grid refined at
+  the known resonance positions would be correct.
+
+Neither is done.
+
+### 14.6 Two things a log colour scale showed that a linear one hid
+
+`tools/pic_thomson_osiris_comparison.py` now defaults to a log colour scale, and
+it changed the reading of the figure twice.
+
+- **The EPW satellites are visible after all**, in exactly the window §14.3
+  predicts: t = 0.33-0.50 ns, where alpha drops to 2.5-5. Both branches track
+  the density. On a linear scale that whole structure sat under the skirt of the
+  central feature and read as black.
+- **The automatic mask was eating them.** At alpha ~ 4.8 the containment
+  measurement returned 17 nm, because the IAW window there holds the electron
+  feature as well as the ion one, and the mask came out 30 nm wide -- a white
+  block straight across the satellites. Capping the half-width at
+  `notch_max_fraction` (0.2) of the Bohm-Gross offset fixes it.
+
+The cap had a bug worth recording: it read `alpha_epw[step]`, which is not
+assigned until after the EPW call the mask is being built for, so
+`_satellite_offset` saw NaN and the cap silently never applied. It now takes the
+scattering parameter from the IAW call made just above.
+
+What is left in the corrected panel outside that window is the central feature's
+skirt, and at alpha = 12-24 there is no computable satellite to compete with it
+-- §14.2, not the mask.
+
+## 15. Validation against a known answer
+
+The shock runs have no analytic spectrum, so a disagreement there cannot be
+attributed to anything. Three WarpX runs of a **uniform Maxwellian hydrogen
+plasma** fix that: the deck sets `n_e`, `T_e`, `T_i` and the drift, so
+`thomson.spectral_density` is the exact answer and the whole chain can be
+checked against it. Decks in `tools/warpx_validation_decks/`, harness in
+`tools/pic_thomson_warpx_validation.py`.
+
+### 15.1 The reader
+
+| case           | quantity | deck      | recovered | error     |
+| -------------- | -------- | --------- | --------- | --------- |
+| collective     | `n_e`    | 1e25 m^-3 | 1.0000e25 | **0.00%** |
+| collective     | `T_e`    | 100 eV    | 99.92     | **0.08%** |
+| collective     | `T_i`    | 50 eV     | 50.03     | **0.05%** |
+| non-collective | `T_e`    | 500 eV    | 497.64    | **0.47%** |
+| drifting       | `u_e`    | 1.5e6 m/s | 1.4983e6  | **0.12%** |
+
+`T_e` moves from 99.918 to 99.917 eV over a full plasma period, so there is no
+numerical heating to confuse with a pipeline error.
+
+### 15.2 The spectrum
+
+Against `spectral_density` at the **measured** moments, so PIC heating is not
+charged to the pipeline:
+
+| case           | alpha | alpha error | satellite position        | band power   |
+| -------------- | ----- | ----------- | ------------------------- | ------------ |
+| non-collective | 0.37  | 0.53%       | exact                     | **0.0-1.6%** |
+| collective     | 2.55  | 0.54%       | within one bin (0.33 nm)  | **0.1-1.1%** |
+| drifting       | 2.55  | 0.50%       | IAW peaks within 0.027 nm | 5-8%         |
+
+The drifted IAW feature lands at 527.896 nm against the analytic 527.921 --
+**0.025 nm**, right sign, right magnitude. The band powers are worse there only
+because the split point is taken from the electron drift while the ion feature
+moves with the ion drift; the peaks are what the measurement is.
+
+### 15.3 Accuracy against alpha, on analytic input
+
+No PIC noise at all, so this is the model's own accuracy:
+
+| alpha | satellite position error | blue-wing power (vdf vs analytic) |
+| ----- | ------------------------ | --------------------------------- |
+| 0.31  | 0.000 nm                 | 31.386% vs 31.389%                |
+| 1.01  | 0.095 nm                 | 30.972% vs 31.003%                |
+| 2.05  | -0.285 nm                | 19.7% vs 19.3%                    |
+| 4.12  | -1.045 nm                | 6.52% vs 6.86%                    |
+| 8.32  | **+6.3 nm**              | 0.056% vs 0.055%                  |
+| 17.4  | **+9.2 nm**              | 0.003% vs 0.002%                  |
+
+**The pipeline is good to a few percent for alpha \<~ 4.** By alpha ~ 8 the
+satellites carry under a thousandth of the scattered power and their position is
+unreliable -- which is §14.2's precision limit arrived at from a completely
+independent direction, and it is a property of the physics and of double
+precision, not of the conditioning.
+
+### 15.4 What the exercise found
+
+- **A bug.** WarpX renames a plotfile it is about to overwrite to
+  `<name>.old.<pid>`, and `_warpx_plotfiles` globbed `<prefix>*`, so a run that
+  had been killed and relaunched came back with a stale plotfile as an extra
+  timestep -- carrying another run's data, sorted right after the step it
+  duplicates. Now matched against `<prefix><digits>` exactly. Found because the
+  first attempt at the collective run was killed and the reader silently
+  reported three dumps where there were two.
+- **A trap, not a bug.** `spectral_density` returns `S(k, omega)`;
+  `arbitrary_forwardmodel` with `scattered_power=True` returns power per unit
+  wavelength, which is that times `(1 + 2 omega/omega_0) * 2/lambda^2`.
+  Comparing them directly puts a factor of three of tilt across a 280 nm window
+  -- 1.9x at the blue end falling to 0.4x at the red -- which looks exactly like
+  a pipeline error. Matching the convention takes the non-collective L1 from
+  0.151 to **0.0076**.
+
+## 16. Reduced mass ratio: what the pipeline may and may not undo
+
+Applied to `KinShock2020/runs/R1_phase/R1_paper_470eV` -- a **kinetic-electron**
+run, unlike the H-PICShock hybrids -- at z = 0.69 mm. Figure:
+`media/13_kinshock_470eV.png`.
+
+### 16.1 What the deck fixes
+
+`n_amb = 4.8e24 m^-3` and `B0 = 7.026 T` are physical, `T_e` is physical, and
+**the electrons are real electrons** (`species_type = electron`). Only the ions
+are light: `m_i = 100 m_e`, so `R = m_p/m_sim = 18.36`.
+
+That splits the quantities cleanly:
+
+| already physical          | corrupted by sqrt(R) = 4.29   |
+| ------------------------- | ----------------------------- |
+| `lambda_De` (n, T_e only) | `v_A`, `c_s`, `v_ti`          |
+| `v_te` (real m_e)         | ion bulk and thermal velocity |
+| `omega_pe`                | (and `omega_ci` by R)         |
+
+**So `alpha` and the EPW satellite are correct as read, and only the ions need
+rescaling.** Three treatments, measured:
+
+| treatment               | alpha (median) | IAW FWHM (median) | EPW resolved |
+| ----------------------- | -------------- | ----------------- | ------------ |
+| A, nothing scaled       | 3.15           | 4.41 nm           | 24/51        |
+| **B, ions / sqrt(R)**   | **3.15**       | **1.54 nm**       | **24/51**    |
+| C, everything / sqrt(R) | 13.51          | 1.43 nm           | 3/51         |
+
+A hands the forward model a 26.4 keV proton where the deck set 1.44 keV at the
+simulated mass, so the ion feature is ~3x too wide. C divides the *electron*
+thermal speed by 4.29 as well, which is already physical, and drags alpha from
+3.15 to 13.51 -- past the double-precision limit of §14.2, hence 3 usable frames
+out of 51. **B is the only correct treatment for a run of this kind.**
+
+### 16.2 What no rescale can fix
+
+`u_e/u_i = 0.14` before any rescale -- the two species genuinely do not move
+together, because a perpendicular shock carries a real cross-field current. The
+reduced mass ratio changes *how* different they are: the current layer is an
+ion-scale structure, so a lighter ion makes it sqrt(R) thinner in `d_e` and the
+drifts inside it sqrt(R) larger relative to `v_te`. Measured `u_e/v_te` is
+0.20-0.36 in the shocked layer, against 0.05-0.08 for the same structure at the
+physical mass.
+
+That ratio is a **dimensionless parameter of the problem**, and one velocity
+factor cannot restore it: the electron distribution carries a thermal scale that
+is already right and a bulk scale that is sqrt(R) too fast, in the same array.
+An electron feature from a reduced-mass-ratio run is therefore a spectrum of a
+plasma with the wrong drift-to-thermal ratio, and no post-processing undoes it.
+The ion feature has no such problem -- both its scales are wrong by the same
+sqrt(R) -- which is why `ion_velocity_scale_factor` works and an electron
+equivalent would not.
+
+### 16.3 The run itself
+
+alpha runs 0.78-5.5, so unlike the OmegaShock and H-PICShock runs this one sits
+**inside the band validated in §15** for most of its history. 24 of 51 frames
+have the EPW satellite inside the sampled tail. The satellites track Bohm-Gross
+to a median of 5.3 nm on those frames, over a density rise of 4.8e24 -> 2.4e26.
+
+### 16.4 Two more reader bugs, both found here
+
+- **Plotfile ordering.** WarpX pads the step to six digits without truncating,
+  so past step 999999 the seven-digit names do not sort lexically against the
+  six-digit ones: `diag11002384` (step 1002384) came before `diag1111376`
+  (step 111376). The time axis ran backwards in places and the run appeared to
+  end at 154 ps instead of 453 ps. Sorting is on the parsed integer now.
+- **Velocity resolution.** One velocity axis spans every frame and every cell,
+  so it is sized by the fastest macroparticle in the run while the feature is
+  carried by the coldest population. Here the piston ions reach 2.6e7 m/s and
+  the 10 eV upstream ions got **1.4 bins per thermal width**, a 4% temperature
+  bias (`dv^2/12`, confirmed: 10.57 eV recovered against 10.11 eV read from a
+  single frame). Now warned about, and reported as `bins_per_thermal_width`.
+
+### 16.5 The electron drift, fixed
+
+§16.2 said one velocity factor cannot serve a species whose thermal scale is
+already physical and whose bulk scale is not. It cannot -- but a *translation*
+can, and the electrons only ever needed a translation.
+
+Writing `f(v) = g(v - vbar)`, the map `f(v) -> f(v - vbar(1/s - 1))` moves the
+mean to `vbar/s` and leaves `g` -- every central moment, the temperature
+included -- exactly as it was. That is `rescale_vdf_drift`, wired into the
+driver as `electron_drift_scale_factor`. Verified on an analytic Maxwellian:
+drift lands on target to 1e-6, temperature preserved to 0.0004%.
+
+Four treatments on R1_paper_470eV at z = 0.69 mm:
+
+| treatment                    | alpha (median) | IAW FWHM    | EPW centroid excursion | EPW resolved |
+| ---------------------------- | -------------- | ----------- | ---------------------- | ------------ |
+| A, nothing                   | 3.15           | 4.41 nm     | 141.9 nm               | 24/51        |
+| B, ions / sqrt(R)            | 3.15           | 1.54 nm     | 138.4 nm               | 24/51        |
+| C, everything / sqrt(R)      | 13.51          | 1.43 nm     | 102.4 nm               | **3/51**     |
+| **D, ions + electron drift** | **3.15**       | **1.58 nm** | **65.4 nm**            | **24/51**    |
+
+D is what a reduced-ion-mass run with kinetic electrons wants: the ion feature
+where B put it, `alpha` and `T_e` untouched, and the electron Doppler shift more
+than halved -- put where the physical plasma would put it.
+
+A detail worth keeping: treatment C makes the forward model divide by zero.
+Compressing the velocity axis by sqrt(R) squeezes the distribution into a
+fraction of its bins, and the model divides by the zeros that leaves. The
+numerical complaint is itself part of the argument against C.
+
+Still not restored, and not restorable: the *ratio* of drift to thermal speed.
+The simulated plasma really does have a thinner current layer in `d_e` and a
+faster drift in `v_te` (measured `u_e/v_te` 0.20-0.36 against 0.05-0.08
+physical). D fixes the line centre, which is what a Doppler measurement reads;
+it does not make the electron distribution's *shape* that of the physical
+plasma.
+
+## 17. The noise in figure 13, and the notch
+
+Two things about `media/13_kinshock_470eV.png` looked wrong: the speckle that
+appears in both features once the piston reaches the probe, and the shape of
+the EPW stray-light mask. Neither is physical. This section is what they were.
+
+### 17.1 The noise is numerical, and it is two different things
+
+Three measurements, on `R1_paper_470eV` at z = 0.69 mm.
+
+**It is uncorrelated frame to frame.** In the red wing of the EPW window the
+fluctuation about a running mean is 0.6 dex -- a factor of four -- and the
+correlation between adjacent frames is 0.07-0.34. A shock feature evolving on
+a 9 ps frame spacing does not do that.
+
+**It has a fixed period in wavelength, and that period does not depend on the
+velocity binning.** Rebinning the cached histogram from 512 to 256 to 128
+velocity bins leaves the ringing period at 2.2-2.9 nm while changing its
+amplitude, so it is not the velocity grid being read through the Doppler map.
+
+**The conditioned distribution it comes from is smooth.** At step 33 the
+piston-electron VDF after conditioning is monotonic beyond the tail join and
+has a log-residual of 0.0004 dex out to 4.5 thermal speeds -- `extend_vdf_tail`
+joins at 1.5 sigma and everything the EPW wing reads is the fitted Maxwellian.
+The distribution has no structure at all where the spectrum has 0.6 dex of it.
+
+So the ringing is made inside the forward model.
+
+### 17.2 The principal-value quadrature
+
+`arbitrary_chi` evaluates
+
+    chi ~ integral f'(u) / (u - xi) du
+
+on a sample grid that is *anchored at xi* and graded away from it --
+`nPoints=1e3` points, 80% of them within `inner_range` of the singularity, the
+rest spread over the remaining 90% of the axis. The outer spacing is therefore
+about `0.009 * deltauMax`, which on this run is 0.1 in u, or 2.9 nm of
+wavelength.
+
+As xi sweeps the wavelength axis, that grid slides underneath f'. Against a
+smooth f' this is a convergent quadrature and the default is fine: on an
+analytic Maxwellian the default reproduces the `nPoints=3e5` answer to **0.0036
+dex at alpha = 0.82, 0.0215 at alpha = 2.37 and 0.0234 at alpha = 4.47**, and
+the error falls as 1/nPoints. Against a f' carrying macroparticle noise the
+sliding grid samples a different set of bumps at every xi and the error
+oscillates with the sample spacing.
+
+Raising `n_quadrature_points`, over 51 frames:
+
+| window        | 1e3 (default) | 1e4       | 1e5   |
+| ------------- | ------------- | --------- | ----- |
+| EPW wing rms  | 0.563 dex     | **0.100** | 0.100 |
+| IAW wing rms  | 0.637 dex     | **0.045** | 0.045 |
+
+1e4 and 1e5 agree, so 1e4 is converged. The **IAW feature FWHM moves by up to
+14%** between the default and the converged answer, which is a systematic on
+every ion-temperature number this pipeline has produced.
+
+This is now a parameter, `n_quadrature_points`, on
+`spectra_from_phase_spaces`. The default is unchanged -- the old behaviour is
+still what you get unless you ask -- because it is correct for the analytic and
+`from_moments` inputs, and only wrong for noisy ones.
+
+### 17.3 What is left is macroparticle statistics, and the timing gives it away
+
+At converged quadrature the wings still carry 0.10 dex. Resampling the
+histogram from its own macroparticle quantum as a Poisson draw and re-running
+moves the spectrum by **0.17-0.53 dex** (the resample doubles the variance, so
+the true figure is that over sqrt(2)). The residual is shot noise.
+
+Counting macroparticles in the probe cell says why it starts when it does:
+
+| t (ps)    | electrons in the probe cell |
+| --------- | --------------------------- |
+| 0-163     | 12,000 - 47,000             |
+| **199**   | **2,162**                   |
+| 199-453   | 2,200 - 5,000               |
+
+The ambient population is swept out of the cell and the piston population that
+replaces it is loaded at 100x the weight and 20x fewer macroparticles. The
+noise in the published figure begins at exactly that frame. It has nothing to
+do with the piston "dominating" in any physical sense -- it is the frame where
+the cell's sampling collapses.
+
+The EPW wing at 580-655 nm reads the electron distribution at **1.5 to 4.3
+thermal speeds**, where 2,000 particles put fewer than ten in a bin. The
+collective factor `|1 - chi_e/epsilon|^2` then turns each noise excursion that
+carries epsilon near zero into a spurious resonance, which is why the late
+frames are a forest of isolated spikes several decades above a near-zero floor
+rather than a noisy continuum.
+
+### 17.4 One cell is the wrong probe volume
+
+A Thomson collection volume at 532 nm is tens to a hundred microns. A cell here
+is 7.6. Averaging the phase space over the cells the real volume spans is what
+the measurement does anyway, and it is free:
+
+| probe volume    | EPW wing rms (dex)          | IAW FWHM (nm)          |
+| --------------- | --------------------------- | ---------------------- |
+| 1 cell, 7.6 um  | 0.10 0.05 0.25 0.02 0.12    | 1.37 2.60 1.61 1.56    |
+| 5 cells, 38 um  | 0.01 0.10 0.17 0.11 0.11    | 1.80 1.67 1.69 1.82    |
+| **11 cells, 84 um** | **0.02 0.10 0.06 0.04 0.05** | **2.90 1.99 1.59 1.55** |
+| 21 cells, 160 um| crosses too much gradient; frames go NaN |    |
+
+Average, do not sum -- summing 11 cells multiplies the density by 11 and drags
+alpha from 3.19 to 11.98.
+
+### 17.5 The notch was never a stray-light notch
+
+`epw_notches="auto"` sized the mask as
+
+    min( 1.5 * (99.9% containment interval of the IAW window),
+         0.2 * (Bohm-Gross offset) )
+
+Both halves are wrong for this.
+
+**The containment half measures the wings, not the line.** At the same frame
+the interval is 17.8 nm at 0.999 containment and **0.79 nm at 0.99** -- the last
+0.1% of the area is spread over the whole window, so the measurement is of
+whatever is in the wings. Late in the run part of what was in the wings was the
+quadrature ringing of 17.2, so the mask width was being set by a numerical
+artefact.
+
+**The cap half is a function of density, not of the instrument.** Where the cap
+binds -- most of the first half of the run -- the mask is 0.4 x the Bohm-Gross
+offset, so it scales as sqrt(n_e) and reaches 20% of the way to the satellites
+by construction.
+
+Between them the applied mask ran **5.1 to 24.0 nm wide, wandering frame to
+frame**, against a central feature that is 0.42-2.5 nm wide by the 95%
+containment measure -- a ratio of 3 to 19. At t = 145 ps, where alpha = 0.82 and
+the spectrum is very nearly a flat non-collective continuum with no central
+feature to speak of, it cut a 21 nm hole in it.
+
+It never ate the Bohm-Gross satellites; the cap prevented that. What it did was
+change width every frame, which no piece of glass does, and blank real spectrum
+between the line and the satellites.
+
+A fixed notch, sized once from the data, is both more honest and easier to
+justify. The central feature spans 526.5-537.4 nm over every collective frame
+of this run and the nearest satellite is at +-20 nm, so **[526, 538] nm** covers
+it everywhere with 14 nm of clearance. That is what figure 13 now uses.
+
+### 17.6 What this invalidates
+
+- **The 440-660 nm EPW window was too narrow.** Past ~250 ps the Bohm-Gross
+  satellites are at +-100 to +-131 nm, i.e. outside it. Everything the published
+  figure showed in that window at late times was the spike forest of 17.3, not
+  the electron feature. The window is now 400-680 nm and the satellites are
+  visible tracking Bohm-Gross for the whole second half of the run.
+- **The "EPW centroid excursion" column of 16.5 measures that noise.** With the
+  satellites outside the window, the centroid of the window was tracking
+  spurious spikes. Measured properly -- as the midpoint of the two satellites,
+  which is what a bulk drift moves -- the excursion is 26.9 nm (A), 38.9 (B),
+  35.5 (D), with an rms scatter about the mean of 6-9 nm. The expected B-to-D
+  difference from the measured drift is about 5 nm, which that estimator cannot
+  resolve. **The claim that D more than halves the electron Doppler excursion
+  does not survive.** What does survive is the argument itself and its direct
+  check: `rescale_vdf_drift` puts the mean where it is asked to to 1e-6 and
+  leaves the temperature to 0.0004%, which is verified on the distribution, not
+  read off a spectrum.
+- **Frames with a resolved electron feature: 24/51 becomes 36/51** once the
+  window holds the satellites and the probe volume is realistic.
+- IAW FWHM medians move: A 4.41 -> 4.57 nm, B 1.54 -> 2.12, D 1.58 -> 2.20. The
+  B/D-versus-A conclusion is unchanged; the absolute widths were low.
+
+### 17.7 The same treatment on the OSIRIS figure
+
+`media/07_osiris_end_to_end.png`, from `omegashock_w3.5e11_exp`. Three of the
+four corrections transfer; the numbers differ enough to be worth recording.
+
+**Quadrature: it matters here too, but less.** Measured against `nPoints=1e5`
+on the `osiris2thomson` run at `alpha ~ 20`:
+
+| window                       | 1e3 (default) | 1e4       |
+| ---------------------------- | ------------- | --------- |
+| EPW satellite band, 540-560  | 0.257 dex     | **0.030** |
+| IAW window, 522-542          | 0.027 dex     | **0.002** |
+| IAW FWHM                     | 0.1288 nm     | 0.1277 nm |
+
+The FWHM moves 0.9% rather than KinShock's 14%: this run smooths with four
+passes and has up to 5e5 macroparticles in the sampled cell, so `f'` is far
+smoother and the sliding quadrature grid has much less to trip over. The
+satellite band still carries a quarter of a decade at the default.
+
+**A caution about that measurement.** The first version of it passed
+`reference_density` as a bare float where the tool passes `u.cm**-3`, a factor
+of 1e6 in density. That put `alpha` at 0.00-0.03 instead of 5-20, i.e. fully
+non-collective, where `chi` is negligible and the quadrature cannot matter --
+and the measurement duly said the quadrature did not matter. It reads as a
+clean negative result and is entirely an artefact of the units.
+
+**The notch: same pathology, tighter constraint.** The automatic mask on this
+run ranges over **0.52 to 9.92 nm, a factor of 19, with a median of 0.64**.
+But a fixed replacement is harder to choose here than on KinShock: the central
+feature spans 520.2-537.4 nm at 1e-3 of its peak while the nearest Bohm-Gross
+satellite over the run is only **8.2 nm** out, at 523.8 and 540.2 nm. Those
+overlap. Where the central feature is at its widest the two features have
+genuinely merged and no mask separates them -- that is the physics of
+`alpha ~ 2-3`, not a sizing failure.
+
+The default is now `[527, 537]`, which covers the central feature in 90% of
+frames and clears the closest satellite by 3.2 nm.
+
+**Probe volume applies.** Cells are 19.9 microns here, so the default 5-cell
+average is a 100 micron collection volume.
+
+**What does not transfer** is the conclusion about which frames are usable. In
+the corrected configuration `omegashock_w3.5e11_exp` sits at `alpha` 2.5-23.7,
+median 16.4 -- mostly past the double-precision limit of 14.2, so the satellite
+is not computable there whatever the quadrature. Where the corrected EPW panel
+is thin, that is 14.2, not the treatment. (KinShock is the opposite case, and
+that is why it was the run worth chasing: `alpha` 0.78-5.5 puts it inside the
+band validated in 15 for most of its history.)
+
+What the colour rule does buy on this figure is the legacy panel's satellites
+after 0.5 ns, at 480 and 580 nm. They were always in the data; with the limit
+set from the whole panel the central line took the scale and they read as
+nearly black.
+
+### 17.8 The OSIRIS runs had the wrong velocity treatment all along
+
+The EPW panel of `07_osiris_end_to_end.png` was empty, and 17.7 attributed that
+to `alpha` sitting past the double-precision limit of 14.2. That was true, and
+it was not the whole story: **`alpha` was that high because the pipeline was
+applying the wrong correction.**
+
+`omegashock_w3.5e11_exp.1d` says:
+
+```text
+species { name = "e",    rqm = -1.0 }
+species { name = "cham", rqm = 69   }
+species { name = "targ", rqm = 68   }
+```
+
+`rqm = -1.0` is a **real electron**. So this run has exactly the structure of
+16.1 -- kinetic electrons at the physical mass, ions at a reduced one -- and not
+the similarity-scaled structure the tool assumed. `T_e`, `v_te`,
+`lambda_De` and therefore `alpha` are already physical; only the ion velocities
+and the flow the electrons share with the ions are wrong.
+
+`run_pipeline` passed `velocity_scale_factor`, which divides *every* species'
+axis by sqrt(R). That is treatment C of 16.5. On this run:
+
+| treatment                                | alpha median | alpha range |
+| ---------------------------------------- | ------------ | ----------- |
+| all velocities / sqrt(R)  (what it did)   | 11.58        | 1.79-16.77  |
+| **ions / sqrt(R) + electron drift**       | **1.64**     | 0.25-2.37   |
+
+The ratio is 11.58 / 1.64 = 7.06 = sqrt(50), which is the whole of it: dividing
+the electron axis divides `v_te`, and `alpha = sqrt(2) omega_pe / (k sigma)`
+rises by the same factor. It carried a perfectly computable spectrum from
+inside the band validated to a few percent in 15 to past the limit where the
+satellite cannot be evaluated in double precision at all.
+
+**The satellites were never missing from the physics. They were being scaled
+out of existence.**
+
+Switching the default moves the run's own diagnostics too, all in the same
+direction:
+
+| quantity                                  | before      | after       |
+| ----------------------------------------- | ----------- | ----------- |
+| `alpha` (corrected config, stride 10)     | 16.38       | **2.32**    |
+| frames whose satellite outruns the data   | 43 of 52    | **30 of 52** |
+| thermal widths the satellite needs        | up to 7.4   | **up to 2.0** |
+| `epw_tail_uncertainty` at the resonance   | large       | **1.01**    |
+
+The last is the one that matters: at 1.8 thermal widths the satellite sits
+*inside* the sampled distribution, so it is a measurement rather than an
+extrapolation off the fitted tail.
+
+Both configurations of `07` now use the corrected scaling, so the legacy
+comparison still isolates the taper -- which is what it was for -- rather than
+conflating it with the velocity treatment. `06`, `07`, `10` and the new `14`
+are regenerated.
+
+**What this does not settle** is `R = 50` itself. `rqm = 68.5` against a proton
+gives R = 1836/68.5 = 26.8; R = 50 requires A/Z ~ 1.87, the fully-stripped
+low-Z ion that is still open decision 1, and the ion labels are still `p+`.
+That moves the IAW width, not the `alpha` above.
+
+### 17.9 What figure 14 is
+
+`media/14_osiris_spectra.png`, from `tools/pic_thomson_osiris_spectra.py`: the
+EPW and IAW spectrograms for the two treatments, and nothing else. No legacy
+column -- the taper is settled and it only crowds the plot.
+
+**Each row is drawn on one absolute colour scale across every timestep.** The
+other figures normalise each row to its own area, which is a trap for the EPW:
+a frame carrying no signal then looks exactly like a frame carrying a strong
+one, and where the notch has removed the central feature the only content left
+is the skirt at the notch edge -- 1e-5 of the peak -- which normalisation
+promotes into a saturated rail along both notch edges, across every such frame.
+That rail is what made the EPW panel unreadable, and widening the notch only
+moved it. Sharing one scale makes brightness mean intensity.

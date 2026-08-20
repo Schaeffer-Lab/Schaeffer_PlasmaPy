@@ -1,0 +1,29 @@
+`~plasmapy.diagnostics.pic_thomson.rescale_vdf_drift` divides the bulk velocity
+of a distribution by a factor while leaving its width -- and so its temperature
+-- exactly alone, and
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` takes it as
+``electron_drift_scale_factor``.
+
+A run with kinetic electrons at the real :math:`m_e` and a reduced ion mass has
+two velocity scales in one array. Its :math:`T_e` and :math:`\lambda_{De}` are
+already physical, since they involve no ion mass, but the bulk flow the
+electrons share with the ions is :math:`\sqrt{R}` too fast.
+`~plasmapy.diagnostics.pic_thomson.rescale_velocity_axis` cannot separate the
+two: dividing the whole axis takes :math:`T_e` down by :math:`R` and drags
+:math:`\alpha` up by :math:`\sqrt{R}` -- on a KinShock run at
+:math:`m_i/m_e = 100` that moved the median :math:`\alpha` from 3.15 to 13.51,
+past the point where the electron feature is computable in double precision at
+all, leaving 3 usable frames out of 51.
+
+Translating each slice instead is exact. Writing :math:`f(v) = g(v - \bar{v})`,
+the map :math:`f(v) \rightarrow f(v - \bar{v}(1/s - 1))` moves the mean to
+:math:`\bar{v}/s` and leaves :math:`g`, and every central moment, untouched. On
+the same run it holds :math:`\alpha` at 3.15 and the ion feature where
+``ion_velocity_scale_factor`` put it, while pulling the electron feature's
+excursion from 138 nm to 65 nm.
+
+What it cannot do is restore the *ratio* of drift to thermal speed, which the
+reduced mass ratio genuinely changes -- the simulated plasma has a thinner
+current layer in units of :math:`d_e` and a faster drift in units of
+:math:`v_{te}`. It puts the Doppler shift where the physical plasma would put
+it, which is what the line centre depends on.

@@ -1,0 +1,14 @@
+Documented, on `~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces`,
+that a single grid cell is usually the wrong probe volume. A Thomson scattering
+volume at 532 nm is tens to a hundred microns; a PIC cell in a shock run is a
+few. Averaging the phase space over the cells the real collection volume spans
+costs nothing, is what the measurement being modelled actually does, and buys
+:math:`\sqrt{N}` in macroparticle statistics exactly where the forward model is
+most sensitive to them -- the tail, which is where the electron feature reads.
+
+On ``R1_paper_470eV`` the probe cell holds 12,000-47,000 macroparticles until
+the shock passes and 2,000-5,000 afterwards, and the noise in the published
+spectrogram begins at the frame where that drop happens. Averaging over 11
+cells -- 84 microns, a realistic probe volume -- takes the residual roughness
+in the EPW wing from 0.25 to 0.06 dex and raises the frames with a resolved
+electron feature from 24/51 to 36/51.

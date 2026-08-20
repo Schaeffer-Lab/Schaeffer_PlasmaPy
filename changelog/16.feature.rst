@@ -1,0 +1,22 @@
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` takes
+``epw_notches="auto"``, which sizes the stray-light mask from the central
+feature as measured in the IAW window, at every timestep, instead of holding it
+at a fixed pair of wavelengths. A fixed mask does not stay over a feature the
+flow is Doppler-shifting: at :math:`2\times10^{6}` m s\ :sup:`-1` the shift is
+:math:`\lambda^2 k u / 2 \pi c \approx 3.7` nm, most of a 4 nm notch, and the
+bin immediately outside then holds the skirt of a feature orders of magnitude
+above the electron-plasma-wave satellites -- which on one OSIRIS run took it
+from 0.5% of the window's area before the piston arrived to 88--98% after. The
+interval applied at each timestep is recorded in ``meta["epw_notch_applied"]``.
+
+The mask is also capped at ``notch_max_fraction`` of the Bohm--Gross satellite
+offset, since a mask must not eat what it is protecting: where the plasma is
+only weakly collective the central feature and the electron feature merge, and
+sizing purely by containment masked 30 nm of the window -- the satellites with
+it.
+
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` results span many
+decades, so ``tools/pic_thomson_osiris_comparison.py`` now draws its
+spectrograms on a log colour scale by default (``--no-log-scale`` for the old
+one). On a linear scale the skirt of the central feature is the only thing
+visible and everything else reads as black.

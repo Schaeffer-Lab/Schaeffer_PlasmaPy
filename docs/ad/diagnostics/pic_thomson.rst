@@ -209,23 +209,76 @@ shape from. Condition these phase spaces with ``taper_threshold=None``: the tape
 exists to replace the discontinuity where shot noise meets the grid edge, and a
 reconstructed distribution has neither.
 
-Sizing the taper
-----------------
+Where the data stops: modelling the tail
+----------------------------------------
 
-`taper_vdf_edges` smooths away the discontinuity where a PIC noise floor meets
-the edge of the velocity grid. Its rolloff runs to the grid boundary by default,
-which is only safe when the distribution roughly fills the grid. When it does
-not, the rolloff fabricates a pedestal at large :math:`|v|`, precisely where the
-:math:`v^2` weighting of the second moment is largest, and the thermal speed the
-forward model reads off the distribution comes out far too high — by 67% for the
-electrons of a real OSIRIS run, and by a factor of tens for its ions, whose
-momentum grid is far wider than their thermal spread.
+A PIC histogram is populated only as far as its last macroparticle. The EPW
+satellite reads :math:`f_e` at :math:`\sqrt{\alpha^2 + 3}` thermal speeds, which
+is routinely much further out — reaching :math:`n\sigma` needs of order
+:math:`e^{n^2/2}` particles per cell, so three to five is typical whatever the
+budget. Something has to fill the gap, and whatever fills it *is* the electron
+feature.
 
-Set ``max_taper_bins``. The ``pedestal_warning`` reports how much the taper
-widened the distribution, so a bad choice does not pass unnoticed.
+`taper_vdf_edges`, the original filler, is a numerical device rather than a
+model: it finds the outermost bin above ``threshold_frac`` of the slice peak and
+runs a half-cosine from that bin's value down to zero. Every part of that is a
+choice rather than a measurement, and on real data the consequences are large.
+The threshold is a fraction of the *peak*, so for a Maxwellian it always lands at
+3.26 :math:`\sigma` no matter how many particles were run — on one OSIRIS run
+that put the anchor bin at 3.24 :math:`\sigma` while ten macroparticles only
+reached 2.60, i.e. **the whole tail hung off a bin holding one or two
+particles**. The shape is wrong in the derivative as well as the value, and
+:math:`\partial f/\partial v` at the resonance is what sets Landau damping, so
+the feature's width is fabricated along with its height. And because the rolloff
+leaves a pedestal at large :math:`|v|`, where the :math:`v^2` weighting of the
+second moment is largest, it sets :math:`\alpha` too: varying
+``max_taper_bins`` over 5, 20, 80 and unbounded moved :math:`\alpha` from 16.0 to
+0.76 on the same data. That is a factor of 21 on a reported plasma parameter,
+from a knob with no physical meaning.
 
-How much smoothing
-------------------
+`extend_vdf_tail` replaces it, and is the default. Per slice and per side:
+
+1. The **macroparticle quantum** is the smallest positive value in the raw
+   histogram — one particle — so ``f / quantum`` is a particle count.
+2. The **join** is the outermost bin holding at least ``min_counts`` particles,
+   10 by default, a 30% counting error. Inside it the histogram is data.
+3. A Maxwellian is fitted to :math:`\ln f` against :math:`(v - \bar{v})^2`
+   between ``fit_from`` thermal speeds and the join, weighted by particle count,
+   which is the inverse-variance weighting since :math:`\mathrm{var}(\ln f)`
+   is :math:`1/N`. That gives a **tail temperature**, which is a real
+   measurable and is what a fit to measured Thomson data reports.
+4. Beyond the join the fit takes over, at its own intercept rather than through
+   the join bin — the join is by construction the outermost bin still reaching
+   ``min_counts``, hence a selected upward fluctuation, and anchoring there
+   biases the tail high by 20–30%.
+
+Below ``min_fit_bins`` in the band, or if the fit returns a non-decaying tail,
+the slice falls back to its own core temperature, which is the assumption a fit
+cannot improve on when there is no signal to fit.
+
+Nothing is set to zero, so no positive floor is wanted afterwards and
+`condition_phase_space` drops it — a floor would put a flat pedestal at about 12
+thermal speeds, which is exactly where the satellite reads at
+:math:`\alpha \sim 12`.
+
+On a sampled Maxwellian the fitted tail temperature comes back to within 0.1% at
+:math:`10^5` particles, and the extrapolated :math:`f` is right to 0.6% at 12
+:math:`\sigma` — three times beyond the last particle. The uncertainty is
+reported rather than assumed: ``tail_width_error`` is the standard error on
+:math:`\sigma_t`, and since :math:`\delta \ln f = (x/\sigma_t)^2 \,
+\delta\sigma_t/\sigma_t`, a small error in the width becomes a large one far
+out. `spectra_from_phase_spaces` turns it into ``epw_tail_uncertainty``, the
+factor by which the EPW amplitude is uncertain at the resonance.
+
+Reconstructed populations — anything from `from_moments` — are skipped: they are
+already their own tail model, with no last macroparticle to join at. So are
+slices whose dynamic range is too large to have come from counting anything.
+
+`taper_vdf_edges` is still there, and ``tail_model=None`` selects it, with
+``max_taper_width`` to bound the rolloff in thermal speeds rather than in bins.
+
+How much smoothing, and in what units
+-------------------------------------
 
 The collective regime needs markedly more velocity smoothing than the
 non-collective one. Where :math:`\alpha > 1` the spectrum carries
@@ -233,6 +286,65 @@ non-collective one. Where :math:`\alpha > 1` the spectrum carries
 electron-plasma-wave resonance, so shot noise entering :math:`\chi_e` through
 :math:`\partial f/\partial u` is amplified into speckle. At :math:`\alpha \ll 1`
 the same noise passes through untouched.
+
+**Ask for it in thermal speeds, not in bins.** Smoothing is a convolution, so a
+boxcar of :math:`W` bins applied :math:`n` times adds
+:math:`n (W^2 - 1) \Delta v^2 / 12` to the second moment of every slice,
+whatever that slice's own width. In velocity units that is a fixed additive
+temperature, and the forward model reads the thermal speed straight off the
+distribution — so it lands in :math:`T_e`, in :math:`\alpha`, and in the
+satellite positions that follow from them.
+
+How bad that is depends entirely on how wide the code's velocity grid happens to
+be, which is a choice made in the input deck and has nothing to do with the
+plasma. On an OSIRIS run whose momentum diagnostic spanned :math:`\pm 0.71c`
+while its electrons occupied :math:`\pm 0.03c` — 31 of 1024 bins — a 40-bin
+window with three passes turned a 38.8 eV ambient into 813 eV and moved
+:math:`\alpha` from 12.0 to 3.2, which is a different scattering regime. The
+same window cost only 18% in the shocked plasma later in the run, so the bias
+does not cancel between two measurements either.
+
+Pass ``smoothing_width`` instead, in thermal speeds, and `condition_phase_space`
+sizes the window from the narrowest appreciably populated slice it is given. The
+default, 0.25, leaves the second moment alone to about 2% over three passes.
+`smooth_vdf` also takes a ``variance_warning``, which
+`condition_phase_space` sets by default, so a window given in bins says what it
+cost.
+
+Whether the electron feature is a measurement at all
+----------------------------------------------------
+
+The EPW satellite sits at the Bohm–Gross resonance, so it reads :math:`f_e` at
+
+.. math::
+
+   \frac{v_\phi}{\sigma} = \sqrt{\alpha^2 + 3}
+
+thermal speeds, with :math:`\alpha = 1/(k \lambda_{De})`. A PIC histogram is
+populated only as far as its last macroparticle: reaching :math:`n \sigma` needs
+of order :math:`e^{n^2/2}` particles per cell, so three to five is typical and
+no amount of compute reaches twelve. Past that the conditioning takes over —
+`taper_vdf_edges` rolls the tail off and the floor holds it up — and the
+resonance of :math:`|1 - \chi_e/\epsilon|^2` amplifies whatever is there into a
+satellite. It looks like a measurement, it tracks nothing, and it moves when
+``max_taper_bins`` moves.
+
+`spectra_from_phase_spaces` records the two numbers per timestep as
+``epw_tail_ratio`` and ``epw_tail_required``, reduces them to ``epw_resolved``,
+and by default replaces the EPW spectrum with `~numpy.nan` where the resonance
+falls outside the sampled tail. Pass ``mask_unresolved_epw=False`` to keep those
+rows. A timestep counts as resolved only when *every* present electron
+population reaches the resonance, since the electron susceptibility they share
+is what lights the satellite up.
+
+For a population built by `from_moments` there is no last macroparticle: the
+grid stops where ``velocity_headroom`` was told to stop, and the tail beyond the
+data is the assumed Maxwellian rather than anything measured. The remedy there
+is a wider grid — the default of 6 covers the resonance only up to
+:math:`\alpha \approx 5.7`, and `read_warpx_hybrid_electrons` takes
+``velocity_headroom`` for that reason. ``meta["epw_tail_analytic"]`` names the
+populations this applies to, because for them the satellite is only ever as good
+as the distribution that was assumed.
 
 What the spectra do and do not carry
 ------------------------------------

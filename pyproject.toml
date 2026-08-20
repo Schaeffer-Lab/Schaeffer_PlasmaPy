@@ -403,8 +403,11 @@ lint.per-file-ignores."tests/utils/_pytest_helpers/test_pytest_helpers.py" = [ "
 lint.per-file-ignores."tests/utils/decorators/test_converters.py" = [ "ARG001", "ARG005" ]
 # Standalone visual/validation scripts; reporting on stdout is the point.
 lint.per-file-ignores."tools/pic_thomson_figures.py" = [ "T201" ]
+lint.per-file-ignores."tools/pic_thomson_kinshock.py" = [ "T201" ]
 lint.per-file-ignores."tools/pic_thomson_osiris_comparison.py" = [ "T201" ]
+lint.per-file-ignores."tools/pic_thomson_osiris_spectra.py" = [ "T201" ]
 lint.per-file-ignores."tools/pic_thomson_warpx.py" = [ "T201" ]
+lint.per-file-ignores."tools/pic_thomson_warpx_validation.py" = [ "T201" ]
 # Allow potentially ambiguous Unicode characters with valid uses in plasma science
 lint.allowed-confusables = [
   "×",

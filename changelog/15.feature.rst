@@ -1,0 +1,35 @@
+`~plasmapy.diagnostics.pic_thomson.extend_vdf_tail` replaces the tails of a PIC
+distribution beyond its last macroparticle with a fitted Maxwellian, and is now
+what `~plasmapy.diagnostics.pic_thomson.condition_phase_space` does by default
+in place of `~plasmapy.diagnostics.pic_thomson.taper_vdf_edges`.
+
+The taper was a numerical device standing in for a physical model, in the one
+place the electron-plasma-wave feature actually reads. It anchored a half-cosine
+to the outermost bin above a fixed fraction of the slice peak -- a criterion
+with no relation to how many particles are in that bin, which on a real OSIRIS
+run put the anchor at 3.24 thermal speeds while ten macroparticles reached only
+2.60, so the whole tail hung off one or two particles. Its shape was wrong in
+the derivative as well as the value, and Landau damping reads
+:math:`\partial f/\partial v` at the resonance, so the feature's width was
+fabricated with its height. Worst, the pedestal it left at large :math:`|v|`
+dominates the :math:`v^2`-weighted second moment: sweeping ``max_taper_bins``
+over 5, 20, 80 and unbounded moved :math:`\alpha` from 16.0 to 0.76 on the same
+data, a factor of 21 on a reported plasma parameter.
+
+The replacement finds the macroparticle quantum -- the smallest positive value
+in the raw histogram is one particle -- joins at the outermost bin holding
+``min_counts`` of them, and fits :math:`\ln f` against
+:math:`(v - \bar{v})^2` over the resolved band with the counts as
+inverse-variance weights, giving a **tail temperature**. Beyond the join the fit
+takes over at its own intercept, since the join bin is a selected upward
+fluctuation and anchoring there biases the tail high by 20--30%. Slices with too
+little signal fall back to their own core temperature. On a sampled Maxwellian
+the fitted temperature is recovered to 0.1% at :math:`10^5` particles and the
+extrapolated distribution is right to 0.6% at 12 thermal speeds -- three times
+beyond the last particle. Nothing is set to zero, so the positive floor is
+dropped as well: it would put a flat pedestal at about 12 thermal speeds, which
+is exactly where the satellite reads at :math:`\alpha \sim 12`.
+
+Reconstructed populations, from
+`~plasmapy.diagnostics.pic_thomson.from_moments`, are skipped -- they are
+already their own tail model. ``tail_model=None`` restores the taper.

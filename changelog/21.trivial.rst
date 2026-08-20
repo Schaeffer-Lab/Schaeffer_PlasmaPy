@@ -1,0 +1,5 @@
+``tools/pic_thomson_osiris_comparison.py`` and
+``tools/pic_thomson_warpx_validation.py`` now draw their spectra on a linear
+colour scale by default, which is what a measured spectrum is read on.
+``--log-scale`` restores the logarithmic one, which is worth having when the
+question is whether a feature is absent or merely faint.

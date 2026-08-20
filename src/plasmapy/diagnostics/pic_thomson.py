@@ -40,6 +40,7 @@ __all__ = [
     "PICPhaseSpace",
     "ThomsonSpectrogram",
     "condition_phase_space",
+    "extend_vdf_tail",
     "from_arrays",
     "from_moments",
     "histogram2d_deck_block",
@@ -49,6 +50,7 @@ __all__ = [
     "read_osiris_phase_space",
     "read_warpx_hybrid_electrons",
     "read_warpx_phase_space",
+    "rescale_vdf_drift",
     "rescale_velocity_axis",
     "smooth_vdf",
     "species_presence_mask",
@@ -57,6 +59,7 @@ __all__ = [
 ]
 
 import json
+import re
 import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -93,9 +96,24 @@ _CLIP_WARNING_FRACTION = 1e-3
 #: itself deposited before the reader complains.
 _DENSITY_CHECK_TOLERANCE = 0.05
 
+#: Velocity bins a reader wants across the narrowest thermal width it is
+#: binning, before it says the axis is too coarse for the feature. Binning adds
+#: dv^2/12 to the second moment, so 3 bins is a 1% temperature error.
+_MIN_BINS_PER_THERMAL_WIDTH = 3.0
+
 #: How much of a reconstructed distribution may fall off its velocity grid
 #: before `from_moments` complains.
 _MOMENT_RECOVERY_TOLERANCE = 0.01
+
+#: Largest ratio of peak to smallest-positive value at which a velocity slice
+#: still looks like a histogram of countable macroparticles. Above it there is no
+#: particle quantum to find and `extend_vdf_tail` leaves the slice alone.
+_MAX_DYNAMIC_RANGE = 1e15
+
+#: Default boxcar width for `condition_phase_space`, in thermal speeds of the
+#: narrowest slice being conditioned. Three passes at this width inflate the
+#: second moment by under 2%, which keeps the smoother out of the temperature.
+DEFAULT_SMOOTHING_WIDTH = 0.25
 
 
 def _si_values(quantity, unit: u.UnitBase) -> np.ndarray:
@@ -406,6 +424,10 @@ def from_moments(
         Resolution of the default velocity axis.
     velocity_headroom : `float`
         How many thermal speeds past the extreme drift the default axis reaches.
+        The EPW satellite reads :math:`f_e` at :math:`\sqrt{\alpha^2 + 3}`
+        thermal speeds, so the default of 6 covers the electron feature only up
+        to :math:`\alpha \approx 5.7`; past that the resonance falls off the end
+        of the grid and `spectra_from_phase_spaces` will say so.
     meta : `dict`, optional
         Extra provenance to attach.
 
@@ -552,6 +574,11 @@ def from_moments(
             "mass": mass_si,
             # f is already a density in m^-3.
             "reference_density": 1.0,
+            # The tail here is assumed, not sampled, so it always reaches the
+            # EPW resonance. `spectra_from_phase_spaces` records which
+            # populations this applies to rather than letting the check pass
+            # silently on a distribution nobody measured.
+            "analytic_tail": True,
             "moment_recovery_error": worst,
             **dict(meta or {}),
         },
@@ -591,8 +618,9 @@ def smooth_vdf(
     window: int,
     iterations: int = 1,
     axis: int = VELOCITY_AXIS,
+    variance_warning: float | None = None,
 ) -> np.ndarray:
-    """
+    r"""
     Suppress macroparticle shot noise with a repeated boxcar average.
 
     Applies a moving average of width *window* along the velocity axis
@@ -604,33 +632,87 @@ def smooth_vdf(
     f : array_like
         Phase-space density.
     window : `int`
-        Width of the moving-average window, in velocity bins.
+        Width of the moving-average window, in velocity bins. Sizing this against
+        the data rather than picking a number is what ``smoothing_width`` in
+        `condition_phase_space` is for -- see the warning below.
     iterations : `int`
         Number of passes. ``0`` returns the input unchanged (aside from cleaning
         non-finite values), which is often what is wanted for ion distributions --
         the IAW feature is narrow and easily washed out.
     axis : `int`
         Axis of *f* holding velocity.
+    variance_warning : `float`, optional
+        Emit a `RuntimeWarning` if smoothing widens the second moment of any
+        appreciably populated slice by more than this fraction. Slices carrying
+        less than 1% of the heaviest slice's weight are excluded, since a nearly
+        empty cell has a near-zero width that any kernel multiplies enormously.
+        The default, `None`, skips the check.
 
     Returns
     -------
     `~numpy.ndarray`
         The smoothed distribution, same shape as *f*.
 
+    Warns
+    -----
+    `RuntimeWarning`
+        If the smoothing has substantially widened the distribution -- see below.
+
     Notes
     -----
     Non-finite values are replaced with zero. Negative values are *not* modified
     here; `normalize_vdf` clips them, with a warning. Taking the absolute value
     would reflect shot noise into fabricated signal.
+
+    .. warning::
+
+       Smoothing is a convolution, so it *adds* variance. A boxcar of width
+       :math:`W` bins applied :math:`n` times adds
+
+       .. math::
+
+          \Delta \sigma^2 = n \, \frac{W^2 - 1}{12} \, \Delta v^2
+
+       to the second moment of every slice, regardless of how wide that slice
+       is. In velocity units that is a fixed additive temperature, and the
+       forward model reads the thermal speed straight off the distribution, so
+       it lands directly in :math:`T_e` and in :math:`\alpha`.
+
+       A window chosen in bins is therefore only meaningful next to the width of
+       the data. On an OSIRIS run whose electrons occupied 31 of the 1024 bins
+       its momentum diagnostic spanned, ``window=40`` with three passes turned a
+       38.8 eV ambient into 813 eV and dragged :math:`\alpha` from 12.0 to 3.2 --
+       enough to move the run between scattering regimes. Give
+       `condition_phase_space` a ``smoothing_width`` in thermal speeds instead,
+       and it sizes the window from the narrowest slice it is given.
     """
     if window < 1:
         raise ValueError(f"window must be at least 1; got {window}.")
     if iterations < 0:
         raise ValueError(f"iterations must be non-negative; got {iterations}.")
 
-    f = np.nan_to_num(np.asarray(f, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    raw = np.nan_to_num(
+        np.asarray(f, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    f = raw
     for _ in range(iterations):
         f = uniform_filter1d(f, size=window, axis=axis, mode="nearest")
+
+    if variance_warning is not None and iterations > 0:
+        worst = _worst_variance_growth(_as_columns(raw, axis), _as_columns(f, axis))
+        if worst is not None and worst > variance_warning:
+            added = iterations * (window**2 - 1) / 12.0
+            warnings.warn(
+                f"smooth_vdf: window={window} over {iterations} pass(es) widened "
+                f"the second moment of at least one slice by {worst:.0%}. A "
+                f"boxcar adds {added:.0f} bins^2 of variance to every slice "
+                f"whatever its width, so this is an additive temperature, not a "
+                f"filter. Size the window against the data -- pass "
+                f"smoothing_width to condition_phase_space -- or narrow the "
+                f"velocity grid.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     return f
 
 
@@ -690,14 +772,79 @@ def _index_space_variance(cols: np.ndarray) -> np.ndarray:
     """
     Variance of each column of *cols* over its row index.
 
-    Used only as a cheap, grid-spacing-independent diagnostic of how much the
-    taper has changed the width of a distribution.
+    Used only as a cheap, grid-spacing-independent diagnostic of how much a
+    conditioning step has changed the width of a distribution.
     """
     position = np.arange(cols.shape[0])[:, None]
     total = cols.sum(axis=0)
     with np.errstate(invalid="ignore", divide="ignore"):
         mean = (cols * position).sum(axis=0) / total
         return (cols * (position - mean) ** 2).sum(axis=0) / total
+
+
+def _as_columns(f: np.ndarray, axis: int = VELOCITY_AXIS) -> np.ndarray:
+    """Flatten *f* to ``(n_velocity, n_slice)`` with velocity leading."""
+    moved = np.moveaxis(np.asarray(f, dtype=np.float64), axis, 0)
+    return moved.reshape(moved.shape[0], -1)
+
+
+def _worst_variance_growth(
+    before: np.ndarray,
+    after: np.ndarray,
+    valid: np.ndarray | None = None,
+) -> float | None:
+    """
+    Largest fractional second-moment growth over appreciably populated columns.
+
+    Both arguments are ``(n_velocity, n_slice)``, as returned by `_as_columns`.
+    Columns carrying less than 1% of the heaviest column's weight are dropped:
+    a nearly empty cell in vacuum has a near-zero width to begin with, so any
+    kernel multiplies it enormously and the check would drown in false alarms.
+
+    Returns `None` when no column carries enough weight to judge.
+    """
+    weight = np.clip(before, 0.0, None).sum(axis=0)
+    if weight.size == 0 or not np.any(weight > 0):
+        return None
+    significant = weight > 0.01 * weight.max()
+    if valid is not None:
+        significant &= valid
+    if not significant.any():
+        return None
+
+    was = _index_space_variance(np.clip(before[:, significant], 0.0, None))
+    now = _index_space_variance(np.clip(after[:, significant], 0.0, None))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        growth = np.where(was > 0, now / was - 1.0, 0.0)
+    return float(np.nanmax(growth)) if growth.size else None
+
+
+def _narrowest_width(f, v, axis: int = VELOCITY_AXIS) -> float | None:
+    """
+    Standard deviation of the narrowest appreciably populated slice of *f*.
+
+    A boxcar smoother adds the same velocity variance to every slice whatever
+    its width, so a window expressed in thermal speeds has to be sized against
+    the slice that can least afford it. Returns `None` when nothing is
+    populated enough to measure.
+    """
+    clean = np.nan_to_num(np.asarray(f, dtype=np.float64))
+    cols = np.clip(_as_columns(clean, axis), 0.0, None)
+    v = np.asarray(v, dtype=np.float64)
+    weight = np.trapezoid(cols, v, axis=0)
+    if weight.size == 0 or not np.any(weight > 0):
+        return None
+    cols = cols[:, weight > 0.01 * weight.max()]
+    if cols.shape[1] == 0:
+        return None
+
+    norm = np.trapezoid(cols, v, axis=0)
+    column_v = v[:, None]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.trapezoid(cols * column_v, v, axis=0) / norm
+        variance = np.trapezoid(cols * (column_v - mean) ** 2, v, axis=0) / norm
+    variance = variance[np.isfinite(variance) & (variance > 0)]
+    return float(np.sqrt(variance.min())) if variance.size else None
 
 
 def taper_vdf_edges(
@@ -819,16 +966,9 @@ def taper_vdf_edges(
     # Judge the pedestal only on columns that carry appreciable weight: an
     # almost-empty cell in vacuum has a near-zero variance to begin with, so any
     # taper multiplies it enormously and would drown the check in false alarms.
-    weight = np.clip(cols, 0.0, None).sum(axis=0)
-    significant = valid & (weight > 0.01 * weight.max()) if weight.size else valid
-
-    if pedestal_warning is not None and significant.any():
-        before = _index_space_variance(np.clip(cols[:, significant], 0.0, None))
-        after = _index_space_variance(np.clip(out[:, significant], 0.0, None))
-        with np.errstate(invalid="ignore", divide="ignore"):
-            growth = np.where(before > 0, after / before - 1.0, 0.0)
-        worst = float(np.nanmax(growth)) if growth.size else 0.0
-        if worst > pedestal_warning:
+    if pedestal_warning is not None:
+        worst = _worst_variance_growth(cols, out, valid)
+        if worst is not None and worst > pedestal_warning:
             warnings.warn(
                 f"taper_vdf_edges: the taper widened the second moment of at "
                 f"least one slice by {worst:.0%}. The distribution likely "
@@ -841,6 +981,291 @@ def taper_vdf_edges(
             )
 
     return np.moveaxis(out.reshape(moved_shape), 0, axis)
+
+
+def _outermost(mask: np.ndarray, *, side_right: bool) -> np.ndarray:
+    """Index of the outermost `True` per column, or -1 where there is none."""
+    n_v = mask.shape[0]
+    present = mask.any(axis=0)
+    if side_right:
+        index = n_v - 1 - np.argmax(mask[::-1, :], axis=0)
+    else:
+        index = np.argmax(mask, axis=0)
+    return np.where(present, index, -1)
+
+
+def _weighted_line(x, y, w) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""
+    Weighted least-squares fit of *y* on *x*, per column.
+
+    Returns slope, intercept, and the standard error of the slope. The weights
+    are particle counts, and the variance of :math:`\ln f` for a bin holding
+    :math:`N` particles is :math:`1/N`, so :math:`w = N` is the inverse-variance
+    weighting and :math:`\mathrm{var}(b) = S_w / D` needs no rescaling.
+
+    Everything comes back `~numpy.nan` where the normal equations are singular,
+    which is what ``min_fit_bins`` and the fallback in `extend_vdf_tail` catch.
+    """
+    s_w = w.sum(axis=0)
+    s_x = (w * x).sum(axis=0)
+    s_y = (w * y).sum(axis=0)
+    s_xx = (w * x * x).sum(axis=0)
+    s_xy = (w * x * y).sum(axis=0)
+    denominator = s_w * s_xx - s_x**2
+    solvable = np.abs(denominator) > 0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        slope = np.where(solvable, (s_w * s_xy - s_x * s_y) / denominator, np.nan)
+        intercept = np.where(solvable, (s_y - slope * s_x) / s_w, np.nan)
+        error = np.where(solvable, np.sqrt(s_w / denominator), np.nan)
+    return slope, intercept, error
+
+
+def extend_vdf_tail(  # noqa: PLR0915
+    f,
+    v,
+    counts=None,
+    *,
+    min_counts: float = 10.0,
+    fit_from: float = 1.0,
+    min_fit_bins: int = 8,
+    axis: int = VELOCITY_AXIS,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    r"""
+    Replace the unsampled tails of a PIC distribution with a fitted Maxwellian.
+
+    Beyond its last macroparticle a PIC histogram is not a measurement, and the
+    electron-plasma-wave satellite of a Thomson spectrum reads :math:`f_e` at
+    :math:`\sqrt{\alpha^2 + 3}` thermal speeds -- routinely further out than any
+    achievable particle count reaches. Something has to fill that in. This
+    replaces it with the distribution's own extrapolated tail rather than with
+    the rolloff-to-zero of `taper_vdf_edges`.
+
+    For each velocity slice, and each side of it independently:
+
+    1. The macroparticle quantum is the smallest positive value in the slice --
+       one particle's worth -- so ``f / quantum`` is a particle count.
+    2. The **join** is the outermost bin holding at least *min_counts*
+       particles. Inside it the histogram is data; outside it is not.
+    3. A Maxwellian :math:`\ln f = a - (v - \bar{v})^2 / 2\sigma_t^2` is fitted
+       by weighted least squares between *fit_from* thermal speeds and the join,
+       weighted by particle count, which is the right weight because the
+       variance of :math:`\ln f` is :math:`1/N`.
+    4. Beyond the join the fit replaces the data, anchored to pass through the
+       value at the join, so both the distribution and its slope are continuous.
+
+    Parameters
+    ----------
+    f : array_like
+        Phase-space density, smoothed if it is going to be.
+    v : array_like
+        Velocity axis, matching ``f.shape[axis]``.
+    counts : array_like, optional
+        The **raw** histogram, before smoothing, from which the macroparticle
+        quantum is taken. Smoothing mixes bins and destroys it. Defaults to *f*,
+        which is only right when no smoothing was applied.
+    min_counts : `float`
+        Particles a bin needs before it counts as measured. The default, 10,
+        is a 30% counting error.
+    fit_from : `float`
+        Inner edge of the fitting band, in thermal speeds from the slice mean.
+        Keeping the core out of it lets a suprathermal tail be seen; the
+        satellite reads the tail, not the core.
+    min_fit_bins : `int`
+        Bins the band needs before the fit is trusted. Below it, or if the fit
+        comes back with a non-decaying tail, the slice falls back to its own
+        core temperature -- a Maxwellian at the measured :math:`\sigma`, which
+        is the assumption a fit cannot improve on when there is no signal.
+    axis : `int`
+        Axis of *f* holding velocity.
+
+    Returns
+    -------
+    extended : `~numpy.ndarray`
+        The distribution, same shape as *f*.
+    info : `dict`
+        What the extension did: median join on each side in thermal speeds,
+        median ratio of fitted tail width to core width, and the fraction of
+        slices that fell back to the core temperature. A ratio above one is a
+        suprathermal tail; a fallback fraction near one means the run has no
+        resolved tail to fit and the electron feature is entirely an assumption.
+
+    Notes
+    -----
+    This does the job `taper_vdf_edges` was doing -- removing the discontinuity
+    where the sampled distribution stops -- and does it with a shape, a slope
+    and an extent that come from the data instead of from ``max_taper_bins``.
+    Nothing is set to zero, so no positive floor is needed afterwards, and a
+    floor would in any case reintroduce a flat pedestal exactly where the
+    satellite reads.
+
+    Slices that are empty, or whose join sits at the edge of the grid, are
+    returned unchanged.
+    """
+    if min_counts <= 0:
+        raise ValueError(f"min_counts must be positive; got {min_counts}.")
+    if fit_from < 0:
+        raise ValueError(f"fit_from must be non-negative; got {fit_from}.")
+
+    f = np.asarray(f, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    moved = np.moveaxis(f, axis, 0)
+    moved_shape = moved.shape
+    cols = np.clip(moved.reshape(moved_shape[0], -1), 0.0, None).copy()
+    n_v, n_cols = cols.shape
+
+    raw = cols if counts is None else np.clip(_as_columns(counts, axis), 0.0, None)
+    if raw.shape != cols.shape:
+        raise ValueError(
+            f"counts has shape {raw.shape} against f's {cols.shape}; they must "
+            f"be the same histogram before and after smoothing."
+        )
+
+    # One particle's worth, per slice. inf marks a slice with nothing in it.
+    quantum = np.where(raw > 0, raw, np.inf).min(axis=0)
+    peak = raw.max(axis=0)
+    # A counted histogram has a smallest positive value that is one particle, so
+    # its dynamic range is the particle count -- large, but nothing like the 300
+    # decades an analytic distribution evaluated on a wide grid spans. A slice
+    # over the limit was not built by counting anything, has no ragged edge to
+    # join at, and is left alone.
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        counted = np.isfinite(quantum) & (
+            peak / np.where(quantum > 0, quantum, np.inf) < _MAX_DYNAMIC_RANGE
+        )
+    usable = counted & (cols.max(axis=0) > 0)
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        particles = np.where(usable, raw / np.where(usable, quantum, 1.0), 0.0)
+
+    total = np.trapezoid(cols, v, axis=0)
+    populated = usable & (total > 0)
+    mean = np.zeros(n_cols)
+    sigma = np.zeros(n_cols)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean[populated] = (
+            np.trapezoid(cols[:, populated] * v[:, None], v, axis=0) / total[populated]
+        )
+        sigma[populated] = np.sqrt(
+            np.trapezoid(
+                cols[:, populated] * (v[:, None] - mean[populated]) ** 2, v, axis=0
+            )
+            / total[populated]
+        )
+    populated &= sigma > 0
+
+    offset = v[:, None] - mean
+    x = offset**2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_f = np.where(cols > 0, np.log(np.where(cols > 0, cols, 1.0)), 0.0)
+
+    out = cols.copy()
+    diagnostics: dict[str, list[float]] = {
+        "join": [],
+        "ratio": [],
+        "error": [],
+        "step": [],
+    }
+    fallbacks = 0
+    considered = 0
+    index = np.arange(n_v)[:, None]
+
+    for side_right in (False, True):
+        side = (offset > 0) if side_right else (offset < 0)
+        measured = side & (particles >= min_counts) & populated
+        # A slice too sparse to reach min_counts anywhere still has to join
+        # somewhere; use its outermost occupied bin and let the fit fail over to
+        # the core temperature.
+        sparse = side & (particles > 0) & populated
+        join = _outermost(measured, side_right=side_right)
+        join = np.where(join >= 0, join, _outermost(sparse, side_right=side_right))
+
+        active = populated & (join >= 0)
+        if side_right:
+            active &= join < n_v - 1
+        else:
+            active &= join > 0
+        if not active.any():
+            continue
+
+        band = (
+            side
+            & (x >= (fit_from * sigma) ** 2)
+            & (cols > 0)
+            & active
+            & ((index <= join) if side_right else (index >= join))
+        )
+        weights = np.where(band, particles, 0.0)
+        slope, fit_intercept, slope_error = _weighted_line(x, log_f, weights)
+
+        core_slope = np.divide(-0.5, sigma**2, out=np.zeros(n_cols), where=sigma > 0)
+        enough = band.sum(axis=0) >= min_fit_bins
+        fitted = enough & np.isfinite(slope) & (slope < 0)
+        slope = np.where(fitted, slope, core_slope)
+
+        considered += int(active.sum())
+        fallbacks += int((active & ~fitted).sum())
+
+        join_index = np.clip(join, 0, n_v - 1)
+        anchor_x = np.take_along_axis(x, join_index[None, :], axis=0)[0]
+        anchor_log = np.take_along_axis(log_f, join_index[None, :], axis=0)[0]
+        # The fit's own intercept, not the value in the join bin. The join is
+        # by construction the outermost bin still holding min_counts, so it is a
+        # selected upward fluctuation: anchoring there biases the whole tail
+        # high, by 20-30% on a sampled Maxwellian. Where the fit failed there is
+        # no intercept to use, so the core-temperature fallback anchors at the
+        # join and wears the bias.
+        intercept = np.where(fitted, fit_intercept, anchor_log - slope * anchor_x)
+
+        beyond = active & ((index > join) if side_right else (index < join))
+        with np.errstate(over="ignore", under="ignore"):
+            model = np.exp(np.clip(intercept + slope * x, -700.0, 700.0))
+        out = np.where(beyond, model, out)
+
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            reach = np.abs(v[join_index] - mean) / sigma
+            tail_sigma = np.sqrt(
+                np.divide(-0.5, slope, out=np.zeros_like(slope), where=slope < 0)
+            )
+            # sigma_t = sqrt(-1/2b), so d(sigma_t)/sigma_t = |db / 2b|.
+            width_error = np.divide(
+                slope_error,
+                2.0 * np.abs(slope),
+                out=np.full_like(slope, np.nan),
+                where=slope < 0,
+            )
+            step = np.exp(
+                np.clip(intercept + slope * anchor_x - anchor_log, -700.0, 700.0)
+            )
+            ratio = np.divide(
+                tail_sigma,
+                sigma,
+                out=np.full_like(sigma, np.nan),
+                where=sigma > 0,
+            )
+        keep = active & fitted
+        diagnostics["join"].extend(reach[active].tolist())
+        diagnostics["ratio"].extend(ratio[keep].tolist())
+        diagnostics["error"].extend(width_error[keep].tolist())
+        diagnostics["step"].extend(step[keep].tolist())
+
+    def median(values):
+        finite = [value for value in values if np.isfinite(value)]
+        return float(np.median(finite)) if finite else None
+
+    info = {
+        "model": "maxwellian",
+        "min_counts": min_counts,
+        "join_thermal_speeds": median(diagnostics["join"]),
+        "tail_over_core_width": median(diagnostics["ratio"]),
+        "tail_width_error": median(diagnostics["error"]),
+        "counted_fraction": (
+            float(np.mean(counted[cols.max(axis=0) > 0]))
+            if np.any(cols.max(axis=0) > 0)
+            else None
+        ),
+        "join_step": median(diagnostics["step"]),
+        "fallback_fraction": (fallbacks / considered) if considered else None,
+    }
+    return np.moveaxis(out.reshape(moved_shape), 0, axis), info
 
 
 def rescale_velocity_axis(
@@ -913,6 +1338,126 @@ def rescale_velocity_axis(
     return target_v, interpolate(target_v) * scale
 
 
+def rescale_vdf_drift(
+    f,
+    v,
+    scale: float,
+    axis: int = VELOCITY_AXIS,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    r"""
+    Divide the bulk velocity of a distribution by *scale*, leaving its width alone.
+
+    A reduced-mass-ratio simulation gets its ion-scale flow wrong by
+    :math:`\sqrt{R}` while its electron thermal speed -- real :math:`m_e`, and a
+    temperature the deck declares physical -- is already right. Those two live in
+    the same array, so `rescale_velocity_axis` cannot fix one without ruining the
+    other: dividing the whole axis takes :math:`T_e` down by :math:`R` and drags
+    :math:`\alpha` up by :math:`\sqrt{R}`.
+
+    Translating each slice does fix it. Writing :math:`f(v) = g(v - \bar{v})`
+    with :math:`g` the distribution in its own rest frame, the map
+
+    .. math::
+
+       f(v) \rightarrow f\!\left(v - \bar{v}\left(\tfrac{1}{s} - 1\right)\right)
+
+    moves the mean from :math:`\bar{v}` to :math:`\bar{v}/s` and leaves
+    :math:`g` -- and so every central moment, the temperature included --
+    exactly as it was.
+
+    Parameters
+    ----------
+    f : array_like
+        Phase-space density.
+    v : array_like
+        Velocity axis, matching ``f.shape[axis]``.
+    scale : `float`
+        Divide the bulk velocity by this. For a mass-ratio reduction
+        :math:`R = m_\mathrm{phys}/m_\mathrm{sim}` it is :math:`\sqrt{R}`, the
+        same factor `rescale_velocity_axis` applies to the whole axis.
+    axis : `int`
+        Axis of *f* holding velocity.
+
+    Returns
+    -------
+    shifted : `~numpy.ndarray`
+        The distribution, same shape and same velocity axis as *f*.
+    info : `dict`
+        The largest shift applied, in m/s and in bins, and the largest fraction
+        of a slice's weight that fell off the end of the grid.
+
+    Notes
+    -----
+    This is the right correction only where the thermal scale is **already
+    physical** and the bulk scale is not, which is what a run with
+    ``species_type = electron`` and a reduced ion mass gives. Where both are
+    wrong by the same factor -- the ions of such a run, or every species of a
+    fully similarity-scaled one -- `rescale_velocity_axis` is what is wanted,
+    since it fixes the width too.
+
+    It cannot restore the *ratio* of drift to thermal speed that the reduced mass
+    ratio changed: the simulated plasma really does have a thinner current layer
+    in units of :math:`d_e` and a faster drift in units of :math:`v_{te}`. What
+    it does is put the Doppler shift where the physical plasma would put it,
+    which is what the spectrum's line centre depends on.
+
+    Slices with no weight are returned unchanged.
+    """
+    if scale <= 0:
+        raise ValueError(f"scale must be positive; got {scale}.")
+
+    f = np.asarray(f, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    moved = np.moveaxis(f, axis, 0)
+    moved_shape = moved.shape
+    cols = moved.reshape(moved_shape[0], -1)
+
+    total = np.trapezoid(np.clip(cols, 0.0, None), v, axis=0)
+    populated = np.isfinite(total) & (total > 0)
+    out = cols.copy()
+    worst_shift = 0.0
+    worst_loss = 0.0
+
+    if populated.any():
+        mean = np.zeros(cols.shape[1])
+        mean[populated] = (
+            np.trapezoid(np.clip(cols[:, populated], 0.0, None) * v[:, None], v, axis=0)
+            / total[populated]
+        )
+        # Move the mean to mean/scale, i.e. translate by mean*(1/scale - 1).
+        shifts = mean * (1.0 / scale - 1.0)
+        for column in np.nonzero(populated)[0]:
+            shift = float(shifts[column])
+            if shift == 0.0:
+                continue
+            # f_new(v) = f_old(v - shift), so sample the old distribution at
+            # v - shift. Off the end of the grid there is nothing to sample.
+            out[:, column] = np.interp(
+                v - shift, v, cols[:, column], left=0.0, right=0.0
+            )
+            worst_shift = max(worst_shift, abs(shift))
+            kept = np.trapezoid(np.clip(out[:, column], 0.0, None), v)
+            worst_loss = max(worst_loss, 1.0 - kept / total[column])
+
+    spacing = float(np.diff(v).mean())
+    info = {
+        "drift_scale": scale,
+        "max_shift_m_per_s": worst_shift,
+        "max_shift_bins": worst_shift / spacing if spacing > 0 else float("nan"),
+        "max_weight_lost": max(worst_loss, 0.0),
+    }
+    if info["max_weight_lost"] > _CLIP_WARNING_FRACTION:
+        warnings.warn(
+            f"rescaling the bulk velocity by {scale:.4g} shifted at least one "
+            f"slice off the end of its velocity grid, losing "
+            f"{100 * info['max_weight_lost']:.2f}% of its weight. The grid was "
+            f"sized around the unshifted distribution; widen velocity_range.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return np.moveaxis(out.reshape(moved_shape), 0, axis), info
+
+
 def species_presence_mask(
     density,
     reference_density: float,
@@ -943,16 +1488,137 @@ def species_presence_mask(
     return np.asarray(density) > threshold * reference_density
 
 
-def condition_phase_space(
+def _sampled_tail_in_widths(
+    raw: "PICPhaseSpace", conditioned: "PICPhaseSpace"
+) -> np.ndarray:
+    r"""
+    How far the code's own histogram reaches, in thermal widths, per timestep.
+
+    The numerator is the largest :math:`|v - \bar{v}|` at which the **raw**
+    histogram still holds a macroparticle: past it the code sampled nothing, and
+    everything the forward model reads is conditioning. The denominator is the
+    standard deviation of the **conditioned** distribution, which is the width
+    the model itself works from. Both phase spaces must already be reduced to a
+    single spatial point.
+
+    Any velocity rescale is undone from the conditioned side's own record, so
+    that a pre-conditioned phase space passed through ``{"skip": True}`` is
+    handled as well as one this module rescaled.
+    """
+    applied = conditioned.meta.get("conditioning", {}).get("velocity_scale_factor")
+    scale = 1.0 if applied is None else float(np.sqrt(applied))
+
+    f_raw = np.clip(np.nan_to_num(raw.f[:, :, 0]), 0.0, None)
+    v_raw = np.asarray(raw.v, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = (f_raw * v_raw).sum(axis=1) / f_raw.sum(axis=1)
+        offsets = np.abs(v_raw[None, :] - mean[:, None])
+        reach = np.where(f_raw > 0, offsets, -np.inf).max(axis=1) / scale
+
+    f_c = np.clip(np.nan_to_num(conditioned.f[:, :, 0]), 0.0, None)
+    v_c = np.asarray(conditioned.v, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        norm = np.trapezoid(f_c, v_c, axis=1)
+        centre = np.trapezoid(f_c * v_c, v_c, axis=1) / norm
+        width = np.sqrt(
+            np.trapezoid(f_c * (v_c - centre[:, None]) ** 2, v_c, axis=1) / norm
+        )
+        ratio = reach / width
+
+    return np.where(np.isfinite(ratio), ratio, np.nan)
+
+
+def _width_in_bins(
+    phase_space: "PICPhaseSpace", width: float, what: str = "window"
+) -> int:
+    """
+    Convert a width in thermal speeds into velocity bins.
+
+    Sized against the narrowest appreciably populated slice, so that no slice
+    gets more than the requested fraction of its own width. Falls back to a
+    single bin -- a no-op for both the smoother and the taper -- when nothing is
+    populated enough to measure, since guessing a width there would be worse
+    than doing nothing.
+    """
+    if width <= 0:
+        raise ValueError(f"{what} width must be positive; got {width}.")
+
+    if not np.any(np.clip(np.nan_to_num(phase_space.f), 0.0, None) > 0):
+        # Nothing here to smooth or taper -- a species absent from the sampled
+        # point, which is ordinary rather than a problem. Say nothing.
+        return 1
+
+    sigma = _narrowest_width(phase_space.f, phase_space.v)
+    spacing = float(np.diff(np.asarray(phase_space.v, dtype=np.float64)).mean())
+    bins = (
+        0.0
+        if sigma is None or not np.isfinite(sigma) or spacing <= 0
+        else width * sigma / spacing
+    )
+    if bins < 1.0:
+        # Asking for less than one bin means the grid cannot resolve the
+        # distribution it is carrying, which is worth saying even though the
+        # answer -- do nothing -- is the safe one.
+        warnings.warn(
+            f"condition_phase_space: {width} thermal speeds is under one "
+            f"velocity bin for species {phase_space.label!r}, so the {what} was "
+            f"skipped. Its narrowest populated slice is not resolved by the "
+            f"grid it was dumped on. Give the width in bins to override.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+        return 1
+    return round(bins)
+
+
+def _resolve_smoothing_window(
+    phase_space: "PICPhaseSpace",
+    *,
+    window: int | None,
+    width: float | None,
+    iterations: int,
+) -> int:
+    """
+    Settle on a boxcar width in bins for `condition_phase_space`.
+
+    A width in thermal speeds is turned into bins against the narrowest
+    appreciably populated slice, so that no slice is smoothed by more than the
+    requested fraction of its own width.
+    """
+    if window is not None and width is not None:
+        raise ValueError(
+            "pass either smoothing_window (in velocity bins) or smoothing_width "
+            "(in thermal speeds), not both."
+        )
+    if window is not None:
+        return window
+    if iterations <= 0:
+        # The window is unused; anything valid will do.
+        return 1
+    return _width_in_bins(
+        phase_space,
+        DEFAULT_SMOOTHING_WIDTH if width is None else width,
+        "smoothing window",
+    )
+
+
+def condition_phase_space(  # noqa: C901
     phase_space: PICPhaseSpace,
     *,
-    smoothing_window: int = 40,
+    smoothing_window: int | None = None,
+    smoothing_width: float | None = None,
     smoothing_iterations: int = 0,
+    smoothing_variance_warning: float | None = 0.05,
+    tail_model: str | None = "maxwellian",
+    tail_min_counts: float = 10.0,
+    tail_fit_from: float = 1.0,
     taper_threshold: float | None = 0.005,
     max_taper_bins: int | None = None,
+    max_taper_width: float | None = None,
     pedestal_warning: float | None = 0.05,
-    floor: float = DEFAULT_FLOOR,
+    floor: float | None = None,
     velocity_scale_factor: float | None = None,
+    drift_scale_factor: float | None = None,
     target_velocity_axis=None,
 ) -> PICPhaseSpace:
     r"""
@@ -966,20 +1632,34 @@ def condition_phase_space(
     ----------
     phase_space : `PICPhaseSpace`
         The raw phase space.
-    smoothing_window : `int`
-        Boxcar width in velocity bins, passed to `smooth_vdf`.
+    smoothing_window : `int`, optional
+        Boxcar width in velocity bins, passed to `smooth_vdf`. Mutually exclusive
+        with *smoothing_width*, which is the safer way to ask for the same thing.
+    smoothing_width : `float`, optional
+        Boxcar width in thermal speeds, converted to bins against the narrowest
+        appreciably populated slice of *phase_space*. When smoothing is requested
+        and neither width nor window is given, this defaults to
+        ``DEFAULT_SMOOTHING_WIDTH``.
     smoothing_iterations : `int`
         Number of boxcar passes. Defaults to ``0`` -- no smoothing -- because the
         right amount differs between species: electron distributions usually need a
         few passes, while smoothing ions washes out the narrow IAW feature. Set it
         per species rather than relying on a default.
+    smoothing_variance_warning : `float`, optional
+        Passed to `smooth_vdf` as ``variance_warning``; `None` silences its check.
     taper_threshold : `float`, optional
         Passed to `taper_vdf_edges` as ``threshold_frac``. Set to `None` to skip
         tapering.
     max_taper_bins : `int`, optional
         Bounds the taper rolloff, passed to `taper_vdf_edges`. Worth setting when
         the distribution occupies only a small part of the velocity grid; see the
-        notes on `taper_vdf_edges`.
+        notes on `taper_vdf_edges`. Mutually exclusive with *max_taper_width*.
+    max_taper_width : `float`, optional
+        The same bound given in thermal speeds rather than bins, converted
+        against the narrowest appreciably populated slice. A rolloff in bins has
+        the same trouble as a smoothing window in bins: how much width it adds
+        depends on how wide the code's velocity grid happens to be. About 0.5
+        keeps the second moment inside a few percent.
     pedestal_warning : `float`, optional
         Passed to `taper_vdf_edges`; `None` silences its pedestal check.
     floor : `float`
@@ -988,6 +1668,14 @@ def condition_phase_space(
         Mass-ratio reduction factor :math:`R`. When given, all velocities are
         divided by :math:`\sqrt{R}` via `rescale_velocity_axis`. Omit -- the
         default -- to leave velocities as the simulation reports them.
+    drift_scale_factor : `float`, optional
+        Mass-ratio reduction factor :math:`R` applied to the **bulk velocity
+        only**, via `rescale_vdf_drift`: each slice is translated so that its
+        mean is divided by :math:`\sqrt{R}` while its width, and so its
+        temperature, is untouched. This is what a species whose thermal scale is
+        already physical but whose flow is not -- the kinetic electrons of a
+        reduced-ion-mass run -- needs instead of *velocity_scale_factor*.
+        Mutually exclusive with it.
     target_velocity_axis : array_like, optional
         Velocity grid to resample onto when *velocity_scale_factor* is given.
 
@@ -995,28 +1683,96 @@ def condition_phase_space(
     -------
     `PICPhaseSpace`
         A new phase space; the input is not modified.
+
+    Notes
+    -----
+    Prefer *smoothing_width* to *smoothing_window*. A boxcar in bins adds a fixed
+    velocity variance -- an additive temperature -- whose size relative to the
+    plasma depends entirely on how wide the code's velocity grid happens to be,
+    and that ratio changes through a run as the plasma heats. See the warning on
+    `smooth_vdf`. The window this resolves to is recorded in the returned
+    ``meta["conditioning"]``.
     """
-    f = smooth_vdf(
-        phase_space.f,
+    window = _resolve_smoothing_window(
+        phase_space,
         window=smoothing_window,
+        width=smoothing_width,
         iterations=smoothing_iterations,
     )
-    if taper_threshold is not None:
+    if tail_model is not None and tail_model != "maxwellian":
+        raise ValueError(
+            f"tail_model must be 'maxwellian' or None; got {tail_model!r}."
+        )
+    # A reconstructed distribution is already its own tail model -- there is no
+    # last macroparticle to join at, and no counts to find one with.
+    analytic = bool(phase_space.meta.get("analytic_tail", False))
+    extending = tail_model is not None and not analytic
+    if floor is None:
+        # With a modelled tail there is nothing to floor, and a floor would
+        # reintroduce a flat pedestal exactly where the satellite reads: a
+        # Maxwellian crosses 1e-30 at about 12 thermal speeds.
+        floor = 0.0 if tail_model is not None else DEFAULT_FLOOR
+
+    f = smooth_vdf(
+        phase_space.f,
+        window=window,
+        iterations=smoothing_iterations,
+        variance_warning=smoothing_variance_warning,
+    )
+    if max_taper_bins is not None and max_taper_width is not None:
+        raise ValueError(
+            "pass either max_taper_bins (in velocity bins) or max_taper_width "
+            "(in thermal speeds), not both."
+        )
+    taper_bins = max_taper_bins
+    # Only resolve the rolloff when it is going to be used; with a modelled tail
+    # there is no taper, and sizing one would warn about a grid nothing reads.
+    if max_taper_width is not None and not extending:
+        taper_bins = _width_in_bins(phase_space, max_taper_width, "taper rolloff")
+
+    tail_info: dict[str, Any] | None = None
+    if extending:
+        f, tail_info = extend_vdf_tail(
+            f,
+            phase_space.v,
+            counts=phase_space.f,
+            min_counts=tail_min_counts,
+            fit_from=tail_fit_from,
+        )
+    elif taper_threshold is not None:
         f = taper_vdf_edges(
             f,
             threshold_frac=taper_threshold,
-            max_taper_bins=max_taper_bins,
+            max_taper_bins=taper_bins,
             pedestal_warning=pedestal_warning,
         )
+    drift_info = None
+    if drift_scale_factor is not None:
+        if velocity_scale_factor is not None:
+            raise ValueError(
+                "pass either velocity_scale_factor, which divides every "
+                "velocity by sqrt(R) and so rescales the temperature too, or "
+                "drift_scale_factor, which moves only the bulk velocity and "
+                "leaves the temperature alone -- not both."
+            )
+        f, drift_info = rescale_vdf_drift(
+            f, phase_space.v, float(np.sqrt(drift_scale_factor))
+        )
+
     f = normalize_vdf(f, phase_space.v)
-    f = np.clip(f, a_min=floor, a_max=None)
+    if floor > 0:
+        f = np.clip(f, a_min=floor, a_max=None)
 
     v = phase_space.v
     conditioning = {
-        "smoothing_window": smoothing_window,
+        "smoothing_window": window,
+        "smoothing_width": smoothing_width,
         "smoothing_iterations": smoothing_iterations,
-        "taper_threshold": taper_threshold,
-        "max_taper_bins": max_taper_bins,
+        "tail": tail_info,
+        "taper_threshold": None if extending else taper_threshold,
+        "max_taper_bins": None if extending else taper_bins,
+        "max_taper_width": None if extending else max_taper_width,
+        "drift": drift_info,
         "floor": floor,
     }
 
@@ -1096,6 +1852,24 @@ class ThomsonSpectrogram:
     electron_present, ion_present : `~numpy.ndarray`
         Boolean, shape ``(n_population, n_time)``: whether each population was
         included at each timestep.
+    epw_tail_ratio : `~numpy.ndarray`
+        Shape ``(n_electron_population, n_time)``: how far the code's own
+        histogram reaches into the tail of each electron population, in thermal
+        widths of the conditioned distribution.
+    epw_tail_required : `~numpy.ndarray`
+        Shape ``(n_time,)``: how far the EPW satellite needs to read,
+        :math:`\sqrt{\alpha^2 + 3}` thermal widths at the conventional
+        :math:`\alpha = 1/(k\lambda_{De})`.
+    epw_resolved : `~numpy.ndarray`
+        Boolean, shape ``(n_time,)``: `True` where every present electron
+        population reaches the resonance, so that the EPW feature is read
+        straight off the sampled distribution. See the notes on
+        `spectra_from_phase_spaces`.
+    epw_tail_uncertainty : `~numpy.ndarray`
+        Shape ``(n_time,)``: the factor by which the EPW amplitude is uncertain
+        where the resonance is being extrapolated to, from the standard error of
+        the fitted tail width. ``1`` where nothing is extrapolated, `~numpy.nan`
+        where the tail was tapered rather than fitted and no error is defined.
     position : `float`
         Requested sampling position, in m.
     electron_labels, ion_labels : `list` of `str`
@@ -1126,7 +1900,28 @@ class ThomsonSpectrogram:
     iaw: np.ndarray | None = None
     iaw_wavelengths: np.ndarray | None = None
     alpha_iaw: np.ndarray | None = None
+    epw_tail_ratio: np.ndarray | None = None
+    epw_tail_required: np.ndarray | None = None
+    epw_resolved: np.ndarray | None = None
+    epw_tail_uncertainty: np.ndarray | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Fill in the tail diagnostic for spectrograms made without one."""
+        # A spectrogram built by hand, or read back from a file written before
+        # the check existed, records nothing about the tail. Leave it unassessed
+        # -- NaN ratios, resolved everywhere -- rather than claiming a verdict.
+        n_time = self.t.size
+        n_electrons = len(self.electron_labels)
+        blanks = {
+            "epw_tail_ratio": np.full((n_electrons, n_time), np.nan),
+            "epw_tail_required": np.full(n_time, np.nan),
+            "epw_resolved": np.ones(n_time, dtype=bool),
+            "epw_tail_uncertainty": np.full(n_time, np.nan),
+        }
+        for name, blank in blanks.items():
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, blank)
 
     @property
     def n_time(self) -> int:
@@ -1233,7 +2028,7 @@ class ThomsonSpectrogram:
             },
         )
 
-    def to_hdf5(self, path) -> None:
+    def to_hdf5(self, path) -> None:  # noqa: PLR0915
         r"""
         Write the spectrogram to a self-describing HDF5 file.
 
@@ -1277,6 +2072,25 @@ class ThomsonSpectrogram:
             )
             if self.alpha_iaw is not None:
                 alpha.create_dataset("alpha_iaw", data=self.alpha_iaw)
+
+            tail = handle.create_group("EPW_TAIL")
+            entry = tail.create_dataset("ratio", data=self.epw_tail_ratio)
+            entry.attrs["UNITS"] = "thermal widths of the conditioned distribution"
+            entry = tail.create_dataset("required", data=self.epw_tail_required)
+            entry.attrs["UNITS"] = "thermal widths"
+            entry = tail.create_dataset(
+                "amplitude_uncertainty", data=self.epw_tail_uncertainty
+            )
+            entry.attrs["MEANING"] = (
+                "factor by which the EPW amplitude is uncertain where the "
+                "resonance is extrapolated past the sampled tail"
+            )
+            entry = tail.create_dataset("resolved", data=self.epw_resolved)
+            entry.attrs["MEANING"] = (
+                "the EPW satellite reads f_e inside the velocity range the "
+                "simulation sampled, so it is a measurement rather than a "
+                "property of the taper and the floor"
+            )
 
             density = handle.create_group("DENSITY")
             entry = density.create_dataset("dens", data=self.electron_density)
@@ -1345,6 +2159,9 @@ class ThomsonSpectrogram:
             spectra = handle["SPECTRA"]
             populations = handle["POPULATIONS"]
             has_iaw = "IAW" in spectra
+            # Absent from files written before the check existed; __post_init__
+            # then leaves the diagnostic unassessed rather than inventing one.
+            tail = handle.get("EPW_TAIL")
             return cls(
                 epw=spectra["EPW/epws"][()],
                 epw_wavelengths=spectra["EPW/wavelengths"][()],
@@ -1360,6 +2177,14 @@ class ThomsonSpectrogram:
                 ifract=populations["ifract"][()],
                 electron_present=populations["electron_present"][()],
                 ion_present=populations["ion_present"][()],
+                epw_tail_ratio=None if tail is None else tail["ratio"][()],
+                epw_tail_required=None if tail is None else tail["required"][()],
+                epw_resolved=None if tail is None else tail["resolved"][()],
+                epw_tail_uncertainty=(
+                    None
+                    if tail is None or "amplitude_uncertainty" not in tail
+                    else tail["amplitude_uncertainty"][()]
+                ),
                 position=float(handle.attrs["POSITION"]),
                 electron_labels=decode(populations["electron_labels"][()]),
                 ion_labels=decode(populations["ion_labels"][()]),
@@ -1537,6 +2362,55 @@ def _fractions(densities: np.ndarray) -> np.ndarray:
     return np.divide(densities, total, out=np.zeros_like(densities), where=total > 0)
 
 
+def _satellite_offset(alpha, electron_density, probe_wavelength) -> float:
+    r"""
+    Distance from the probe line to the Bohm--Gross satellite, in nm.
+
+    The forward model reports :math:`\alpha = \sqrt{2}\,\omega_{pe}/(k\sigma)`,
+    so :math:`k\sigma = \sqrt{2}\,\omega_{pe}/\alpha` and
+
+    .. math::
+
+       \omega^2 = \omega_{pe}^2 + 3 k^2 \sigma^2
+                = \omega_{pe}^2 \left(1 + 6/\alpha^2\right),
+
+    which needs neither :math:`k` nor :math:`\sigma`. The shift is then
+    :math:`\lambda_0^2 \omega / 2\pi c`. Returns `~numpy.nan` when there is no
+    plasma to have a resonance.
+    """
+    alpha = float(np.asarray(alpha))
+    density = float(np.asarray(electron_density))
+    if not np.isfinite(alpha) or alpha <= 0 or density <= 0:
+        return float("nan")
+    omega = _plasma_frequency(density) * np.sqrt(1.0 + 6.0 / alpha**2)
+    lam0 = float(_si_values(probe_wavelength, u.m))
+    return float(lam0**2 * omega / (2.0 * np.pi * const.c.si.value) * 1e9)
+
+
+def _containing_interval(
+    spectrum, wavelengths, containment: float
+) -> tuple[float, float] | None:
+    """
+    Narrowest wavelength interval holding *containment* of the area.
+
+    Used to find where the central feature actually is, so that the stray-light
+    mask can be put over it rather than over where it was last time. The
+    spectrum is a single feature plus wings, so scanning from both ends inward
+    is enough and costs nothing.
+    """
+    spectrum = np.clip(np.asarray(spectrum, dtype=np.float64), 0.0, None)
+    total = np.trapezoid(spectrum, wavelengths)
+    if not np.isfinite(total) or total <= 0:
+        return None
+    cumulative = np.concatenate(
+        [[0.0], np.cumsum(np.diff(wavelengths) * (spectrum[:-1] + spectrum[1:]) / 2)]
+    )
+    outside = (1.0 - containment) / 2.0
+    lo = float(np.interp(outside * total, cumulative, wavelengths))
+    hi = float(np.interp((1.0 - outside) * total, cumulative, wavelengths))
+    return lo, hi
+
+
 def _notches_to_quantity(notches):
     """Coerce notch specifications into an ``(n, 2)`` Quantity in nm."""
     if notches is None:
@@ -1552,7 +2426,7 @@ def _notches_to_quantity(notches):
     return notches
 
 
-def spectra_from_phase_spaces(  # noqa: C901, PLR0915
+def spectra_from_phase_spaces(  # noqa: C901, PLR0912, PLR0915
     electrons,
     ions,
     *,
@@ -1563,14 +2437,20 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
     iaw_wavelengths=None,
     epw_notches=None,
     iaw_notches=None,
+    notch_containment: float = 0.999,
+    notch_margin: float = 1.5,
+    notch_max_fraction: float = 0.2,
+    n_quadrature_points: float = 1e3,
     probe_vec=(1.0, 0.0, 0.0),
     scatter_vec=(0.0, 1.0, 0.0),
     electron_conditioning: dict[str, Any] | None = None,
     ion_conditioning: dict[str, Any] | None = None,
     velocity_scale_factor: float | None = None,
     ion_velocity_scale_factor: float | None = None,
+    electron_drift_scale_factor: float | None = None,
     presence_threshold: float = 1e-2,
     scattered_power: bool = True,
+    mask_unresolved_epw: bool = False,
     progress: bool = True,
 ) -> ThomsonSpectrogram:
     r"""
@@ -1613,6 +2493,41 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
         Wavelength ranges to zero out, as a pair or a sequence of pairs -- a
         stray-light notch filter. Usually only the EPW window needs one, since the
         IAW window sits inside the notch.
+
+        Pass ``epw_notches="auto"`` and the EPW mask is sized from the central
+        feature as measured in the IAW window, per timestep. A fixed mask does
+        not stay over a feature that the flow is Doppler-shifting: at
+        :math:`2 \times 10^6` m/s the shift is :math:`\lambda^2 k u / 2\pi c
+        \approx 3.7` nm, most of a 4 nm notch, and the bin immediately outside
+        holds the skirt of a feature orders of magnitude above the satellites.
+        Requires *iaw_wavelengths*. The interval actually applied at each
+        timestep is recorded in ``meta["epw_notch_applied"]``.
+    notch_containment : `float`
+        Fraction of the central feature's area the automatic mask must cover.
+    notch_margin : `float`
+        Widens the automatic mask by this factor about its centre, since the
+        containment interval stops where the feature is still well above the
+        satellites.
+    n_quadrature_points : `float`
+        Sample points the forward model uses for the principal-value integral
+        that gives :math:`\\chi`. The default, ``1e3``, is the forward model's
+        own default and is enough for a smooth analytic distribution -- it
+        reproduces the converged answer to 0.02 dex at
+        :math:`\\alpha \\approx 4`. It is **not** enough for a PIC histogram.
+        The integrand is :math:`f'(u)/(u - \\xi)` sampled on a grid anchored at
+        :math:`\\xi`, so as :math:`\\xi` sweeps the wavelength axis the grid
+        slides under a shot-noise-roughened :math:`f'` and the quadrature error
+        oscillates with it. On a 2000-macroparticle probe cell that puts
+        0.5 dex of spurious ringing into the wings of both features, at a
+        period set by the sample spacing rather than by anything physical.
+        ``1e4`` converges it -- see the notes on `smooth_vdf` for the
+        complementary lever.
+    notch_max_fraction : `float`
+        Hard cap on the automatic mask's half-width, as a fraction of the
+        Bohm--Gross satellite offset. A mask must not eat what it is protecting:
+        where the plasma is only weakly collective the central feature and the
+        electron feature merge, and sizing purely by containment then masks the
+        satellites too.
     probe_vec, scatter_vec : array_like
         Unit vectors along the probe beam and towards the detector. The defaults
         give a 90 degree scattering geometry.
@@ -1636,6 +2551,15 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
         ion *temperature* unchanged -- :math:`m_\mathrm{phys} (v/\sqrt{R})^2 =
         m_\mathrm{sim} v^2` -- so it maps the distribution onto the physical
         species without touching :math:`T_i/T_e`.
+    electron_drift_scale_factor : `float`, optional
+        Mass-ratio reduction factor :math:`R` applied to the electron **bulk
+        velocity only**, leaving the temperature alone; see
+        `rescale_vdf_drift`. This is what a run with kinetic electrons at the
+        real :math:`m_e` and a reduced ion mass needs: its :math:`T_e` and
+        :math:`\lambda_{De}` are already physical, so *velocity_scale_factor*
+        would ruin them, but the flow the electrons share with the ions is still
+        :math:`\sqrt{R}` too fast. Mutually exclusive with
+        *velocity_scale_factor* for the electrons.
     presence_threshold : `float`
         A population contributes at a given timestep only if its fractional density
         exceeds this. Timesteps where the total electron density falls below
@@ -1643,6 +2567,11 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
         recorded as `~numpy.nan` rather than given a fabricated spectrum.
     scattered_power : `bool`
         Convert :math:`S(k, \omega)` to scattered power per unit wavelength.
+    mask_unresolved_epw : `bool`
+        Replace the EPW spectrum with `~numpy.nan` at timesteps where the
+        satellite would read the electron distribution beyond the last velocity
+        the simulation actually sampled. See the notes below. The diagnostic is
+        recorded either way; set this `False` to keep the fabricated rows.
     progress : `bool`
         Show a progress bar over timesteps.
 
@@ -1660,6 +2589,33 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
 
     Each returned spectrum is normalised to unit area over its own window; see the
     notes on `ThomsonSpectrogram`.
+
+    **Where the EPW satellite reads the distribution.** The satellite sits at the
+    Bohm--Gross resonance, so it samples :math:`f_e` at
+
+    .. math::
+
+       \frac{v_\phi}{\sigma} = \sqrt{\alpha^2 + 3}
+
+    with :math:`\alpha = 1/(k \lambda_{De})` and :math:`\sigma` the standard
+    deviation of the electron distribution. A PIC histogram, meanwhile, is
+    populated only out to wherever its last macroparticle landed -- typically
+    three to five :math:`\sigma`, since reaching :math:`n\sigma` needs of order
+    :math:`e^{n^2/2}` particles per cell. Beyond that the conditioning takes
+    over: `taper_vdf_edges` rolls the tail off and the floor holds it up, and
+    the resonance of :math:`|1 - \chi_e/\epsilon|^2` turns whatever is there
+    into a satellite. Such a satellite is a property of the conditioning, not of
+    the simulation, and its position moves when ``max_taper_bins`` moves.
+
+    The ratio of the two is recorded per population and timestep in
+    ``epw_tail_ratio``, against the requirement in ``epw_tail_required``, and
+    reduced to ``epw_resolved``. A timestep counts as resolved only when *every*
+    present electron population reaches the resonance, since the electron
+    susceptibility they share is what lights the satellite up.
+
+    Populations built by `from_moments` carry an analytic tail and so always
+    pass; ``meta["epw_tail_analytic"]`` names them, because for those the
+    satellite is only ever as good as the assumed distribution.
 
     Examples
     --------
@@ -1720,7 +2676,7 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
     ion_present = (ifract > presence_threshold) & plasma_present
 
     # --- conditioning ---
-    def _condition(phase_spaces, settings, scale):
+    def _condition(phase_spaces, settings, scale, drift_scale=None):
         settings = dict(settings or {})
         if settings.pop("skip", False):
             return list(phase_spaces)
@@ -1734,6 +2690,7 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
             condition_phase_space(
                 phase_space,
                 velocity_scale_factor=scale,
+                drift_scale_factor=drift_scale,
                 **settings,
             )
             for phase_space in phase_spaces
@@ -1745,6 +2702,7 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
         [sampled[id(ps)] for ps in electrons],
         electron_conditioning,
         velocity_scale_factor,
+        drift_scale=electron_drift_scale_factor,
     )
     ions_c = _condition(
         [sampled[id(ps)] for ps in ions],
@@ -1752,13 +2710,45 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
         ion_velocity_scale_factor,
     )
 
+    # --- how far the code sampled the electron tail, in thermal widths ---
+    # Measured on the raw histogram, since the taper and the floor extend the
+    # conditioned one past anything a macroparticle reached; divided by the same
+    # velocity scale the conditioner applied, so that it can be compared with a
+    # width taken off the conditioned distribution.
+    epw_tail_ratio = np.stack(
+        [
+            _sampled_tail_in_widths(sampled[id(raw)], conditioned)
+            for raw, conditioned in zip(electrons, electrons_c, strict=True)
+        ]
+    )
+    analytic_tail = [
+        ps.label for ps in electrons if ps.meta.get("analytic_tail", False)
+    ]
+
     # --- wavelength windows ---
     epw_wavelengths = u.Quantity(epw_wavelengths, u.nm)
-    epw_notches = _notches_to_quantity(epw_notches)
+    epw_notches_in = epw_notches
+    epw_notches = (
+        None if isinstance(epw_notches, str) else _notches_to_quantity(epw_notches)
+    )
     want_iaw = iaw_wavelengths is not None
     if want_iaw:
         iaw_wavelengths = u.Quantity(iaw_wavelengths, u.nm)
         iaw_notches = _notches_to_quantity(iaw_notches)
+
+    automatic_notch = isinstance(epw_notches_in, str)
+    if automatic_notch:
+        if epw_notches_in != "auto":
+            raise ValueError(
+                f"epw_notches must be a pair of wavelengths, a sequence of "
+                f"pairs, 'auto', or None; got {epw_notches_in!r}."
+            )
+        if not want_iaw:
+            raise ValueError(
+                "epw_notches='auto' sizes the mask from the central feature, "
+                "which it measures in the IAW window; pass iaw_wavelengths."
+            )
+    epw_notch_applied = np.full((n_time, 2), np.nan)
 
     probe_vec = np.asarray(probe_vec, dtype=np.float64)
     scatter_vec = np.asarray(scatter_vec, dtype=np.float64)
@@ -1807,20 +2797,126 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
             "probe_vec": probe_vec,
             "scatter_vec": scatter_vec,
             "scattered_power": scattered_power,
+            "n_quadrature_points": n_quadrature_points,
         }
 
-        alpha, spectrum = arbitrary_forwardmodel(
-            wavelengths=epw_wavelengths, notches=epw_notches, **common
-        )
-        epw[step] = np.asarray(spectrum, dtype=np.float64)
-        alpha_epw[step] = float(np.asarray(alpha))
-
+        # The IAW window first, because an automatic stray-light mask is sized
+        # from the central feature it resolves.
         if want_iaw:
             alpha, spectrum = arbitrary_forwardmodel(
                 wavelengths=iaw_wavelengths, notches=iaw_notches, **common
             )
             iaw[step] = np.asarray(spectrum, dtype=np.float64)
             alpha_iaw[step] = float(np.asarray(alpha))
+
+        step_notches = epw_notches
+        if automatic_notch:
+            interval = _containing_interval(
+                iaw[step], iaw_wavelengths.to_value(u.nm), notch_containment
+            )
+            if interval is not None:
+                lo, hi = interval
+                half = (hi - lo) / 2.0 * notch_margin
+                centre = (hi + lo) / 2.0
+                # A mask must not eat the thing it is protecting. Where the
+                # plasma is only weakly collective the central feature and the
+                # electron feature merge, so sizing purely by containment masks
+                # the satellites too -- 25 nm of the window, on one shock.
+                # Bohm-Gross says where they are; stay well inside that.
+                # alpha_epw[step] is not filled until the EPW call below, so
+                # take the scattering parameter from the IAW call just made --
+                # the model reports the same one for both windows.
+                offset = _satellite_offset(
+                    alpha_iaw[step], electron_density[step], probe_wavelength
+                )
+                if np.isfinite(offset):
+                    half = min(half, notch_max_fraction * offset)
+                applied = np.array([[centre - half, centre + half]])
+                epw_notch_applied[step] = applied[0]
+                step_notches = applied * u.nm
+
+        alpha, spectrum = arbitrary_forwardmodel(
+            wavelengths=epw_wavelengths, notches=step_notches, **common
+        )
+        epw[step] = np.asarray(spectrum, dtype=np.float64)
+        alpha_epw[step] = float(np.asarray(alpha))
+
+    # --- is the EPW satellite a measurement or a property of the taper? ---
+    # The forward model's alpha is sqrt(2) * wpe / (k * sigma), so the
+    # conventional 1 / (k * lambda_De) is that over sqrt(2), and Bohm-Gross puts
+    # the resonance at sqrt(alpha_conventional^2 + 3) thermal widths.
+    with np.errstate(invalid="ignore"):
+        epw_tail_required = np.sqrt(alpha_epw**2 / 2.0 + 3.0)
+    reached = epw_tail_ratio > epw_tail_required[None, :]
+    # Populations that are absent cannot fail; ones present with an unusable
+    # ratio must. Resolved means every present population got there.
+    epw_resolved = np.all(reached | ~electron_present, axis=0) & np.isfinite(
+        epw_tail_required
+    )
+
+    # How far the fitted tail can be trusted where it is extrapolating. For
+    # f ~ exp(-x^2 / 2 sigma_t^2), a fractional error eps in sigma_t moves ln f
+    # by (x/sigma_t)^2 * eps, so the amplitude at the resonance is uncertain by
+    # exp(required^2 * eps). This is the number that decides whether an EPW
+    # feature outside the sampled tail means anything.
+    tail_errors = [
+        (ps.meta.get("conditioning", {}).get("tail") or {}).get("tail_width_error")
+        for ps in electrons_c
+    ]
+    worst_error = max((x for x in tail_errors if x is not None), default=None)
+    if worst_error is None:
+        epw_tail_uncertainty = np.full(n_time, np.nan)
+    else:
+        with np.errstate(over="ignore", invalid="ignore"):
+            epw_tail_uncertainty = np.exp(
+                np.clip(epw_tail_required**2 * worst_error, 0.0, 700.0)
+            )
+        # Inside the sampled tail there is nothing being extrapolated.
+        epw_tail_uncertainty = np.where(epw_resolved, 1.0, epw_tail_uncertainty)
+
+    unresolved = np.isfinite(alpha_epw) & ~epw_resolved
+    if unresolved.any():
+        short = np.where(electron_present, epw_tail_ratio, np.nan)[:, unresolved]
+        culprit = int(np.nanargmin(np.nanmin(short, axis=1)))
+        # A reconstructed distribution has no last macroparticle -- its grid
+        # stops where velocity_headroom was told to stop -- so the remedy is a
+        # wider grid, not more particles.
+        cause = (
+            f"population {electrons[culprit].label!r} is reconstructed, and its "
+            f"velocity grid stops short of the resonance; widen "
+            f"velocity_headroom in from_moments"
+            if electrons[culprit].meta.get("analytic_tail", False)
+            else f"the simulation sampled no {electrons[culprit].label!r} that "
+            f"fast, so the feature there rests on however the tail was continued"
+        )
+        modelled = np.isfinite(epw_tail_uncertainty[unresolved]).any()
+        judgement = (
+            f"The tail was fitted, so this is an extrapolation rather than an "
+            f"artefact: the amplitude at the resonance is uncertain by a factor "
+            f"of {np.nanmax(epw_tail_uncertainty[unresolved]):.3g} "
+            f"(epw_tail_uncertainty)."
+            if modelled
+            else "The tail was tapered rather than fitted, so the feature there "
+            "is a property of the taper and moves when max_taper_bins moves."
+        )
+        warnings.warn(
+            f"spectra_from_phase_spaces: at {unresolved.sum()} of "
+            f"{np.isfinite(alpha_epw).sum()} timesteps with plasma, the EPW "
+            f"satellite falls beyond the last velocity the electron "
+            f"distribution reaches (got {np.nanmin(short):.1f} thermal widths, "
+            f"needed up to {np.nanmax(epw_tail_required[unresolved]):.1f}): "
+            f"{cause}. {judgement} "
+            + (
+                "Those spectra have been replaced with NaN; pass "
+                "mask_unresolved_epw=False to keep them."
+                if mask_unresolved_epw
+                else "Those spectra have been kept, as mask_unresolved_epw=False asked."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        if mask_unresolved_epw:
+            epw[unresolved] = np.nan
 
     return ThomsonSpectrogram(
         epw=epw,
@@ -1835,6 +2931,10 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
         ifract=ifract,
         electron_present=electron_present,
         ion_present=ion_present,
+        epw_tail_ratio=epw_tail_ratio,
+        epw_tail_required=epw_tail_required,
+        epw_resolved=epw_resolved,
+        epw_tail_uncertainty=epw_tail_uncertainty,
         position=position,
         electron_labels=[ps.label for ps in electrons],
         ion_labels=[ps.label for ps in ions],
@@ -1845,7 +2945,11 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0915
             "presence_threshold": presence_threshold,
             "velocity_scale_factor": velocity_scale_factor,
             "ion_velocity_scale_factor": ion_velocity_scale_factor,
+            "electron_drift_scale_factor": electron_drift_scale_factor,
             "scattered_power": scattered_power,
+            "mask_unresolved_epw": mask_unresolved_epw,
+            "epw_notch_applied": epw_notch_applied.tolist(),
+            "epw_tail_analytic": analytic_tail,
             "species_meta": {ps.label: ps.meta for ps in [*electrons_c, *ions_c]},
         },
     )
@@ -2265,11 +3369,43 @@ def _load_yt():
     return yt
 
 
+def _warpx_plotfile_directories(path: Path, prefix: str) -> list[Path]:
+    """
+    Sorted plotfile directories for a WarpX diagnostic.
+
+    A plotfile is the prefix followed by the zero-padded step number and nothing
+    else, and they are returned in **step order**.
+
+    Two things make that less trivial than a sorted glob.
+
+    WarpX renames a plotfile it is about to overwrite to ``<name>.old.<pid>``
+    instead of deleting it, so a directory written to twice -- a run restarted,
+    or one killed and relaunched -- holds stale copies alongside the real
+    output. Those sort immediately after the plotfile they duplicate, so a plain
+    ``<prefix>*`` glob returns them as extra timesteps carrying another run's
+    data.
+
+    And the step number is padded to six digits but not truncated, so a run past
+    step 999999 writes seven-digit names that do not sort lexically against the
+    six-digit ones: ``diag11002384`` (step 1002384) lands before
+    ``diag1111376`` (step 111376). The frames then come back interleaved, with a
+    time axis that runs backwards in places -- which looks like a physics
+    problem and is not one. Sorting on the parsed integer is the fix.
+    """
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+    found = []
+    for candidate in path.glob(f"{prefix}*"):
+        match = pattern.match(candidate.name)
+        if candidate.is_dir() and match:
+            found.append((int(match.group(1)), candidate))
+    return [candidate for _, candidate in sorted(found)]
+
+
 def _warpx_plotfiles(path: Path, prefix: str, timesteps) -> list[Path]:
-    """Sorted plotfile directories for a WarpX diagnostic."""
-    available = sorted(p for p in path.glob(f"{prefix}*") if p.is_dir())
+    """Plotfile directories for a WarpX diagnostic, optionally subset."""
+    available = _warpx_plotfile_directories(path, prefix)
     if not available:
-        raise FileNotFoundError(f"no {prefix}* plotfiles in {path}")
+        raise FileNotFoundError(f"no {prefix}<step> plotfiles in {path}")
     if timesteps is None:
         return available
     try:
@@ -2355,7 +3491,7 @@ def _warpx_matching_plotfile(reference, prefix: str, step: int | None) -> Path |
     candidate = Path(reference) / f"{prefix}{step:06d}"
     if candidate.is_dir():
         return candidate
-    for other in sorted(Path(reference).glob(f"{prefix}*")):
+    for other in _warpx_plotfile_directories(Path(reference), prefix):
         if other.is_dir() and _warpx_step_number(other, prefix) == step:
             return other
     return None
@@ -3006,7 +4142,26 @@ def read_warpx_phase_space(  # noqa: C901, PLR0912, PLR0915
     f = np.stack(blocks)
     t = np.asarray(times, dtype=np.float64)
 
+    narrowest = _narrowest_width(f, v_axis)
+    bins_per_width = (
+        narrowest / float(np.diff(v_axis).mean()) if narrowest else float("inf")
+    )
+    if bins_per_width < _MIN_BINS_PER_THERMAL_WIDTH:
+        warnings.warn(
+            f"the velocity axis gives species {species!r} only "
+            f"{bins_per_width:.1f} bin(s) per thermal width in its narrowest "
+            f"populated cell. One axis spans every frame and every cell, so a "
+            f"run whose fastest particles are far quicker than its coldest "
+            f"population is under-resolved where the feature actually is: "
+            f"binning adds dv^2/12 to the second moment, which is "
+            f"{100 / (12 * bins_per_width**2):.0f}% of the temperature here. "
+            f"Raise n_velocity_bins, or read a narrower window of timesteps.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     resolved = {
+        "bins_per_thermal_width": bins_per_width,
         "transverse_area": transverse_area,
         "position_fields": list(position_fields),
         "momentum_fields": list(momentum_fields),
@@ -3654,6 +4809,7 @@ def read_warpx_hybrid_electrons(  # noqa: C901, PLR0912, PLR0915
     position=None,
     v=None,
     n_velocity_bins: int = 512,
+    velocity_headroom: float = 6.0,
     timesteps=None,
     prefix: str = "diag1",
     progress: bool = True,
@@ -3734,6 +4890,12 @@ def read_warpx_hybrid_electrons(  # noqa: C901, PLR0912, PLR0915
         moments themselves.
     n_velocity_bins : `int`
         Resolution of the default velocity axis.
+    velocity_headroom : `float`
+        How far the default velocity axis reaches, in thermal speeds, passed to
+        `from_moments`. Worth raising for a compressed shock: the EPW satellite
+        reads :math:`f_e` at :math:`\sqrt{\alpha^2 + 3}` thermal speeds, and
+        :math:`\alpha` climbs with density, so the default of 6 stops short of
+        the resonance once :math:`\alpha` passes about 5.7.
     timesteps : iterable of `int`, optional
         Indices into the sorted list of plotfiles. The default reads all.
     prefix : `str`
@@ -4024,6 +5186,7 @@ def read_warpx_hybrid_electrons(  # noqa: C901, PLR0912, PLR0915
         mass=const.m_e.si.value if mass is None else mass,
         is_electron=True,
         n_velocity_bins=n_velocity_bins,
+        velocity_headroom=velocity_headroom,
         meta={
             "code": "WarpX (hybrid)",
             "path": str(path),

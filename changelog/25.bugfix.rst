@@ -1,0 +1,22 @@
+``tools/pic_thomson_osiris_comparison.py`` and
+``tools/pic_thomson_figures.py`` were applying the wrong velocity correction to
+the OSIRIS runs. Both passed ``velocity_scale_factor``, which divides every
+species' velocity axis by :math:`\sqrt{R}`, on the assumption that the run is a
+similarity-scaled model. The deck says otherwise --
+``species { name = "e", rqm = -1.0 }`` is a real electron -- so :math:`T_e`,
+:math:`v_{te}`, :math:`\lambda_{De}` and therefore :math:`\alpha` were already
+physical, and only the ions and the shared bulk flow needed correcting.
+
+Dividing the electron axis as well multiplied :math:`\alpha` by
+:math:`\sqrt{50} = 7.07`, from 1.64 to 11.58, carrying the spectrum from inside
+the band validated to a few percent past the point where the electron-plasma-wave
+satellite can be evaluated in double precision at all. The satellites were not
+missing from the physics; they were being scaled out of existence, which is why
+the EPW spectrogram read as empty.
+
+Both tools now pass ``ion_velocity_scale_factor`` together with
+``electron_drift_scale_factor``. On the same run the satellite goes from needing
+7.4 thermal widths of sampled distribution to 2.0 -- inside the data, so a
+measurement rather than an extrapolation, with ``epw_tail_uncertainty`` of 1.01.
+``media/06``, ``07``, ``10`` are regenerated, and both configurations of ``07``
+use the corrected scaling so that its legacy comparison still isolates the taper.

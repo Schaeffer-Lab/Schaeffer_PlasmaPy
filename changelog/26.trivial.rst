@@ -1,0 +1,11 @@
+``tools/pic_thomson_osiris_spectra.py`` draws ``media/14_osiris_spectra.png``:
+the EPW and IAW spectrograms of an OSIRIS run under the reduced-mass-ratio
+corrections, with no legacy column.
+
+Each panel uses **one absolute colour scale across every timestep**. Rescaling
+each row to its own maximum -- what the other spectrogram figures do -- makes a
+frame carrying no signal indistinguishable from one carrying a strong feature,
+and where a stray-light notch has removed the central feature the only content
+left is the skirt at the notch edge, a factor of :math:`10^{-5}` below the peak,
+which the renormalisation promotes into a saturated rail along each notch edge
+across every such frame.

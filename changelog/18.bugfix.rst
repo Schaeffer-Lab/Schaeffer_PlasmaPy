@@ -1,0 +1,14 @@
+Fixed the order `plasmapy.diagnostics.pic_thomson`'s WarpX readers return
+plotfiles in. WarpX pads a step number to six digits but does not truncate it,
+so a run past step 999999 writes seven-digit names that do not sort lexically
+against the six-digit ones: ``diag11002384`` (step 1002384) landed before
+``diag1111376`` (step 111376). Frames came back interleaved, with a time axis
+that ran backwards in places -- on a real 2784400-step KinShock run the last
+frame was reported at 154 ps when the run reaches 453 ps. Sorting is now on the
+parsed step number.
+
+The same enumeration also picked up the ``<name>.old.<pid>`` directories WarpX
+leaves behind when it is about to overwrite a plotfile, which happens whenever a
+run is restarted or killed and relaunched. Those sort immediately after the
+plotfile they duplicate, so they were returned as extra timesteps carrying
+another run's data. Only ``<prefix><digits>`` is accepted now.

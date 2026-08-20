@@ -1,0 +1,12 @@
+Fixed the wavelength range a notch actually blocks in
+`~plasmapy.diagnostics.thomson.spectral_density` and the three
+arbitrary-distribution forward models beside it. Each located the notch
+endpoints with ``argmin``, which rounds them to the nearest bin centre, and then
+zeroed a half-open slice, which drops the upper endpoint bin: on the 0.4 nm grid
+a synthetic OSIRIS EPW window uses, a requested ``[530, 534]`` nm came out as
+``[530.2, 533.4]``. Every bin whose centre lies in the closed interval is now
+zeroed, which is what a filter blocking that interval does to a binned detector.
+The bin immediately outside a notch holds the skirt of the central feature,
+orders of magnitude above the electron-plasma-wave satellites, so a notch
+narrower than the one asked for takes most of the window once the spectrum is
+normalised to unit area.

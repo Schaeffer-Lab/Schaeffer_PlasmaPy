@@ -402,7 +402,13 @@ def figure_osiris_spectrogram(electrons, ions, reference_density, position) -> N
             "max_taper_bins": 20,
         },
         ion_conditioning={"smoothing_iterations": 0, "max_taper_bins": 3},
-        velocity_scale_factor=50,
+        # Ions only, plus a translation of the electron drift: the deck runs
+        # real-mass electrons (`rqm = -1.0`), so their thermal scale -- and so
+        # alpha -- is already physical. Rescaling the whole axis multiplies
+        # alpha by sqrt(R) and puts the satellite past the computable limit.
+        # See plan.md 17.8.
+        ion_velocity_scale_factor=50,
+        electron_drift_scale_factor=50,
     )
 
     time_ns = spectrogram.t * 1e9

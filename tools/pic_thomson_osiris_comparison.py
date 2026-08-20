@@ -33,6 +33,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 import astropy.constants as const
@@ -105,8 +106,41 @@ def read_run(
     return electrons, ions
 
 
+def probe_volume(phase_space, position, n_cells):
+    """
+    Average the phase space over the cells a real collection volume spans.
+
+    A Thomson collection volume at 532 nm is tens to a hundred microns; a cell
+    in this run is 13.1. Averaging over the cells the volume covers is what the
+    measurement does anyway, and it buys sqrt(N) in macroparticle statistics
+    where the forward model is most sensitive to them. Averaged, never summed:
+    summing multiplies the density by the cell count.
+    """
+    if n_cells <= 1:
+        return phase_space
+    index = int(np.argmin(np.abs(phase_space.x - position)))
+    half = n_cells // 2
+    lo, hi = max(index - half, 0), min(index + half + 1, phase_space.x.size)
+    return replace(
+        phase_space,
+        f=np.ascontiguousarray(phase_space.f[:, :, lo:hi].mean(axis=2, keepdims=True)),
+        x=phase_space.x[index : index + 1],
+        meta={**phase_space.meta, "probe_cells": hi - lo},
+    )
+
+
 def run_pipeline(electrons, ions, args, reference_density, position, *, bounded):
     """Run the driver in the legacy or the corrected configuration."""
+    # The legacy pipeline smoothed with a 40-bin boxcar. On this run the
+    # electrons occupy 31 of the 1024 bins the momentum diagnostic spans, so
+    # that window is wider than the distribution and adds several hundred eV of
+    # variance to it. The corrected configuration asks for a width in thermal
+    # speeds instead and lets the module size the window.
+    electron_smoothing = (
+        {"smoothing_width": 0.25} if bounded else {"smoothing_window": 40}
+    )
+    electrons = probe_volume(electrons, position, args.probe_cells)
+    ions = [probe_volume(ion, position, args.probe_cells) for ion in ions]
     return pt.spectra_from_phase_spaces(
         electrons,
         ions,
@@ -115,20 +149,47 @@ def run_pipeline(electrons, ions, args, reference_density, position, *, bounded)
         probe_wavelength=PROBE_WAVELENGTH,
         epw_wavelengths=EPW_WAVELENGTHS,
         iaw_wavelengths=IAW_WAVELENGTHS,
-        epw_notches=args.notch * u.nm,
+        # Legacy: the fixed notch the old pipeline used. Corrected: sized from
+        # the central feature every frame, because the flow shifts it out of a
+        # fixed one and the bin just outside then takes most of the window.
+        epw_notches=("auto" if (bounded and args.auto_notch) else args.notch * u.nm),
         scatter_vec=SCATTER_VEC,
         electron_conditioning={
-            "smoothing_window": 40,
+            **electron_smoothing,
             "smoothing_iterations": args.smoothing_iterations,
-            "max_taper_bins": 20 if bounded else None,
+            # Legacy: the half-cosine taper, run to the grid edge. Corrected:
+            # the fitted-Maxwellian tail, which is the default.
+            "tail_model": None if not bounded else "maxwellian",
+            "max_taper_bins": None,
             "pedestal_warning": None,
+            "smoothing_variance_warning": None if bounded else 1e9,
         },
         ion_conditioning={
             "smoothing_iterations": 0,
-            "max_taper_bins": 3 if bounded else None,
+            "tail_model": None if not bounded else "maxwellian",
+            "max_taper_bins": None,
             "pedestal_warning": None,
         },
-        velocity_scale_factor=args.velocity_scale_factor,
+        # The ions only, plus a translation of the electron bulk velocity.
+        # The deck settles this: `species { name = "e", rqm = -1.0 }` is a real
+        # electron, so T_e, v_te, lambda_De and therefore alpha are already
+        # physical and the electron velocity axis must not be rescaled. Only
+        # the flow the electrons share with the ions is sqrt(R) too fast, and a
+        # translation is what moves a mean while leaving every central moment
+        # alone. See plan.md 16 and 17.8.
+        #
+        # This used to pass velocity_scale_factor, i.e. the whole axis for every
+        # species. That is treatment C of 16.5, and on this run it multiplied
+        # alpha by sqrt(50) = 7.07 -- from 1.64 to 11.58 -- carrying it past the
+        # point where the satellite is computable in double precision at all.
+        # It is why the EPW panel read as empty.
+        ion_velocity_scale_factor=args.velocity_scale_factor,
+        electron_drift_scale_factor=args.velocity_scale_factor,
+        n_quadrature_points=args.quadrature_points,
+        # Keep every row in both: with the tail fitted, a resonance past the
+        # sampled data is an extrapolation priced by epw_tail_uncertainty rather
+        # than something to hide.
+        mask_unresolved_epw=False,
         progress=True,
     )
 
@@ -291,7 +352,7 @@ def check_epw_tracks_density(spectrogram, notch) -> None:
         )
 
 
-def figure(spectrograms, results, reference, args) -> None:
+def figure(spectrograms, results, reference, args) -> None:  # noqa: PLR0915
     """Draw the two configurations, and the reference if there is one."""
     epw_nm = EPW_WAVELENGTHS.to_value(u.nm)
     iaw_nm = IAW_WAVELENGTHS.to_value(u.nm)
@@ -305,22 +366,66 @@ def figure(spectrograms, results, reference, args) -> None:
         (("EPW", epw_nm, "epw"), ("IAW", iaw_nm, "iaw"))
     ):
         panels = [
-            (legacy[key], f"{name}: legacy-matched (unbounded taper)"),
-            (corrected[key], f"{name}: corrected (bounded taper)"),
+            (legacy[key], f"{name}: legacy (half-cosine taper to zero)"),
+            (corrected[key], f"{name}: corrected (fitted Maxwellian tail)"),
         ]
         if reference is not None:
             panels.insert(0, (legacy[f"ref_{key}"], f"{name}: osiris2thomson"))
         for column, (data, title) in enumerate(panels):
-            finite = data[np.isfinite(data).all(axis=1)]
+            # Each row was normalised to its own area, which for the EPW is a
+            # trap: where the notch has removed the central feature and the
+            # plasma has no computable satellite, the only content left is the
+            # skirt at the notch edge -- 1e-5 of the peak. Dividing by its area
+            # promotes that residue to order one and paints a saturated rail
+            # along each notch edge, across every such frame. So for the EPW,
+            # blank the notched band and renormalise by what is outside it: a
+            # row with nothing outside is then blank, which is the truth.
+            away = np.abs(axis - PROBE_WAVELENGTH.to_value(u.nm)) > args.colour_guard
+            shown_data = data
+            if name == "EPW" and away.sum() > 4:
+                shown_data = np.array(data, dtype=float)
+                shown_data[:, ~away] = np.nan
+                with np.errstate(invalid="ignore"):
+                    areas = np.trapezoid(
+                        np.nan_to_num(shown_data[:, away]), axis[away], axis=1
+                    )
+                usable = np.isfinite(areas) & (areas > 0)
+                shown_data[~usable] = np.nan
+                shown_data[usable] /= areas[usable][:, np.newaxis]
+            finite = shown_data[np.isfinite(shown_data).any(axis=1)]
+            scale_from = finite[:, away] if away.sum() > 4 else finite
+            if args.log_scale:
+                # Each row is area-normalised, and the features that matter span
+                # many decades: the notch skirt sits orders of magnitude above
+                # the satellites, so on a linear scale everything else is one
+                # colour. Zeros -- the notch itself -- are masked rather than
+                # clipped, so the mask reads as blank instead of as signal.
+                shown = np.ma.masked_invalid(
+                    np.ma.masked_where(~(shown_data > 0), shown_data)
+                )
+                positive = scale_from[np.isfinite(scale_from) & (scale_from > 0)]
+                top = np.percentile(positive, 99.9) if positive.size else 1.0
+                norm = mpl.colors.LogNorm(vmin=top * 10.0**-args.log_decades, vmax=top)
+                kwargs = {"norm": norm}
+            else:
+                shown = np.ma.masked_invalid(shown_data)
+                kwargs = {
+                    "vmin": 0.0,
+                    "vmax": (
+                        np.nanpercentile(scale_from, 99)
+                        if np.isfinite(scale_from).any()
+                        else None
+                    ),
+                }
             image = axes[row][column].imshow(
-                data.T,
+                shown.T,
                 origin="lower",
                 aspect="auto",
                 extent=[time_ns[0], time_ns[-1], axis[0], axis[-1]],
                 cmap="inferno",
-                vmax=np.percentile(finite, 99) if finite.size else None,
+                **kwargs,
             )
-            fig.colorbar(image, ax=axes[row][column])
+            fig.colorbar(image, ax=axes[row][column], extend="max")
             axes[row][column].set_title(title, fontsize=9)
             axes[row][column].set_xlabel("time (ns)")
             axes[row][column].set_ylabel("wavelength (nm)")
@@ -366,7 +471,7 @@ def figure(spectrograms, results, reference, args) -> None:
     print(f"\n  wrote {path.relative_to(MEDIA.parent)}")
 
 
-def main() -> None:
+def main() -> None:  # noqa: PLR0915
     """Run both configurations over the simulation and report the outcome."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ms", type=Path, required=True, help="OSIRIS MS directory")
@@ -386,10 +491,50 @@ def main() -> None:
         "--velocity-scale-factor",
         type=float,
         default=50.0,
-        help="mass-ratio reduction factor R; velocities are divided by sqrt(R)",
+        help="mass-ratio reduction factor R. The ion velocity axes are divided "
+        "by sqrt(R), and the electron bulk velocity is divided by sqrt(R) as a "
+        "translation that leaves T_e alone. The electron axis is NOT rescaled: "
+        "the deck runs real-mass electrons, so their thermal scale is already "
+        "physical",
     )
     parser.add_argument(
         "--position", type=float, default=5.0, help="sampling position in mm"
+    )
+    parser.add_argument(
+        "--auto-notch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="size the corrected run's stray-light mask from the central "
+        "feature each frame, instead of using --notch. Off by default: a "
+        "stray-light notch is a piece of glass and does not change width "
+        "between frames. The automatic sizing measures a 99.9%% containment "
+        "interval, which is set by whatever is in the wings rather than by "
+        "the line, and is then capped at a fraction of the Bohm-Gross offset, "
+        "which makes it a function of density. On omegashock_w3.5e11_exp it "
+        "ranges over 0.52 to 9.92 nm, a factor of 19, with a median of 0.64. "
+        "See plan.md 17.5",
+    )
+    parser.add_argument(
+        "--log-scale",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="log colour scale on the spectrograms. Off by default: a linear "
+        "scale is what a measured spectrum is read on. Worth turning on to "
+        "check whether a feature is absent or merely faint",
+    )
+    parser.add_argument(
+        "--colour-guard",
+        type=float,
+        default=8.0,
+        help="nm either side of the probe line excluded when choosing the "
+        "colour limit, so the central feature does not crush the satellites. "
+        "Keep it just outside --notch",
+    )
+    parser.add_argument(
+        "--log-decades",
+        type=float,
+        default=8.0,
+        help="decades below the 99.9th percentile to show with --log-scale",
     )
     parser.add_argument("--electron", default="e", help="electron species name")
     parser.add_argument("--ions", nargs="+", default=["cham", "targ"])
@@ -407,6 +552,25 @@ def main() -> None:
         help="deck rqm of each ion, used only to check the labels",
     )
     parser.add_argument("--smoothing-iterations", type=int, default=4)
+    parser.add_argument(
+        "--probe-cells",
+        type=int,
+        default=5,
+        help="cells the collection volume spans, averaged. Cells here are "
+        "19.9 um on omegashock_w3.5e11_exp, so 5 is a 100 um volume -- the "
+        "scale of a real 532 nm Thomson collection volume. 1 disables it",
+    )
+    parser.add_argument(
+        "--quadrature-points",
+        type=float,
+        default=1e4,
+        help="sample points for the principal-value integral giving chi. The "
+        "forward model's own default, 1e3, is converged for a smooth "
+        "distribution and is not for a noisy one -- see plan.md 17.2. This run "
+        "smooths hard and has up to 5e5 macroparticles in the sampled cell, so "
+        "it is converged either way; the setting is explicit because the "
+        "KinShock run is not",
+    )
     parser.add_argument("--stride", type=int, default=1, help="read every Nth dump")
     parser.add_argument(
         "--output",
@@ -430,9 +594,16 @@ def main() -> None:
         "--notch",
         nargs=2,
         type=float,
-        default=[530.0, 534.0],
-        help="stray-light notch in nm. Must be narrower than the EPW satellite "
-        "separation, which is only ~8 nm at 1e18 cm^-3",
+        default=[525.0, 539.0],
+        help="fixed stray-light notch in nm. Sized from the skirt on "
+        "omegashock_w3.5e11_exp: measured out from the probe line, the "
+        "central feature falls from 1e9 to ~1e4 at 4 nm, ~1e1 at 6 nm and "
+        "~1e-5 by 7 nm, so +-7 leaves nothing above the satellites for the "
+        "colour scale to lock onto. A narrower mask leaves the first "
+        "surviving bin carrying the skirt, which draws a saturated rail "
+        "along each notch edge across the whole spectrogram. The real "
+        "satellites in this run are 11-20 nm out (512-520 and 545 nm, in the "
+        "alpha = 1.9-4.5 window at 0.35-0.50 ns), so +-7 clears them",
     )
     args = parser.parse_args()
 
@@ -487,7 +658,7 @@ def main() -> None:
 
     epw_nm = EPW_WAVELENGTHS.to_value(u.nm)
     iaw_nm = IAW_WAVELENGTHS.to_value(u.nm)
-    print("\nlegacy vs corrected (what bounding the taper changes):")
+    print("\nlegacy vs corrected (what the fitted tail changes):")
     print(
         f"  EPW L1 difference:          median "
         f"{np.nanmedian(l1_per_row(results['legacy']['epw'], results['corrected']['epw'], epw_nm)):.4f}"
