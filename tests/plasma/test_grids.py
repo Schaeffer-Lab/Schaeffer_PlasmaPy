@@ -323,14 +323,14 @@ def test_unit_attribute_error_case() -> None:
         [-1 * u.cm, 0 * u.rad, -2 * u.cm],
         [1 * u.cm, 2 * np.pi * u.rad, 2 * u.cm],
         num=5,
-    )
+    )  # ty: ignore[call-non-callable]
 
     with pytest.raises(ValueError):
         grid.unit  # noqa: B018
 
 
 @pytest.mark.parametrize(("key", "value", "error", "warning", "match"), quantities)
-def test_AbstractGrid_add_quantities(
+def test_AbstractGrid_add_quantities(  # noqa: PLR0917
     abstract_grid_uniform,
     key,
     value,
@@ -383,7 +383,7 @@ req_q = [
     ("required", "replace_with_zeros", "error", "warning", "match"),
     req_q,
 )
-def test_AbstractGrid_require_quantities(
+def test_AbstractGrid_require_quantities(  # noqa: PLR0917
     abstract_grid_uniform,
     required: bool,  # noqa: FBT001
     replace_with_zeros,
@@ -478,7 +478,7 @@ vector_intersect = [
 @pytest.mark.filterwarnings(
     "ignore:.*MultiIndex.*:DeprecationWarning",
 )  # see issue 2319
-def test_AbstractGrid_vector_intersects(
+def test_AbstractGrid_vector_intersects(  # noqa: PLR0917
     abstract_grid_uniform,
     abstract_grid_nonuniform,
     fixture,

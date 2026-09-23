@@ -207,7 +207,7 @@ class Tracker(ParticleTracker):
         into the standard output while running.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         grids: AbstractGrid | Iterable[AbstractGrid],
         source: u.Quantity[u.m],
@@ -393,7 +393,7 @@ class Tracker(ParticleTracker):
     # Create mesh
     # *************************************************************************
 
-    def add_wire_mesh(
+    def add_wire_mesh(  # noqa: PLR0917
         self,
         location,
         extent,
@@ -524,7 +524,7 @@ class Tracker(ParticleTracker):
 
         self.mesh_list.append(mesh_entry)
 
-    def _apply_wire_mesh(
+    def _apply_wire_mesh(  # noqa: PLR0917
         self,
         location=None,
         wire_radius=None,
@@ -541,8 +541,8 @@ class Tracker(ParticleTracker):
         x = self._coast_to_plane(location, mesh_hdir, mesh_vdir)
 
         # Particle positions in 2D on the mesh plane
-        xloc = np.dot(x - location, mesh_hdir)  # ty:ignore[invalid-argument-type]
-        yloc = np.dot(x - location, mesh_vdir)  # ty:ignore[invalid-argument-type]
+        xloc = np.dot(x - location, mesh_hdir)  # ty:ignore[no-matching-overload]
+        yloc = np.dot(x - location, mesh_vdir)  # ty:ignore[no-matching-overload]
 
         # Create an array in which True indicates that a particle has hit
         # a wire and False indicates that it has not
@@ -652,7 +652,7 @@ class Tracker(ParticleTracker):
         return theta.flatten(), phi.flatten()
 
     @particles.particle_input
-    def create_particles(
+    def create_particles(  # noqa: PLR0917
         self,
         num_particles,
         particle_energy,

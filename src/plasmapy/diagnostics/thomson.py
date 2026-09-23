@@ -651,7 +651,7 @@ def arbitrary_spectral_density_arbdist(
     for ii, ion in enumerate(ion_species):  # ty:ignore[invalid-argument-type]
         if isinstance(ion, Particle):
             continue
-        ion_species[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
+        ion_species[ii] = Particle(ion)  # ty:ignore[invalid-assignment]
     
     # Create arrays of ion Z and mass from particles given
     ion_z = np.zeros(len(ion_species))  # ty:ignore[invalid-argument-type]
@@ -1008,7 +1008,7 @@ def arbitrary_spectral_density_maxwellian(
     for ii, ion in enumerate(ion_species):  # ty:ignore[invalid-argument-type]
         if isinstance(ion, Particle):
             continue
-        ion_species[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
+        ion_species[ii] = Particle(ion)  # ty:ignore[invalid-assignment]
 
     # Condition Ti
     if Ti.size == 1:
@@ -2696,7 +2696,7 @@ def spectral_density_plasmapy(  # noqa: C901, PLR0912, PLR0915
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
+            ions[ii] = Particle(ion)
         ions = ParticleList(ions)  # ty:ignore[invalid-assignment]
     else:
         raise TypeError(
@@ -4152,7 +4152,7 @@ def spectral_density_experimental(  # noqa: C901, PLR0912, PLR0915
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
+            ions[ii] = Particle(ion)
         ions = ParticleList(ions)  # ty:ignore[invalid-assignment]
     else:
         raise TypeError(
@@ -4471,7 +4471,7 @@ def spectral_power_experimental(  # noqa: C901, PLR0912, PLR0915
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type, invalid-assignment]
+            ions[ii] = Particle(ion)
         ions = ParticleList(ions)  # ty:ignore[invalid-assignment]
     else:
         raise TypeError(
@@ -5024,7 +5024,7 @@ def spectral_density_model_experimental(  # noqa: C901, PLR0912, PLR0915
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type]
+            ions[ii] = Particle(ion)
         ions = ParticleList(ions)
     else:
         raise TypeError(
@@ -5303,7 +5303,7 @@ def spectral_power_model_experimental(  # noqa: C901, PLR0912, PLR0915
         for ii, ion in enumerate(ions):
             if isinstance(ion, Particle):
                 continue
-            ions[ii] = Particle(ion)  # ty:ignore[invalid-argument-type]
+            ions[ii] = Particle(ion)
         ions = ParticleList(ions)
     else:
         raise TypeError(
