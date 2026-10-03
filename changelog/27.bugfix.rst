@@ -1,0 +1,14 @@
+`~plasmapy.diagnostics.pic_thomson.condition_phase_space` now resamples a
+non-uniform velocity axis onto a uniform one, at the finest spacing the axis
+has. Readers that bin proper velocity -- OSIRIS, openPMD -- return
+:math:`v = u c / \sqrt{1 + u^2}`, compressed toward the edges to 0.35 of the
+centre spacing on a :math:`\pm 1` grid, and
+`~plasmapy.diagnostics.thomson.arbitrary_derivative` differentiates with
+fixed-spacing stencils. A whole-axis velocity rescale resampled onto a uniform
+grid and hid this; a species conditioned without one -- drift-only electrons, the
+correct treatment for real-mass electrons -- reached the forward model raw, with
+:math:`f'` wrong by up to 2.8 times. On ``omegashock_w3.5e11_exp`` that put the
+EPW satellites about 6 nm from Bohm-Gross on every collective frame; they now sit
+within a median of 0.12 nm (blue) and 0.37 nm (red).
+`~plasmapy.diagnostics.thomson.arbitrary_derivative` now raises on a
+non-uniform axis instead of returning a wrong derivative.

@@ -1,21 +1,25 @@
-`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` takes
-``n_quadrature_points``, which sets how finely the forward model samples the
-principal-value integral for :math:`\chi`. The default is unchanged, and is
-enough for a smooth distribution: on an analytic Maxwellian the default
-reproduces the converged spectrum to 0.02 dex at :math:`\alpha \approx 4`.
+`~plasmapy.diagnostics.thomson.arbitrary_chi` now evaluates the principal-value
+integral for :math:`\chi` in closed form, and is exact for the piecewise-linear
+interpolant of :math:`f'` that it was always integrating. The quadrature it
+replaces had three faults.
 
-It is not enough for a PIC histogram. `~plasmapy.diagnostics.thomson.arbitrary_chi`
-evaluates :math:`\int f'(u)/(u - \xi)\,\mathrm{d}u` on a sample grid anchored at
-:math:`\xi` and geometrically graded away from it, so as :math:`\xi` sweeps the
-wavelength axis the grid slides underneath a shot-noise-roughened :math:`f'`
-and the quadrature error oscillates with it. The result is a regular ringing in
-the computed spectrum whose period is set by the outer sample spacing -- about
-2.2 nm on a KinShock run at 532 nm -- and which is uncorrelated frame to frame
-because the noise it is sampling is.
+- It was first order in ``nPoints`` on a grid anchored at :math:`\xi`, so on a
+  noisy PIC distribution it rang at the sample spacing as :math:`\xi` swept the
+  wavelength axis: 0.56 dex in the EPW wings of a KinShock run and 0.64 dex in
+  the IAW wings at the default ``nPoints=1e3``, and 0.26 dex across the
+  satellites of an OSIRIS run.
+- Its window was :math:`\xi` plus or minus the span of the velocity axis, which
+  misses part or all of an ion distribution whenever :math:`|\xi|` exceeds the
+  span -- which in an EPW window it always does. No ``nPoints`` reduced this; at
+  ``1e5`` it still left 0.17 dex in late KinShock frames.
+- An odd ``nPoints`` gave the two sides of the singularity different spacings,
+  so the standoff terms stopped cancelling: 22.7% error in :math:`\chi` at 1001,
+  against 4.9% at 1000.
 
-On ``KinShock2020/runs/R1_phase/R1_paper_470eV`` at z = 0.69 mm the wings of
-both features carried 0.56 dex (EPW) and 0.64 dex (IAW) of this ringing after
-the shock passed the probe. Raising ``n_quadrature_points`` to ``1e4`` -- which
-is converged, and agrees with ``1e5`` -- takes them to 0.10 and 0.045 dex. The
-ion-feature FWHM moves by up to 14% between the two, so IAW widths measured at
-the default carry that as a systematic.
+The closed form agrees with a brute-force quadrature at :math:`h/2000` to
+:math:`4\times10^{-11}` on a Maxwellian and :math:`4\times10^{-8}` on a noisy
+histogram, recovers the large-:math:`\xi` asymptote, and makes the forward model
+about 40 times faster end to end on a 51-frame run -- 27 s to under a second --
+with no large temporaries. ``phi``, ``nPoints``, ``inner_range`` and
+``inner_frac`` are still accepted and are now unused. Both numba kernels are
+compiled with ``cache=True``, which removes an 8.5 s compile from every process.

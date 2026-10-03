@@ -8,15 +8,8 @@ therefore :math:`\alpha` are already physical, while every ion velocity and the
 bulk flow the electrons share with the ions are :math:`\sqrt{R}` too fast. Four
 treatments are compared; see ``plan.md`` sections 16 and 17.
 
-Three settings here are not the module defaults, and each of them was arrived
+Two settings here are not the module defaults, and each of them was arrived
 at by a measurement rather than a preference:
-
-``--quadrature-points 1e4``
-    The forward model's principal-value integral for :math:`\chi` is sampled on
-    a grid anchored at :math:`\xi`. Its default resolution is converged for a
-    smooth distribution and is not for a PIC histogram: the grid slides under a
-    shot-noise-roughened :math:`f'` as :math:`\xi` sweeps the wavelength axis,
-    putting ~0.5 dex of spurious ringing into the wings of both features.
 
 ``--probe-cells 11``
     A Thomson collection volume at 532 nm is tens to a hundred microns; a cell
@@ -149,7 +142,6 @@ def spectra(species: dict, args, **treatment: float) -> pt.ThomsonSpectrogram:
                 "smoothing_width": args.smoothing_width,
                 "smoothing_iterations": args.smoothing_iterations,
             },
-            n_quadrature_points=args.quadrature_points,
             progress=False,
             **treatment,
         )
@@ -348,7 +340,6 @@ def figure(runs: dict, args) -> None:  # noqa: PLR0915
         f"pic_thomson on KinShock, z = {args.position:.2f} mm  —  reduced mass ratio "
         rf"$m_i/m_e={args.mass_ratio:.0f}$, $R=m_p/m_{{sim}}$"
         f"\n{args.probe_cells}-cell probe volume · "
-        f"quadrature {args.quadrature_points:.0e} · "
         f"fixed {args.notch[0]:.0f}–{args.notch[1]:.0f} nm notch · "
         "linear colour scale (set from the satellites, not the probe line)",
         fontsize=12,
@@ -387,12 +378,6 @@ def main() -> None:
         type=int,
         default=11,
         help="cells the collection volume spans; averaged, not summed",
-    )
-    parser.add_argument(
-        "--quadrature-points",
-        type=float,
-        default=1e4,
-        help="sample points for the principal-value integral giving chi",
     )
     parser.add_argument("--smoothing-width", type=float, default=0.25)
     parser.add_argument("--smoothing-iterations", type=int, default=2)

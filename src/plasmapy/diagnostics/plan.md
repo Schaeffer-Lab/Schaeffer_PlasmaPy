@@ -1989,3 +1989,75 @@ is the skirt at the notch edge -- 1e-5 of the peak -- which normalisation
 promotes into a saturated rail along both notch edges, across every such frame.
 That rail is what made the EPW panel unreadable, and widening the notch only
 moved it. Sharing one scale makes brightness mean intensity.
+
+## 18. Exact susceptibility, and a regression in 17.8
+
+### 18.1 17.8 shipped with the satellites in the wrong place
+
+17.8 switched the OSIRIS electrons from a whole-axis rescale to a drift-only
+translation. That was right for alpha, and it exposed something the whole-axis
+path had hidden: OSIRIS bins proper velocity, so after `v = u c / sqrt(1 + u^2)`
+the axis is non-uniform -- edge spacing 0.354 of the centre on `u` in +-1 --
+and `arbitrary_derivative` assumes `dx = x[1] - x[0]`. `rescale_velocity_axis`
+used to resample every species onto a `linspace` and so fixed the grid by
+accident; drift-only never resamples, so the raw grid reached the model and
+`f'` was wrong by up to 2.8x. The satellites of figures 06, 07, 10 and 14 sat
+about 6 nm from Bohm-Gross (515/549 against 520/544 nm on an analytic
+Maxwellian). Alpha barely moved, which is why 17.8's table was right and its
+figures were not.
+
+Fixed in two places: `condition_phase_space` resamples any non-uniform axis
+onto a uniform one at its finest spacing (linear interpolation; width moves by
+about dv^2/24 sigma^2, 1e-4 here), and `arbitrary_derivative` raises on a
+non-uniform axis rather than return a wrong answer.
+
+### 18.2 The principal value has a closed form
+
+The quadrature in `arbitrary_chi` integrated the piecewise-linear interpolant
+of `f'` numerically -- and that integral is elementary. Writing
+`L(t) = L(u0) + sum_j c_j (t - u_j)_+` with `c_j` the change of slope at node j,
+
+    PV int L(t)/(t - x) dt = L(u0) ln|(uN - x)/(u0 - x)|
+                             + sum_j c_j [(uN - u_j) + (x - u_j) ln|(uN - x)/(u_j - x)|]
+
+Replacing the quadrature with this removes three faults at once: the
+first-order convergence in `nPoints` that made noisy input ring (17.2); the
+window `xi +- span`, which missed part or all of an ion distribution whenever
+`|xi|` exceeded the span -- always, in an EPW window -- and which no `nPoints`
+fixed (0.17 dex left at 1e5); and the floor/ceil split that broke the
+cancellation across the singularity for odd `nPoints` (22.7% at 1001).
+
+Verified against brute-force quadrature at h/2000 (4e-11 Maxwellian, 4e-8 noisy
+histogram) and against the large-xi asymptote `int f / xi^2 + 3 int u^2 f / xi^4`
+to 1e-4. `n_quadrature_points`, added in 17.2, is gone; the quadrature
+parameters of `arbitrary_chi` are accepted and unused.
+
+### 18.3 What it buys
+
+| | before | after |
+|---|---|---|
+| 51 KinShock frames, model | 27 s (1e4), 270 s (1e5) | under 1 s |
+| per-process JIT | 8.5 s | cached |
+| `test_pic_thomson` + `test_thomson` | 44 s | 9 s |
+| OSIRIS end to end, 52 frames | minutes | 9 s, now dominated by reading |
+
+Satellites against Bohm-Gross on the 38 collective frames of
+`omegashock_w3.5e11_exp`: median +0.12 nm (blue), -0.37 nm (red). The tool's
+own check reported "observed/predicted" against the bare plasma-frequency shift
+and selected frames by whether *that* cleared the notch, which excluded every
+collective frame and compared the non-collective ones, where there is no
+resonance; it now compares against Bohm-Gross on frames with alpha > 1.2.
+
+### 18.4 Still open (from the audit)
+
+- `extend_vdf_tail` treats the smallest positive value as one particle; OSIRIS
+  deposits fractional, variably weighted contributions, so inferred counts are
+  3-200x high and `min_counts=10` means 0.05-3 particles.
+- The vacuum threshold is relative to `reference_density`, which WarpX,
+  openPMD, `from_moments` and `from_arrays` set to 1 m^-3, so it never fires.
+- Ion terms weighted by `Z * ifract` rather than `Z^2 * ifract / Zbar`; ion
+  mass passed in units of m_p and converted with the amu (0.72% light).
+- A frame's spectrum depends on which other frames are passed (conditioning
+  sizes windows from run-wide quantities): chunking a run changes frames by up
+  to 2.7 dex.
+- The torch path (`autodiff_forwardmodel`) still uses the old quadrature.

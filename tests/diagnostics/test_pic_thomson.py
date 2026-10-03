@@ -5314,3 +5314,57 @@ class TestRescaleVDFDrift:
                 electrons=electrons, ions=[ions], velocity_scale_factor=self.R
             )
         assert np.nanmedian(scaled.alpha_epw) > 3 * np.nanmedian(plain.alpha_epw)
+
+
+class TestNonuniformVelocityAxis:
+    """
+    Readers that bin proper velocity hand back a non-uniform v axis, and the
+    forward model differentiates with fixed-spacing stencils. Conditioning has
+    to leave every species on a uniform axis, whether or not it is rescaled.
+    """
+
+    @staticmethod
+    def phase_space():
+        proper = np.linspace(-1.0, 1.0, 801)
+        v = proper * const.c.si.value / np.sqrt(1 + proper**2)
+        sigma = 2e7
+        f = np.exp(-((v - 3e6) ** 2) / (2 * sigma**2))[None, :, None]
+        return pic_thomson.from_arrays(
+            f=f,
+            v=v,
+            x=np.array([0.0]),
+            t=np.array([0.0]),
+            label="e-",
+            meta={"reference_density": 1.0},
+        )
+
+    @pytest.mark.parametrize(
+        "settings",
+        [{}, {"drift_scale_factor": 18.36}, {"velocity_scale_factor": 18.36}],
+    )
+    def test_conditioned_axis_is_uniform(self, settings) -> None:
+        conditioned = pic_thomson.condition_phase_space(
+            self.phase_space(), tail_model=None, taper_threshold=None, **settings
+        )
+        steps = np.diff(conditioned.v)
+        np.testing.assert_allclose(steps, steps[0], rtol=1e-6)
+
+    def test_resampling_keeps_the_moments(self) -> None:
+        raw = self.phase_space()
+        conditioned = pic_thomson.condition_phase_space(
+            raw, tail_model=None, taper_threshold=None
+        )
+        assert conditioned.meta["conditioning"]["resampled_to_uniform"] > raw.v.size
+
+        def moments(ps):
+            g = ps.f[0, :, 0] / np.trapezoid(ps.f[0, :, 0], ps.v)
+            mean = np.trapezoid(g * ps.v, ps.v)
+            return mean, np.sqrt(np.trapezoid(g * (ps.v - mean) ** 2, ps.v))
+
+        # Linear interpolation of a distribution sampled at the raw core
+        # spacing dv adds about dv^2 / 12 to its variance: 1e-4 of the width
+        # here, 2e-4 of the temperature.
+        np.testing.assert_allclose(moments(conditioned), moments(raw), rtol=3e-4)
+        np.testing.assert_allclose(
+            np.trapezoid(conditioned.f[0, :, 0], conditioned.v), 1.0, rtol=1e-12
+        )

@@ -185,7 +185,6 @@ def run_pipeline(electrons, ions, args, reference_density, position, *, bounded)
         # It is why the EPW panel read as empty.
         ion_velocity_scale_factor=args.velocity_scale_factor,
         electron_drift_scale_factor=args.velocity_scale_factor,
-        n_quadrature_points=args.quadrature_points,
         # Keep every row in both: with the tail fitted, a resonance past the
         # sampled data is an extrapolation priced by epw_tail_uncertainty rather
         # than something to hide.
@@ -294,62 +293,66 @@ def report(name, spectrogram, reference) -> dict:
 
 def check_epw_tracks_density(spectrogram, notch) -> None:
     r"""
-    Check the EPW satellite against the plasma-frequency shift.
+    Check the EPW satellites against Bohm-Gross, on the frames that have them.
 
-    The satellite sits at the plasma frequency plus a Bohm-Gross excess, so the
-    observed-to-predicted ratio should be :math:`\sqrt{1 + 3 k^2 \lambda_{De}^2}`
-    -- a little above one. Agreement validates the whole chain: reader units,
-    conditioning, and forward model.
+    The resonance sits at :math:`\omega^2 = \omega_{pe}^2 (1 + 3/\alpha^2)`,
+    with :math:`\alpha = 1/k\lambda_{De}`, which on each side of the probe
+    maps to :math:`\lambda_\pm = 2\pi c / (\omega_0 \mp \omega)`. Agreement
+    validates the whole chain: reader units, conditioning, and forward model.
 
-    The notch has to be kept out of it. Where the satellite would fall inside
-    the notch, the largest surviving value sits on the notch edge and the ratio
-    is meaningless, so those timesteps are excluded rather than reported.
+    Two exclusions, each of which an earlier version of this check got wrong.
+    Only frames with :math:`\alpha > 1.2` count: below that there is no
+    resonance, and the peak of the electron feature is not a satellite. And the
+    notch test uses the Bohm-Gross offset, not the bare plasma-frequency shift,
+    which is smaller -- testing that against the notch threw away every
+    collective frame of ``omegashock_w3.5e11_exp`` and left only the
+    non-collective ones, where the comparison means nothing.
     """
     epw_nm = EPW_WAVELENGTHS.to_value(u.nm)
-    probe_nm = PROBE_WAVELENGTH.to_value(u.nm)
     notch_nm = u.Quantity(notch, u.nm).to_value(u.nm)
-    clearance = 2.0  # nm the satellite must clear the notch edge by
-    red = epw_nm > notch_nm[1] + clearance
-    peaks = peak_wavelength(spectrogram.epw, epw_nm, red)
-
+    c = const.c.si.value
+    omega_0 = 2 * np.pi * c / PROBE_WAVELENGTH.to_value(u.m)
     omega_pe = np.sqrt(
         spectrogram.electron_density
         * const.e.si.value**2
         / (const.eps0.si.value * const.m_e.si.value)
     )
-    predicted = (
-        PROBE_WAVELENGTH.to_value(u.m) ** 2
-        * omega_pe
-        / (2 * np.pi * const.c.si.value)
-        * 1e9
-    )
-    observed = peaks - probe_nm
-    ratio = observed / predicted
+    # The forward model reports sqrt(2) * wpe / (k sigma); 1/(k lambda_De) is
+    # that over sqrt(2).
+    alpha = spectrogram.alpha_epw / np.sqrt(2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        omega = omega_pe * np.sqrt(1 + 3 / alpha**2)
+    expected = {
+        "blue": 2 * np.pi * c / (omega_0 + omega) * 1e9,
+        "red": 2 * np.pi * c / (omega_0 - omega) * 1e9,
+    }
+    outside = {"blue": epw_nm < notch_nm[0], "red": epw_nm > notch_nm[1]}
+    search = 6.0  # nm either side of Bohm-Gross to look for the peak
 
-    # Only meaningful where the satellite clears the notch and still fits inside
-    # the window.
-    usable = (
-        np.isfinite(ratio)
-        & (predicted > notch_nm[1] - probe_nm + clearance)
-        & (peaks < epw_nm[-1] - 5)
-    )
-    # Bohm-Gross expectation from the reported alpha, converting the forward
-    # model's sqrt(2)*wpe/(k*sigma) convention into 1/(k*lambda_De).
-    k_lambda_de = np.sqrt(2) / spectrogram.alpha_epw
-    expected = np.sqrt(1 + 3 * k_lambda_de**2)
+    offsets = {"blue": [], "red": []}
+    for step in np.nonzero(np.isfinite(alpha) & (alpha > 1.2))[0]:
+        row = np.nan_to_num(np.asarray(spectrogram.epw[step], dtype=float))
+        found = {}
+        for side in ("blue", "red"):
+            near = outside[side] & (np.abs(epw_nm - expected[side][step]) < search)
+            if near.sum() < 3 or row[near].max() <= 0:
+                break
+            found[side] = epw_nm[near][np.argmax(row[near])] - expected[side][step]
+        if len(found) == 2:
+            for side, offset in found.items():
+                offsets[side].append(offset)
 
-    print("\nEPW satellite vs the plasma-frequency shift:")
+    print("\nEPW satellites vs Bohm-Gross (frames with alpha > 1.2):")
     print(
-        f"  usable timesteps:           {int(usable.sum())} of {spectrogram.n_time}"
-        f"   (satellite must clear the notch)"
+        f"  frames compared:            {len(offsets['red'])} of {spectrogram.n_time}"
     )
-    if usable.any():
-        print(f"  observed / predicted:       median {np.nanmedian(ratio[usable]):.3f}")
-        print(
-            f"  Bohm-Gross expectation:     median "
-            f"{np.nanmedian(expected[usable]):.3f}"
-            f"   (= sqrt(1 + 3 k^2 lambda_De^2) from alpha)"
-        )
+    for side in ("blue", "red"):
+        if offsets[side]:
+            values = np.asarray(offsets[side])
+            print(
+                f"  {side:4s} observed - expected:  median {np.median(values):+.2f} nm"
+                f"   (largest {values[np.argmax(np.abs(values))]:+.2f} nm)"
+            )
 
 
 def figure(spectrograms, results, reference, args) -> None:  # noqa: PLR0915
@@ -559,17 +562,6 @@ def main() -> None:  # noqa: PLR0915
         help="cells the collection volume spans, averaged. Cells here are "
         "19.9 um on omegashock_w3.5e11_exp, so 5 is a 100 um volume -- the "
         "scale of a real 532 nm Thomson collection volume. 1 disables it",
-    )
-    parser.add_argument(
-        "--quadrature-points",
-        type=float,
-        default=1e4,
-        help="sample points for the principal-value integral giving chi. The "
-        "forward model's own default, 1e3, is converged for a smooth "
-        "distribution and is not for a noisy one -- see plan.md 17.2. This run "
-        "smooths hard and has up to 5e5 macroparticles in the sampled cell, so "
-        "it is converged either way; the setting is explicit because the "
-        "KinShock run is not",
     )
     parser.add_argument("--stride", type=int, default=1, help="read every Nth dump")
     parser.add_argument(

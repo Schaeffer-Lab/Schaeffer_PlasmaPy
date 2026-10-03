@@ -117,7 +117,6 @@ def spectra(electrons, ions, density, position, args, **treatment):
                 "pedestal_warning": None,
             },
             mask_unresolved_epw=False,
-            n_quadrature_points=args.quadrature_points,
             progress=False,
             **treatment,
         )
@@ -195,7 +194,6 @@ def main() -> None:
     parser.add_argument("--notch", nargs=2, type=float, default=[525.0, 539.0])
     parser.add_argument("--spectral-bins", type=int, default=500)
     parser.add_argument("--probe-cells", type=int, default=5)
-    parser.add_argument("--quadrature-points", type=float, default=1e4)
     parser.add_argument("--smoothing-width", type=float, default=0.25)
     parser.add_argument("--smoothing-iterations", type=int, default=4)
     parser.add_argument("--electron", default="e")

@@ -1602,6 +1602,12 @@ def _resolve_smoothing_window(
     )
 
 
+def _is_uniform(v, rtol: float = 1e-6) -> bool:
+    """Whether a velocity axis is evenly spaced, to *rtol* of its first step."""
+    steps = np.diff(np.asarray(v, dtype=np.float64))
+    return bool(np.all(np.abs(steps - steps[0]) <= rtol * abs(steps[0])))
+
+
 def condition_phase_space(  # noqa: C901
     phase_space: PICPhaseSpace,
     *,
@@ -1764,6 +1770,23 @@ def condition_phase_space(  # noqa: C901
         f = np.clip(f, a_min=floor, a_max=None)
 
     v = phase_space.v
+    # The forward model differentiates f with fixed-spacing stencils, so it
+    # needs a uniform axis. Readers that bin proper velocity (OSIRIS, openPMD)
+    # do not give one: v = u c / sqrt(1 + u^2) compresses the edges, to 0.35 of
+    # the centre spacing on a +-1 grid. A whole-axis rescale used to resample
+    # every species onto a linspace and hid this; a species conditioned
+    # without one -- drift-only electrons -- reached the model raw, and its
+    # derivative was wrong by the local spacing ratio. Resample here, at the
+    # finest spacing the axis has, so no part of it loses resolution.
+    resampled = None
+    if velocity_scale_factor is None and not _is_uniform(v):
+        steps = np.diff(v)
+        n_uniform = int(np.ceil((v[-1] - v[0]) / steps.min())) + 1
+        v, f = rescale_velocity_axis(
+            f, v, 1.0, target_v=np.linspace(v[0], v[-1], n_uniform)
+        )
+        f = normalize_vdf(f, v)
+        resampled = n_uniform
     conditioning = {
         "smoothing_window": window,
         "smoothing_width": smoothing_width,
@@ -1774,6 +1797,7 @@ def condition_phase_space(  # noqa: C901
         "max_taper_width": None if extending else max_taper_width,
         "drift": drift_info,
         "floor": floor,
+        "resampled_to_uniform": resampled,
     }
 
     if velocity_scale_factor is not None:
@@ -2440,7 +2464,6 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0912, PLR0915
     notch_containment: float = 0.999,
     notch_margin: float = 1.5,
     notch_max_fraction: float = 0.2,
-    n_quadrature_points: float = 1e3,
     probe_vec=(1.0, 0.0, 0.0),
     scatter_vec=(0.0, 1.0, 0.0),
     electron_conditioning: dict[str, Any] | None = None,
@@ -2508,20 +2531,6 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0912, PLR0915
         Widens the automatic mask by this factor about its centre, since the
         containment interval stops where the feature is still well above the
         satellites.
-    n_quadrature_points : `float`
-        Sample points the forward model uses for the principal-value integral
-        that gives :math:`\\chi`. The default, ``1e3``, is the forward model's
-        own default and is enough for a smooth analytic distribution -- it
-        reproduces the converged answer to 0.02 dex at
-        :math:`\\alpha \\approx 4`. It is **not** enough for a PIC histogram.
-        The integrand is :math:`f'(u)/(u - \\xi)` sampled on a grid anchored at
-        :math:`\\xi`, so as :math:`\\xi` sweeps the wavelength axis the grid
-        slides under a shot-noise-roughened :math:`f'` and the quadrature error
-        oscillates with it. On a 2000-macroparticle probe cell that puts
-        0.5 dex of spurious ringing into the wings of both features, at a
-        period set by the sample spacing rather than by anything physical.
-        ``1e4`` converges it -- see the notes on `smooth_vdf` for the
-        complementary lever.
     notch_max_fraction : `float`
         Hard cap on the automatic mask's half-width, as a fraction of the
         Bohm--Gross satellite offset. A mask must not eat what it is protecting:
@@ -2797,7 +2806,6 @@ def spectra_from_phase_spaces(  # noqa: C901, PLR0912, PLR0915
             "probe_vec": probe_vec,
             "scatter_vec": scatter_vec,
             "scattered_power": scattered_power,
-            "n_quadrature_points": n_quadrature_points,
         }
 
         # The IAW window first, because an automatic stray-light mask is sized

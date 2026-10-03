@@ -1415,3 +1415,84 @@ def test_model_input_validation(
             if msg is not None:
                 print(excinfo.value)  # noqa: T201
                 assert msg in str(excinfo.value)
+
+
+class TestArbitraryChi:
+    r"""
+    `~plasmapy.diagnostics.thomson.arbitrary_chi` evaluates the principal value
+    in closed form. Checked here against an independent brute-force quadrature,
+    and against the large-:math:`\xi` asymptote a truncated integration window
+    cannot reach.
+    """
+
+    u_axis = np.linspace(-6, 6, 513)
+    unit = {"k": 1.0, "v_th": 1.0, "n": 1.0, "particle_m": 1.0, "particle_q": 1.0}
+
+    @classmethod
+    def coefficient(cls) -> float:
+        """The prefactor arbitrary_chi applies to the integral, for `unit`."""
+        wpl2 = 1.6022e-19**2 / (1.6605e-27 * 8.8541878e-12)
+        return -wpl2 / np.sqrt(2)
+
+    @staticmethod
+    def brute_force(f, u_axis, x):
+        """PV as int_0^S [g(x+s) - g(x-s)] / s ds on a step of h/2000."""
+        f_prime = thomson.arbitrary_derivative(f, u_axis, 1)
+        h = u_axis[1] - u_axis[0]
+        span = u_axis[-1] - u_axis[0]
+        out = []
+        for point in x:
+            reach = span + abs(point)
+            s = np.linspace(0, reach, int(reach / (h / 2000)) + 1)[1:]
+            g_plus = np.interp(point + s, u_axis, f_prime, left=0, right=0)
+            g_minus = np.interp(point - s, u_axis, f_prime, left=0, right=0)
+            y = (g_plus - g_minus) / s
+            out.append(np.trapezoid(y, s) + s[0] * y[0])
+        return np.array(out)
+
+    @pytest.mark.parametrize("noisy", [False, True])
+    def test_principal_value_matches_brute_force(self, noisy) -> None:
+        f = np.exp(-(self.u_axis**2))
+        if noisy:
+            # A PIC-like histogram: shot noise, and empty bins at the edges.
+            rng = np.random.default_rng(1)
+            f = np.clip(f * (1 + 0.2 * rng.standard_normal(f.size)), 0, None)
+            f[:20] = 0
+            f[-20:] = 0
+        x = np.array([-5.7, -2.1, -0.37, 0.0, 0.81, 1.9, 4.4])
+        chi = thomson.arbitrary_chi(f, self.u_axis, xi=x, **self.unit)
+        expected = self.brute_force(f, self.u_axis, x)
+        np.testing.assert_allclose(
+            chi.real / self.coefficient(), expected, rtol=1e-6, atol=1e-8
+        )
+
+    @pytest.mark.parametrize("xi", [20.0, 60.0, 200.0])
+    def test_far_phase_velocity_sees_the_whole_distribution(self, xi) -> None:
+        """
+        PV of f'(u)/(u - xi) tends to (int f du) / xi^2 + 3 (int u^2 f du) / xi^4.
+
+        The old quadrature integrated over xi plus or minus the axis span, so
+        once |xi| exceeded the span -- every ion in an EPW window -- it missed
+        part or all of the distribution, however many points it used.
+        """
+        f = np.exp(-(self.u_axis**2))
+        chi = thomson.arbitrary_chi(f, self.u_axis, xi=np.array([xi]), **self.unit)
+        norm = np.trapezoid(f, self.u_axis)
+        second = np.trapezoid(self.u_axis**2 * f, self.u_axis)
+        asymptote = norm / xi**2 + 3 * second / xi**4
+        np.testing.assert_allclose(
+            chi.real[0] / self.coefficient(), asymptote, rtol=1e-4
+        )
+
+    def test_odd_and_even_point_counts_agree(self) -> None:
+        """The quadrature parameters are kept for compatibility and do nothing."""
+        f = np.exp(-(self.u_axis**2))
+        x = np.linspace(-3, 3, 41)
+        a = thomson.arbitrary_chi(f, self.u_axis, xi=x, nPoints=1000, **self.unit)
+        b = thomson.arbitrary_chi(f, self.u_axis, xi=x, nPoints=1001, **self.unit)
+        np.testing.assert_array_equal(a, b)
+
+    def test_derivative_refuses_a_nonuniform_axis(self) -> None:
+        u_axis = np.sinh(np.linspace(-2, 2, 513))
+        with pytest.raises(ValueError, match="uniformly spaced"):
+            thomson.arbitrary_derivative(np.exp(-(u_axis**2)), u_axis, 1)
