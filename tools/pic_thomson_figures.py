@@ -431,7 +431,7 @@ def figure_osiris_spectrogram(electrons, ions, reference_density, position) -> N
             cmap="inferno",
             vmax=np.percentile(finite, 99) if finite.size else None,
         )
-        fig.colorbar(image, ax=ax, label="scattered power (arb., area-normalised)")
+        fig.colorbar(image, ax=ax, label=r"$n_e S(k, \omega)$ (arb.)")
         ax.set_xlabel("time (ns)")
         ax.set_ylabel("wavelength (nm)")
         ax.set_title(f"{name} spectrogram at x = {spectrogram.position * 1e3:.2f} mm")

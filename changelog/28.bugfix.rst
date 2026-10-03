@@ -1,0 +1,20 @@
+Three faults in the arbitrary-distribution forward model of
+`plasmapy.diagnostics.thomson`, found by checking it against
+`~plasmapy.diagnostics.thomson.spectral_density` on a hydrogen-carbon mixture,
+which it now reproduces to better than one part in :math:`10^4`:
+
+- The ion term was weighted by :math:`Z_j \, f_j` instead of
+  :math:`Z_j^2 f_j / \bar{Z}`. The two agree for one ion species and differ for
+  several -- by 24-39% across the ion feature of an H/C mixture. Fixed in the
+  arbitrary, Maxwellian-fast, autodiff and experimental paths; the public
+  `~plasmapy.diagnostics.thomson.spectral_density` already had it right.
+- Ion masses were passed in units of :math:`m_p` to
+  `~plasmapy.diagnostics.thomson.arbitrary_chi`, which converts with the atomic
+  mass unit, making every ion 0.72% light and shifting the ion feature.
+- `~plasmapy.diagnostics.thomson.arbitrary_forwardmodel` rewrote the caller's
+  list of ion species in place, replacing strings with `Particle` objects.
+
+The autodiff path's susceptibility now uses the same closed-form principal value
+as the numpy path, removing the window truncation that missed ion distributions
+and the odd-``nPoints`` failure there too; it agrees with the numpy path to
+:math:`10^{-9}` and differentiates through it.

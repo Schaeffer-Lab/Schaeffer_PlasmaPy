@@ -1,0 +1,14 @@
+`~plasmapy.diagnostics.pic_thomson.extend_vdf_tail` no longer assumes the
+smallest positive value of a histogram is one macroparticle unless the
+histogram really is whole multiples of it. OSIRIS deposits fractional, variably
+weighted contributions; there the smallest value is a sliver of a particle, and
+on ``omegashock_w3.5e11_exp`` the inferred count was 12-14 times the deck's
+(5-41 interquartile), so ``min_counts=10`` meant about one particle and the tail
+join sat in noise. For such slices the quantum now comes from the slice's own
+shot noise -- bin variance is ``quantum * f``, measured from second differences
+and corrected for the correlation a shaped deposit puts between neighbouring
+bins -- and never claims more particles than the smallest value allows. Against
+the deck's macroparticle count it lands at 0.84-1.07 for ions and about 1.9 for
+electrons. Quantised histograms (WarpX) are unchanged. ``quantum`` (and
+``tail_quantum`` on `~plasmapy.diagnostics.pic_thomson.condition_phase_space`)
+overrides the estimate when the weights are known.

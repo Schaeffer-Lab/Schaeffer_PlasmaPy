@@ -134,6 +134,7 @@ from plasmapy.utils.decorators import validate_quantities
 _c = const.c.si.value  # Make sure C is in SI units
 _e = const.e.si.value
 _m_p = const.m_p.si.value
+_MP_IN_AMU = _m_p / 1.6605e-27  # the amu arbitrary_chi converts with
 
 # Most-probable, 3D thermal-speed coefficient, used with thermal_speed_lite to
 # reproduce the unit-stripped thermal speed previously provided by the
@@ -166,10 +167,12 @@ def arbitrary_derivative(f, x, order):
     # The stencils below assume uniform spacing. A non-uniform axis -- OSIRIS
     # bins proper velocity, so v = u c / sqrt(1 + u^2) is compressed toward
     # the edges -- gives derivatives wrong by the local spacing ratio, which
-    # on one real run moved the EPW satellites by 6 nm. Refuse it.
+    # on one real run moved the EPW satellites by 6 nm. Refuse it. The
+    # tolerance only has to clear round-off from unit conversions (~4e-6 of a
+    # step has been seen); the non-uniformity that matters is O(1).
     dx = x[1] - x[0]
     for j in range(1, len(x) - 1):
-        if abs((x[j + 1] - x[j]) - dx) > 1e-6 * abs(dx):
+        if abs((x[j + 1] - x[j]) - dx) > 1e-4 * abs(dx):
             raise ValueError(
                 "arbitrary_derivative needs a uniformly spaced axis; resample "
                 "the distribution onto one first."
@@ -374,7 +377,9 @@ def arbitrary_fast_spectral_density_arbdist(
     scattered_power=False,
     inner_range=0.1,
     inner_frac=0.8,
-    return_chi = False
+    return_chi = False,
+    *,
+    normalize: bool = True,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor],
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -521,7 +526,8 @@ def arbitrary_fast_spectral_density_arbdist(
             xi=xii[i],
             v_th=vTi[i],
             n=ni[i],
-            particle_m=ion_m[i],
+            # ion_m is in units of m_p; arbitrary_chi takes amu.
+            particle_m=ion_m[i] * _MP_IN_AMU,
             particle_q=ion_z[i],
             inner_range = inner_range,
             inner_frac = inner_frac
@@ -555,7 +561,8 @@ def arbitrary_fast_spectral_density_arbdist(
         icontr[m] = ifract[m] * (
             2
             * np.pi
-            * ion_z[m]
+            * ion_z[m] ** 2
+            / zbar
             / k
             * np.power(np.abs(np.sum(chiE, axis=0) / epsilon), 2)
             * np.interp(
@@ -593,8 +600,12 @@ def arbitrary_fast_spectral_density_arbdist(
 
     # print("S(k,w) before normaliation:", Skw)
 
-    # Normalize result to have integral 1
-    Skw = Skw / np.trapezoid(Skw, wavelengths)
+    # Normalize result to have integral 1. That discards the absolute
+    # intensity, which a single spectrum does not need and a time series does:
+    # normalize=False returns S(k, w) itself, so brightness is comparable
+    # between calls.
+    if normalize:
+        Skw = Skw / np.trapezoid(Skw, wavelengths)
 
     if not torch.is_tensor(alpha):
         alpha = torch.tensor(alpha, dtype=torch.float64)
@@ -627,6 +638,8 @@ def arbitrary_spectral_density_arbdist(
     inner_range=0.1,
     inner_frac=0.8,
     return_chi: bool = False,   # <-- NEW
+    *,
+    normalize: bool = True,
     ) -> Union[
     Tuple[np.floating, np.ndarray],
     Tuple[np.floating, np.ndarray, np.ndarray, np.ndarray]
@@ -660,6 +673,9 @@ def arbitrary_spectral_density_arbdist(
     # Condition ion_species
     if isinstance(ion_species, (str, Particle)):
         ion_species = [ion_species]  # ty:ignore[invalid-assignment]
+    # A copy: the loop below converts entries in place, and the caller's list
+    # is theirs.
+    ion_species = list(ion_species)  # ty:ignore[invalid-argument-type]
     if len(ion_species) == 0:  # ty:ignore[invalid-argument-type]
         raise ValueError("At least one ion species needs to be defined.")
     for ii, ion in enumerate(ion_species):  # ty:ignore[invalid-argument-type]
@@ -697,7 +713,8 @@ def arbitrary_spectral_density_arbdist(
         scattered_power,
         inner_range,
         inner_frac,
-        return_chi=return_chi
+        return_chi=return_chi,
+        normalize=normalize,
         )
     
     
@@ -822,7 +839,8 @@ def arbitrary_fast_spectral_density_maxwellian(
         icontr[m, :] = ifract[m] * (
             2
             * np.sqrt(np.pi)
-            * ion_z[m]
+            * ion_z[m] ** 2
+            / zbar
             / k
             / vTi[m]
             * np.power(np.abs(np.sum(chiE, axis=0) / epsilon), 2)
@@ -1017,6 +1035,9 @@ def arbitrary_spectral_density_maxwellian(
     # Condition ion_species
     if isinstance(ion_species, (str, Particle)):
         ion_species = [ion_species]  # ty:ignore[invalid-assignment]
+    # A copy: the loop below converts entries in place, and the caller's list
+    # is theirs.
+    ion_species = list(ion_species)  # ty:ignore[invalid-argument-type]
     if len(ion_species) == 0:  # ty:ignore[invalid-argument-type]
         raise ValueError("At least one ion species needs to be defined.")
     for ii, ion in enumerate(ion_species):  # ty:ignore[invalid-argument-type]
@@ -1683,6 +1704,7 @@ torch.set_default_dtype(torch.float64)
 _c = const.c.si.value  # Make sure C is in SI units
 _e = const.e.si.value
 _m_p = const.m_p.si.value
+_MP_IN_AMU = _m_p / 1.6605e-27  # the amu arbitrary_chi converts with
 _m_e = const.m_e.si.value
 
 def autodiff_derivative(f: torch.Tensor, x: torch.Tensor, derivative_matrices: Tuple[torch.Tensor, torch.Tensor], order: int):
@@ -1770,67 +1792,39 @@ def autodiff_chi(
 
     # Take f' = df/du and f" = d^2f/d^2u
     fPrime = autodiff_derivative(f=f, x=u_axis, derivative_matrices=derivative_matrices, order=1)
-    fDoublePrime = autodiff_derivative(f=f, x=u_axis, derivative_matrices=derivative_matrices, order=2)
 
-    # Interpolate f' and f" onto xi
-    g = autodiff_torch_1d_interp(xi, u_axis, fPrime)
-    gPrime = autodiff_torch_1d_interp(xi, u_axis, fDoublePrime)
+    # The principal value in closed form, exactly as in `arbitrary_chi`: f' is
+    # read as its linear interpolant L(t) = L(u0) + sum_j c_j (t - u_j)_+, and
+    #   PV int L(t)/(t - x) dt = L(u0) ln|(uN - x)/(u0 - x)|
+    #       + sum_j c_j [(uN - u_j) + (x - u_j) ln|(uN - x)/(u_j - x)|].
+    # The quadrature this replaces missed part or all of an ion distribution
+    # whenever |xi| exceeded the axis span, and broke for odd nPoints. This is
+    # differentiable in both f and xi.
+    # The quadrature's parameters, kept in the signature for compatibility.
+    del phi, nPoints, inner_range, inner_frac
+    u_start = u_axis[0]
+    u_end = u_axis[-1]
+    outside = (xi < u_start) | (xi > u_end)
+    g = torch.where(outside, torch.zeros_like(xi), autodiff_torch_1d_interp(xi, u_axis, fPrime))
 
-    # Set up integration ranges and spacing
-    # We need fine divisions near the asymtorchote, but not at infinity
+    slopes = (fPrime[1:] - fPrime[:-1]) / (u_axis[1:] - u_axis[:-1])
+    kinks = torch.cat((slopes[:1], slopes[1:] - slopes[:-1]))
+    nodes = u_axis[:-1]
+    constant = torch.sum(kinks * (u_end - nodes))
 
-    """
-    the fractional range of the inner fine divisions near the asymtorchote
-    inner_range = 0.1
-    the fraction of total divisions used in the inner range; should be > inner_range
-    inner_frac = 0.8
-    """
-    
-    with torch.no_grad():
-        outer_frac = torch.tensor([1.]) - inner_frac
+    def log_abs(value):
+        # ln|value|, with 0 where value is 0: every use is multiplied by
+        # something that vanishes there.
+        return torch.log(torch.where(value == 0, torch.ones_like(value), value.abs()))
 
-        m_inner = torch.linspace(0, inner_range, int(torch.floor(torch.tensor([nPoints / 2 * inner_frac]))))
-        p_inner = torch.linspace(0, inner_range, int(torch.ceil(torch.tensor([nPoints / 2 * inner_frac]))))
-        m_outer = torch.linspace(inner_range, 1, int(torch.floor(torch.tensor([nPoints / 2 * outer_frac]))))
-        p_outer = torch.linspace(inner_range, 1, int(torch.ceil(torch.tensor([nPoints / 2 * outer_frac]))))
-
-        m = torch.cat((m_inner, m_outer))
-        p = torch.cat((p_inner, p_outer))
-
-        # Generate integration sample points that avoid the singularity
-        # Create empty arrays of the correct size
-        zm = torch.zeros((len(xi), len(m)))
-        zp = torch.zeros((len(xi), len(p)))
-    
-        # Compute maximum width of integration range based on the size of the input array of normalized velocities
-        deltauMax = max(u_axis) - min(u_axis)
-        # print("deltauMax:", deltauMax)
-
-        # Compute arrays of offsets to add to the central points in xi
-        m_point_array = phi + m * deltauMax
-        p_point_array = phi + p * deltauMax
-
-        m_deltas = torch.cat((m_point_array[1:] - m_point_array[:-1], torch.tensor([0.])))
-        p_deltas = torch.cat((p_point_array[1:] - p_point_array[:-1], torch.tensor([0.])))
-
-        # The integration points on u
-        for i in range(len(xi)):
-            zm[i, :] = xi[i] + m_point_array
-            zp[i, :] = xi[i] - p_point_array
-
-    gm = autodiff_torch_1d_interp(zm, u_axis, fPrime)
-    gp = autodiff_torch_1d_interp(zp, u_axis, fPrime)
-    
-    # Evaluate integral (df/du / (u - xi)) du
-    M_array = m_deltas * gm / m_point_array
-    P_array = p_deltas * gp / p_point_array
-
-    integral = (
-        torch.sum(M_array, axis=1)
-        - torch.sum(P_array, axis=1)
-        + 1j * torch.pi * g
-        + 2 * phi * gPrime
+    distance = xi[:, None] - nodes[None, :]
+    ln_end = log_abs(u_end - xi)
+    principal = (
+        constant
+        + (distance * (ln_end[:, None] - log_abs(distance))) @ kinks
+        + fPrime[0] * (ln_end - log_abs(u_start - xi))
     )
+    integral = principal + 1j * torch.pi * g
 
     # Convert mass and charge to SI units
     m_SI = torch.tensor([particle_m * 1.6605e-27])
@@ -2006,7 +2000,8 @@ def autodiff_fast_spectral_density_arbdist(
             xi=xii[i],
             v_th=vTi[i],
             n=ni[i],
-            particle_m=ion_m[i],
+            # ion_m is in units of m_p; arbitrary_chi takes amu.
+            particle_m=ion_m[i] * _MP_IN_AMU,
             particle_q=ion_z[i],
             inner_range = inner_range,
             inner_frac = inner_frac
@@ -2043,7 +2038,8 @@ def autodiff_fast_spectral_density_arbdist(
         icontr[m] = ifract[m] * (
             2
             * torch.pi
-            * ion_z[m]
+            * ion_z[m] ** 2
+            / zbar
             / k
             * torch.pow(torch.abs(torch.sum(chiE, axis=0) / epsilon), 2)
             * iInterp[m]
@@ -2139,6 +2135,9 @@ def autodiff_spectral_density_arbdist(
     # Condition ion_species
     if isinstance(ion_species, (str, Particle)):
         ion_species = [ion_species]
+    # A copy: the loop below converts entries in place, and the caller's list
+    # is theirs.
+    ion_species = list(ion_species)
     if len(ion_species) == 0:
         raise ValueError("At least one ion species needs to be defined.")
     for ii, ion in enumerate(ion_species):
@@ -3464,7 +3463,8 @@ def spectral_density_lite_experimental(
         icontr[m, :] = ifract[m] * (
             2
             * np.sqrt(np.pi)
-            * ion_z[m]
+            * ion_z[m] ** 2
+            / zbar
             / k
             / vT_i[m]
             * np.power(np.abs(np.sum(chiE, axis=0) / epsilon), 2)
@@ -3677,7 +3677,8 @@ def spectral_power_lite_experimental(
         icontr[m, :] = ifract[m] * (
             2
             * np.sqrt(np.pi)
-            * ion_z[m]
+            * ion_z[m] ** 2
+            / zbar
             / k
             / vT_i[m]
             * np.power(np.abs(np.sum(chiE, axis=0) / epsilon), 2)

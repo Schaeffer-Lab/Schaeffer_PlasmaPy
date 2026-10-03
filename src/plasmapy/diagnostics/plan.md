@@ -2061,3 +2061,40 @@ resonance; it now compares against Bohm-Gross on frames with alpha > 1.2.
   sizes windows from run-wide quantities): chunking a run changes frames by up
   to 2.7 dex.
 - The torch path (`autodiff_forwardmodel`) still uses the old quadrature.
+
+## 19. The rest of the audit
+
+Fixed, each with a regression test:
+
+| fault | effect | fix |
+|---|---|---|
+| ion term weighted Z f instead of Z^2 f / Zbar (five fork paths) | H/C mixture ion feature 24-39% off; one species unaffected | Z^2/Zbar, matching `spectral_density` |
+| ion mass in m_p, converted with the amu | ions 0.72% light | convert at the call |
+| `arbitrary_forwardmodel` mutated the caller's ion list | strings became `Particle` | copy |
+| torch `autodiff_chi` still on the old quadrature | ion truncation, odd-nPoints | closed form, matches numpy to 1e-9 |
+| vacuum threshold relative to `reference_density` = 1 m^-3 for SI readers | never fired | `vacuum_density`; SI default from the peak at the probe |
+| alpha of an electron mixture an unweighted mean | `epw_resolved` wrong both ways | alpha^2 = sum f_p alpha_p^2; per-population requirement |
+| `{"skip": True}` passed unnormalised f to the model | alpha 21 orders out | normalise each slice before the call |
+| smoothing window from the narrowest slice of the run | chunking moved frames 2.7 dex | per-slice windows |
+| smallest value = one particle, on fractional deposits | OSIRIS counts 12-14x high | shot-noise quantum; deck check 0.84-1.07 (ions), ~1.9 (electrons) |
+| cache key = repr | numpy-1/2 caches never matched | canonical JSON, old keys still match |
+| every frame area-normalised by the model | no brightness history; the notch-edge rails | driver returns n_e S(k, w) by default |
+| automatic notch re-sized per frame | wandered 19-26x | one run-wide notch on the probe |
+
+The last two change what figures show. Figure 14 now has a brightness
+history: on `omegashock_w3.5e11_exp` the pre-shock satellites are faint at
+9e17 cm^-3 and the post-shock ones bright after the density jumps ~39x, which
+is what a streak camera records. Before, every frame was stretched to the same
+area. On OSIRIS, honest particle counts move the tail join inward (electrons
+3.65 -> 2.48 sigma, ions 3.42 -> 2.51 sigma), and `epw_tail_uncertainty` rises
+from 1.01 to 1.35 because more of the tail is now extrapolated and priced.
+
+Still open:
+
+- the SI vacuum default reads the run's peak density, so it is the one
+  remaining cross-frame dependence; pass `vacuum_density` to pin it;
+- the WarpX reader sizes its velocity grid from the fastest macroparticle in
+  the frames it reads, so reading a different subset bins differently;
+- the OSIRIS electron shot-noise count is ~2x the deck's (ions are right);
+- R = 50 vs rqm 68.5 and the `p+` labels (open decision 1);
+- WarpX spectra still in simulation units (11.4).

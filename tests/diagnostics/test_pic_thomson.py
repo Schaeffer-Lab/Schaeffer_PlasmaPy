@@ -2509,8 +2509,15 @@ class TestHDF5RoundTrip:
             assert handle["AXES/TIME_AXES/time"].attrs["UNITS"] == "s"
             assert handle["AXES/WAVELENGTH_AXES/epw_wavelengths"].attrs["UNITS"] == "m"
             assert handle.attrs["POSITION_UNITS"] == "m"
-            # The per-row normalisation is easy to forget; it is on the file.
-            assert "unit area" in handle.attrs["NORMALISATION"]
+            # Without a record of how rows were scaled, the file says so.
+            assert handle.attrs["NORMALISATION"] == "not recorded"
+        for flag, phrase in ((True, "unit area"), (False, "n_e S(k, omega)")):
+            spectrogram = synthetic_spectrogram()
+            spectrogram.meta["normalise_each_frame"] = flag
+            spectrogram.to_hdf5(path)
+            with h5py.File(path, "r") as handle:
+                assert phrase in handle.attrs["NORMALISATION"]
+        with h5py.File(path, "r") as handle:
             assert (
                 "lambda_De"
                 in (
@@ -4323,9 +4330,8 @@ class TestSmoothingWidth:
 
     def test_smoothing_is_sized_by_the_narrowest_slice(self):
         """
-        One boxcar serves every slice, so it has to suit the slice that can
-        least afford it -- otherwise a cold cell beside a hot one is smeared to
-        match the hot one's width.
+        Every slice gets a window sized against its own width, so a cold cell
+        beside a hot one is not smeared to match the hot one.
         """
         sigma = sigma_of(40.0, const.m_e)
         v = np.linspace(-40 * sigma, 40 * sigma, 1024)
@@ -4440,7 +4446,8 @@ class TestEPWTailCheck:
         # sqrt(alpha_conventional^2 + 3), with the model's alpha being sqrt(2)
         # times the conventional one.
         expected = np.sqrt(spectra.alpha_epw**2 / 2 + 3)
-        np.testing.assert_allclose(spectra.epw_tail_required, expected, rtol=1e-12)
+        assert spectra.epw_tail_required.shape == (1, spectra.n_time)
+        np.testing.assert_allclose(spectra.epw_tail_required[0], expected, rtol=1e-12)
 
     def test_reports_how_far_the_histogram_reaches(self):
         spectra = self.spectra(8.0)
@@ -5368,3 +5375,327 @@ class TestNonuniformVelocityAxis:
         np.testing.assert_allclose(
             np.trapezoid(conditioned.f[0, :, 0], conditioned.v), 1.0, rtol=1e-12
         )
+
+
+class TestVacuumThreshold:
+    """
+    A reader that already produces SI records ``reference_density = 1`` m^-3,
+    so a threshold relative to it was 0.01 m^-3 and never fired: frames with a
+    handful of macroparticles at the probe got a spectrum instead of NaN.
+    """
+
+    @staticmethod
+    def species(densities, label, *, is_electron, sigma):
+        v = np.linspace(-6 * sigma, 6 * sigma, 401)
+        shape = np.exp(-(v**2) / (2 * sigma**2)) / (np.sqrt(2 * np.pi) * sigma)
+        f = np.asarray(densities)[:, None, None] * shape[None, :, None]
+        return pic_thomson.from_arrays(
+            f=f,
+            v=v,
+            x=np.array([0.0]),
+            t=np.arange(len(densities)) * 1e-12,
+            label=label,
+            is_electron=is_electron,
+            meta={"reference_density": 1.0},
+        )
+
+    def run(self, **kwargs):
+        densities = [1e25, 1e25, 1e20]  # the last frame is all but empty
+        electrons = self.species(densities, "e-", is_electron=True, sigma=4e6)
+        ions = self.species(densities, "p+", is_electron=False, sigma=7e4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return pic_thomson.spectra_from_phase_spaces(
+                electrons,
+                ions,
+                position=0.0,
+                probe_wavelength=532 * u.nm,
+                epw_wavelengths=np.linspace(500, 564, 200) * u.nm,
+                iaw_wavelengths=np.linspace(531, 533, 200) * u.nm,
+                electron_conditioning={"skip": True},
+                ion_conditioning={"skip": True},
+                **kwargs,
+            )
+
+    def test_near_empty_frame_is_vacuum_for_si_input(self) -> None:
+        spectrogram = self.run()
+        assert np.isfinite(spectrogram.epw[:2]).all()
+        assert np.isnan(spectrogram.epw[2]).all()
+        assert spectrogram.meta["vacuum_density"] == pytest.approx(1e23)
+
+    def test_explicit_vacuum_density_wins(self) -> None:
+        spectrogram = self.run(vacuum_density=1e19 * u.m**-3)
+        assert np.isfinite(spectrogram.epw).all()
+        assert spectrogram.meta["vacuum_density"] == pytest.approx(1e19)
+
+
+class TestElectronMixtureAlpha:
+    """
+    The forward model reports the unweighted mean over electron populations of
+    sqrt(2) w_pe / (k sigma_p). The plasma's alpha comes from summing inverse
+    squared Debye lengths: alpha^2 = sum_p f_p alpha_p^2.
+    """
+
+    sigma_cold = 4e6
+
+    def run(self, fractions, widths):
+        v = np.linspace(-1.2e8, 1.2e8, 4001)
+        total = 1e25
+        species = []
+        for fraction, sigma in zip(fractions, widths, strict=True):
+            shape = np.exp(-(v**2) / (2 * sigma**2)) / (np.sqrt(2 * np.pi) * sigma)
+            species.append(
+                pic_thomson.from_arrays(
+                    f=(fraction * total * shape)[None, :, None],
+                    v=v,
+                    x=np.array([0.0]),
+                    t=np.array([0.0]),
+                    label="e-",
+                    is_electron=True,
+                    meta={"reference_density": 1.0},
+                )
+            )
+        sigma_i = 7e4
+        vi = np.linspace(-6 * sigma_i, 6 * sigma_i, 801)
+        ion_f = np.exp(-(vi**2) / (2 * sigma_i**2)) / (np.sqrt(2 * np.pi) * sigma_i)
+        ions = pic_thomson.from_arrays(
+            f=(total * ion_f)[None, :, None],
+            v=vi,
+            x=np.array([0.0]),
+            t=np.array([0.0]),
+            label="p+",
+            meta={"reference_density": 1.0},
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return pic_thomson.spectra_from_phase_spaces(
+                species,
+                ions,
+                position=0.0,
+                probe_wavelength=532 * u.nm,
+                epw_wavelengths=np.linspace(480, 584, 300) * u.nm,
+                iaw_wavelengths=np.linspace(531, 533, 100) * u.nm,
+                electron_conditioning={"skip": True},
+                ion_conditioning={"skip": True},
+            )
+
+    def test_mixture_alpha_is_density_weighted(self) -> None:
+        cold = self.run([1.0], [self.sigma_cold])
+        hot = 5 * self.sigma_cold
+        fractions = (0.8, 0.2)
+        mixture = self.run(fractions, [self.sigma_cold, hot])
+        expected = np.sqrt(fractions[0] + fractions[1] * (self.sigma_cold / hot) ** 2)
+        ratio = mixture.alpha_epw[0] / cold.alpha_epw[0]
+        assert ratio == pytest.approx(expected, rel=1e-3)
+
+    def test_each_population_reads_the_same_phase_velocity(self) -> None:
+        hot = 5 * self.sigma_cold
+        mixture = self.run((0.8, 0.2), [self.sigma_cold, hot])
+        cold_reach, hot_reach = mixture.epw_tail_required[:, 0]
+        # The resonance is one phase velocity; in each population's widths
+        # it is that velocity over sigma_p.
+        assert cold_reach / hot_reach == pytest.approx(hot / self.sigma_cold, rel=1e-3)
+
+
+class TestFramesAreIndependent:
+    """
+    A frame's conditioning must not depend on which other frames were read.
+    One smoothing window sized against the narrowest slice of the whole block
+    made a frame's spectrum change by up to 2.7 dex with how a run was chunked.
+    """
+
+    @staticmethod
+    def block():
+        rng = np.random.default_rng(3)
+        sigma = sigma_of(40.0, const.m_e)
+        v = np.linspace(-40 * sigma, 40 * sigma, 1024)
+        frames = [
+            maxwellian(v, sigma),
+            maxwellian(v, 6 * sigma),
+            maxwellian(v, 2 * sigma),
+        ]
+        f = np.stack([rng.poisson(2e4 * frame / frame.max()) for frame in frames])
+        return pic_thomson.from_arrays(
+            f=f[:, :, np.newaxis].astype(float),
+            v=v,
+            x=np.array([0.0]),
+            t=np.arange(3) * 1e-12,
+            label="e-",
+        )
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            {"smoothing_width": 0.25, "smoothing_iterations": 2},
+            {
+                "smoothing_width": 0.25,
+                "smoothing_iterations": 2,
+                "tail_model": None,
+                "max_taper_width": 0.5,
+            },
+        ],
+    )
+    def test_conditioning_a_block_equals_each_frame_alone(self, settings) -> None:
+        whole = self.block()
+        together = pic_thomson.condition_phase_space(whole, **settings)
+        for frame in range(whole.f.shape[0]):
+            alone = pic_thomson.condition_phase_space(
+                replace(
+                    whole, f=whole.f[frame : frame + 1], t=whole.t[frame : frame + 1]
+                ),
+                **settings,
+            )
+            np.testing.assert_allclose(
+                together.f[frame], alone.f[0], rtol=1e-12, atol=1e-30
+            )
+
+
+class TestParticleQuantum:
+    """
+    extend_vdf_tail turns a raw histogram into particle counts. The smallest
+    positive value is one particle only when every value is a whole multiple
+    of it; a fractional, shaped deposit (OSIRIS) needs the shot noise instead.
+    """
+
+    @staticmethod
+    def histogram(n_particles, *, shaped, n_columns=8, weight=2.5):
+        rng = np.random.default_rng(7)
+        n_v = 400
+        out = np.zeros((n_columns, n_v, 1))
+        for column in range(n_columns):
+            position = rng.normal(n_v / 2, 18.0, n_particles)
+            if shaped:
+                # Linear (cloud-in-cell) deposit: each particle split between
+                # its two nearest bins.
+                low = np.floor(position).astype(int)
+                share = position - low
+                np.add.at(out[column, :, 0], low, weight * (1 - share))
+                np.add.at(out[column, :, 0], low + 1, weight * share)
+            else:
+                np.add.at(out[column, :, 0], np.rint(position).astype(int), weight)
+        v = np.linspace(-1e7, 1e7, n_v)
+        return out, v
+
+    def counts(self, f, v, **kwargs):
+        _, info = pic_thomson.extend_vdf_tail(f, v, **kwargs)
+        return info
+
+    def test_whole_multiples_use_the_smallest_value(self) -> None:
+        f, v = self.histogram(20000, shaped=False)
+        info = self.counts(f, v)
+        assert info["quantum_source"]["quantised"] == f.shape[0]
+        assert info["quantum_source"]["shot_noise"] == 0
+
+    def test_a_shaped_deposit_is_counted_from_its_noise(self) -> None:
+        n_particles = 20000
+        f, v = self.histogram(n_particles, shaped=True)
+        info = self.counts(f, v)
+        assert info["quantum_source"]["shot_noise"] == f.shape[0]
+        raw = f[:, :, 0].T
+        smallest = np.where(raw > 0, raw, np.inf).min(axis=0)
+        quantum, _, _ = pic_thomson._particle_quantum(
+            raw, smallest, np.ones(raw.shape[1], dtype=bool), None
+        )
+        inferred = raw.sum(axis=0) / quantum
+        # The smallest value of a shaped deposit is a sliver of a particle and
+        # overstates the count 5-35 times here; the noise estimate stays
+        # within about a factor of two.
+        assert np.all(raw.sum(axis=0) / smallest > 3 * n_particles)
+        assert np.all((inferred > 0.5 * n_particles) & (inferred < 2.5 * n_particles))
+
+    def test_a_known_quantum_overrides_the_estimate(self) -> None:
+        f, v = self.histogram(20000, shaped=True)
+        info = self.counts(f, v, quantum=2.5)
+        assert info["quantum_source"] == {"given": f.shape[0]}
+
+
+class TestCacheSignature:
+    """A cache key must not depend on how the running numpy spells a scalar."""
+
+    settings = {
+        "species": "e",
+        "mass": np.float64(9.1093837015e-31),
+        "scatter_direction": [np.float64(0.0), np.float64(0.0), np.float64(1.0)],
+        "n_velocity_bins": 512,
+        "timesteps": None,
+    }
+
+    def test_numpy_scalars_and_plain_floats_agree(self) -> None:
+        plain = {
+            **self.settings,
+            "mass": 9.1093837015e-31,
+            "scatter_direction": [0.0, 0.0, 1.0],
+        }
+        assert pic_thomson._cache_signature(self.settings) == (
+            pic_thomson._cache_signature(plain)
+        )
+
+    def test_an_old_numpy2_repr_key_still_matches(self) -> None:
+        # What numpy 2 wrote, whichever numpy is running now.
+        legacy = (
+            "[('mass', np.float64(9.1093837015e-31)), ('n_velocity_bins', 512), "
+            "('scatter_direction', [np.float64(0.0), np.float64(0.0), "
+            "np.float64(1.0)]), ('species', 'e'), ('timesteps', None)]"
+        )
+        assert pic_thomson._cache_matches(legacy, self.settings)
+
+    def test_different_settings_do_not_match(self) -> None:
+        other = {**self.settings, "n_velocity_bins": 256}
+        assert not pic_thomson._cache_matches(
+            pic_thomson._cache_signature(self.settings), other
+        )
+
+
+class TestAbsoluteIntensity:
+    """
+    The forward model scales every spectrum to unit area. A time series needs
+    the opposite: brightness that means the same thing in every frame.
+    """
+
+    def run(self, densities, **kwargs):
+        electrons = TestVacuumThreshold.species(
+            densities, "e-", is_electron=True, sigma=4e6
+        )
+        ions = TestVacuumThreshold.species(
+            densities, "p+", is_electron=False, sigma=7e4
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return pic_thomson.spectra_from_phase_spaces(
+                electrons,
+                ions,
+                position=0.0,
+                probe_wavelength=532 * u.nm,
+                epw_wavelengths=np.linspace(500, 564, 400) * u.nm,
+                iaw_wavelengths=np.linspace(531, 533, 200) * u.nm,
+                electron_conditioning={"skip": True},
+                ion_conditioning={"skip": True},
+                vacuum_density=1.0 * u.m**-3,
+                **kwargs,
+            )
+
+    def test_each_frame_on_its_own_has_unit_area(self) -> None:
+        spectra = self.run([1e25, 3e25], normalise_each_frame=True)
+        x = spectra.epw_wavelengths * 1e9
+        np.testing.assert_allclose(np.trapezoid(spectra.epw, x, axis=1), 1.0)
+
+    def test_default_is_density_times_the_structure_factor(self) -> None:
+        densities = [1e25, 3e25]
+        absolute = self.run(densities)
+        shape = self.run(densities, normalise_each_frame=True)
+        x = absolute.epw_wavelengths * 1e9
+        area = np.trapezoid(absolute.epw, x, axis=1)
+        # Same shape frame by frame...
+        np.testing.assert_allclose(absolute.epw, shape.epw * area[:, None], rtol=1e-9)
+        # ...and a brightness history: three times the density scatters more.
+        assert area[1] / area[0] > 1.5
+
+    def test_automatic_notch_is_one_filter_on_the_probe(self) -> None:
+        spectra = self.run([1e25, 3e25, 2e25], epw_notches="auto")
+        applied = np.asarray(spectra.meta["epw_notch_applied"], dtype=float)
+        assert np.all(applied == applied[0])
+        assert applied[0].mean() == pytest.approx(532.0, abs=1e-9)
+        x = spectra.epw_wavelengths * 1e9
+        blocked = (x >= applied[0, 0]) & (x <= applied[0, 1])
+        assert blocked.any()
+        assert np.all(spectra.epw[:, blocked] == 0)

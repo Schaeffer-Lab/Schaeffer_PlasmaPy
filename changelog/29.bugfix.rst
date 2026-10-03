@@ -1,0 +1,26 @@
+Four faults in `~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces`.
+
+- **The vacuum threshold never fired for SI readers.** It was
+  ``presence_threshold * reference_density``, and WarpX, openPMD,
+  `~plasmapy.diagnostics.pic_thomson.from_moments` and
+  `~plasmapy.diagnostics.pic_thomson.from_arrays` record a reference density of
+  1 m\ :sup:`-3`, so the threshold was :math:`10^{-2}` m\ :sup:`-3`. New
+  ``vacuum_density`` parameter; when omitted, a normalised code keeps the old
+  rule and an SI reader uses a fraction of the peak density at the probe.
+- **The scattering parameter of an electron mixture was an unweighted mean.**
+  The forward model averages :math:`\sqrt{2}\omega_{pe}/k\sigma_p` over
+  populations, which for hot plus cold electrons is the plasma's :math:`\alpha`
+  for neither. ``alpha_epw`` and ``alpha_iaw`` are now
+  :math:`\alpha^2 = \sum_p f_p \alpha_p^2`, from summing inverse squared Debye
+  lengths, and ``epw_tail_required`` is per population -- each population reads
+  the resonance at its own number of thermal widths -- so ``epw_resolved`` is
+  right for mixtures. Single-population results are unchanged.
+- **A phase space passed with** ``{"skip": True}`` **reached the model
+  unnormalised**, and the model takes moments assuming unit area, so a thermal
+  speed off by a factor of the density put :math:`\alpha` 21 orders of
+  magnitude out. Each slice is now normalised before the model call.
+- **A frame's spectrum depended on which other frames were read.** The
+  smoothing window and taper rolloff were sized against the narrowest slice of
+  the whole block, so chunking a run changed frames by up to 2.7 dex. Every
+  slice is now sized against its own width; conditioning a block equals
+  conditioning each frame alone.

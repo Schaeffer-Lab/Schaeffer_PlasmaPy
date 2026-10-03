@@ -1,0 +1,17 @@
+`~plasmapy.diagnostics.pic_thomson.spectra_from_phase_spaces` now returns
+spectra on one absolute scale -- :math:`n_e S(k, \omega)`, proportional to the
+scattered power -- instead of scaling every frame to unit area. The forward model
+normalises each spectrum on its own, which discards the brightness history along
+the time axis and the EPW-to-IAW ratio, makes a frame with no signal look like
+one with a strong feature, and, where a stray-light notch has removed the central
+feature, promotes whatever residue is left into a saturated rail along each notch
+edge. ``normalise_each_frame=True`` restores the old behaviour, and
+`~plasmapy.diagnostics.thomson.arbitrary_forwardmodel` takes ``normalize=False``
+for the absolute :math:`S(k, \omega)`.
+
+``epw_notches="auto"`` now sizes one notch for the whole run, centred on the
+probe wavelength and wide enough for the central feature in its widest frame,
+capped below the closest computable satellite with a warning when that binds.
+It used to be re-sized every frame from a 99.9% containment interval -- set by
+the wings rather than the line -- capped at a fraction of the Bohm-Gross offset,
+and wandered over a factor of 19-26 in width on two runs.

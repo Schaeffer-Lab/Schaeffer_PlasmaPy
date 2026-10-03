@@ -1,0 +1,5 @@
+The `~plasmapy.diagnostics.pic_thomson.read_warpx_phase_space` cache key was
+``repr`` of its settings, which spells a numpy scalar ``np.float64(0.0)`` under
+numpy 2 and ``0.0`` under numpy 1, so a cache built under one never matched
+under the other and every plotfile was silently re-read. The key is now
+canonical JSON, and existing caches written either way still match.

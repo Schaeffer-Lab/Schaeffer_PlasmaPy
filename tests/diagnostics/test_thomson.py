@@ -1496,3 +1496,121 @@ class TestArbitraryChi:
         u_axis = np.sinh(np.linspace(-2, 2, 513))
         with pytest.raises(ValueError, match="uniformly spaced"):
             thomson.arbitrary_derivative(np.exp(-(u_axis**2)), u_axis, 1)
+
+
+class TestArbitraryMatchesSpectralDensity:
+    """
+    On Maxwellian input the arbitrary-VDF forward model must reproduce
+    `~plasmapy.diagnostics.thomson.spectral_density`, including for a mixture of
+    ion species. Two faults used to break this: the ion term was weighted by
+    ``Z * ifract`` instead of ``Z**2 * ifract / Zbar`` -- identical for one
+    species, 24-39% off for a hydrogen-carbon mixture -- and the ion mass was
+    passed in units of m_p to a function that converts with the amu, 0.72% light.
+    """
+
+    @staticmethod
+    def spectra(ions, ifract):
+        wavelengths = np.linspace(529, 535, 601) * u.nm
+        n = 5e25 * u.m**-3
+        T_e, T_i = 100.0, 50.0
+        kB = const.e.si.value
+        sigma_e = np.sqrt(T_e * kB / const.m_e.si.value)
+        v_e = np.linspace(-3e7, 3e7, 4001)
+        efn = [np.exp(-(v_e**2) / (2 * sigma_e**2)) / (np.sqrt(2 * np.pi) * sigma_e)]
+        ifn, v_i = [], []
+        for ion in ions:
+            sigma = np.sqrt(T_i * kB / Particle(ion).mass.si.value)
+            v = np.linspace(-12 * sigma, 12 * sigma, 4001)
+            v_i.append(v)
+            ifn.append(np.exp(-(v**2) / (2 * sigma**2)) / (np.sqrt(2 * np.pi) * sigma))
+        geometry = {
+            "probe_vec": np.array([1, 0, 0]),
+            "scatter_vec": np.array([0, 1, 0]),
+        }
+        _, arbitrary = thomson.arbitrary_forwardmodel(
+            wavelengths=wavelengths,
+            probe_wavelength=532 * u.nm,
+            e_velocity_axes=[v_e] * u.m / u.s,
+            i_velocity_axes=v_i * u.m / u.s,
+            efn=efn * u.s / u.m,
+            ifn=ifn * u.s / u.m,
+            n=n,
+            efract=np.array([1.0]),
+            ifract=np.array(ifract),
+            ion_species=list(ions),
+            **geometry,
+        )
+        _, reference = thomson.spectral_density(
+            wavelengths,
+            532 * u.nm,
+            n,
+            T_e=T_e * u.eV,
+            T_i=np.full(len(ions), T_i) * u.eV,
+            efract=np.array([1.0]),
+            ifract=np.array(ifract),
+            ions=list(ions),
+            **geometry,
+        )
+        x = wavelengths.value
+        arbitrary = np.asarray(arbitrary)
+        reference = np.asarray(getattr(reference, "value", reference))
+        return (
+            arbitrary / np.trapezoid(arbitrary, x),
+            reference / np.trapezoid(reference, x),
+        )
+
+    @pytest.mark.parametrize(
+        ("ions", "ifract"),
+        [(["p+"], [1.0]), (["p+", "C 6+"], [0.5, 0.5]), (["p+", "C 6+"], [0.9, 0.1])],
+    )
+    def test_ion_feature_matches(self, ions, ifract) -> None:
+        arbitrary, reference = self.spectra(ions, ifract)
+        assert np.max(np.abs(arbitrary - reference)) / reference.max() < 1e-3
+
+    def test_caller_ion_list_is_left_alone(self) -> None:
+        ions = ["p+", "C 6+"]
+        self.spectra(ions, [0.5, 0.5])
+        assert ions == ["p+", "C 6+"]
+
+
+class TestAutodiffChi:
+    """The torch path evaluates the same closed form as the numpy one."""
+
+    @staticmethod
+    def stencils(n):
+        """The numpy derivative stencils, as matrices on a unit-spaced axis."""
+        unit = np.arange(n, dtype=float)
+        eye = np.eye(n)
+        return tuple(
+            np.stack(
+                [
+                    thomson.arbitrary_derivative(eye[:, j], unit, order)
+                    for j in range(n)
+                ],
+                axis=1,
+            )
+            for order in (1, 2)
+        )
+
+    def test_matches_the_numpy_path_and_differentiates(self) -> None:
+        torch = pytest.importorskip("torch")
+        u_axis = np.linspace(-6, 6, 257)
+        rng = np.random.default_rng(2)
+        f = np.exp(-(u_axis**2)) * (1 + 0.1 * rng.standard_normal(u_axis.size))
+        f[:15] = 0
+        f[-15:] = 0
+        xi = np.array([-40.0, -5.5, -1.3, 0.0, 0.7, 2.9, 25.0])
+        args = {"k": 1.0, "v_th": 1.0, "n": 1.0, "particle_m": 1.0, "particle_q": 1.0}
+        expected = thomson.arbitrary_chi(f, u_axis, xi=xi, **args)
+        f_torch = torch.tensor(f, dtype=torch.float64, requires_grad=True)
+        matrices = tuple(torch.tensor(m) for m in self.stencils(u_axis.size))
+        chi = thomson.autodiff_chi(
+            f_torch,
+            matrices,
+            torch.tensor(u_axis),
+            xi=torch.tensor(xi),
+            **args,
+        )
+        np.testing.assert_allclose(chi.detach().numpy().ravel(), expected, rtol=1e-9)
+        chi.real.sum().backward()
+        assert torch.isfinite(f_torch.grad).all()

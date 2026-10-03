@@ -368,37 +368,29 @@ def figure(spectrograms, results, reference, args) -> None:  # noqa: PLR0915
     for row, (name, axis, key) in enumerate(
         (("EPW", epw_nm, "epw"), ("IAW", iaw_nm, "iaw"))
     ):
+        # The pipeline's own spectra, n_e S(k, w) on one scale, not the
+        # per-row normalised copies the L1 comparison uses: normalising each
+        # row hid the brightness history and, where the notch had removed the
+        # central feature, promoted its residue into a rail along each edge.
         panels = [
-            (legacy[key], f"{name}: legacy (half-cosine taper to zero)"),
-            (corrected[key], f"{name}: corrected (fitted Maxwellian tail)"),
+            (
+                getattr(spectrograms["legacy"], key),
+                f"{name}: legacy (half-cosine taper to zero)",
+            ),
+            (
+                getattr(spectrograms["corrected"], key),
+                f"{name}: corrected (fitted Maxwellian tail)",
+            ),
         ]
         if reference is not None:
             panels.insert(0, (legacy[f"ref_{key}"], f"{name}: osiris2thomson"))
         for column, (data, title) in enumerate(panels):
-            # Each row was normalised to its own area, which for the EPW is a
-            # trap: where the notch has removed the central feature and the
-            # plasma has no computable satellite, the only content left is the
-            # skirt at the notch edge -- 1e-5 of the peak. Dividing by its area
-            # promotes that residue to order one and paints a saturated rail
-            # along each notch edge, across every such frame. So for the EPW,
-            # blank the notched band and renormalise by what is outside it: a
-            # row with nothing outside is then blank, which is the truth.
             away = np.abs(axis - PROBE_WAVELENGTH.to_value(u.nm)) > args.colour_guard
-            shown_data = data
-            if name == "EPW" and away.sum() > 4:
-                shown_data = np.array(data, dtype=float)
-                shown_data[:, ~away] = np.nan
-                with np.errstate(invalid="ignore"):
-                    areas = np.trapezoid(
-                        np.nan_to_num(shown_data[:, away]), axis[away], axis=1
-                    )
-                usable = np.isfinite(areas) & (areas > 0)
-                shown_data[~usable] = np.nan
-                shown_data[usable] /= areas[usable][:, np.newaxis]
+            shown_data = np.asarray(data, dtype=float)
             finite = shown_data[np.isfinite(shown_data).any(axis=1)]
             scale_from = finite[:, away] if away.sum() > 4 else finite
             if args.log_scale:
-                # Each row is area-normalised, and the features that matter span
+                # The features that matter span
                 # many decades: the notch skirt sits orders of magnitude above
                 # the satellites, so on a linear scale everything else is one
                 # colour. Zeros -- the notch itself -- are masked rather than
